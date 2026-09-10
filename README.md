@@ -1,5 +1,13 @@
 # wabbit
 
+the stupidest blue team rootkit ever
+
+THIS IS FOR EDUCATIONAL USE BY BLUE TEAMS IN REGULATED CTFs ONLY. DO NOT USE THIS TO COMMIT CRIMES. IT WILL BE REALLY BAD AT IT.
+
+NOT an edr
+
+
+
 ## Prerequisites
 
 1. stable rust toolchains: `rustup toolchain install stable`
