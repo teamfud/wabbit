@@ -27,6 +27,25 @@ cargo run --release
 Cargo build scripts are used to automatically build the eBPF correctly and include it in the
 program.
 
+The `wabbit-initrd` binary is a small initrd entry point for applying the same
+`RootFSConfig` policy without starting the main tracer or IPC server:
+
+```sh
+WABBIT_FILESYSTEM_CONFIGURATION_FILE=/etc/wabbit/rootfs.json \
+  wabbit-initrd --outer
+wabbit-initrd --namespace --inner
+```
+
+Use `--outer` before entering a private namespace and `--inner` after entering one. The
+`--namespace` option creates and privatizes a mount namespace before applying the inner policy.
+
+When running with `WABBIT_READ_ONLY_PATHS` and `WABBIT_WRITABLE_PATHS` (both JSON arrays of
+paths), wabbit exposes a Unix-domain IPC socket to the namespace process. A client can use
+`wabbit::ipc::NamespaceIpc::connect(socket_path)` and call `reconfigure_filesystems` with one of
+the `RootFSConfig` fields and `PathOverride` entries to describe writable and executable
+mounts. `apply_rootfs_config(&config, false)` applies the outer policy, while
+`apply_rootfs_config(&config, true)` applies the inner policy after entering a private namespace.
+
 ## Cross-compiling on macOS
 
 Cross compilation should work on both Intel and Apple Silicon Macs.

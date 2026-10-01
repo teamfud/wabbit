@@ -11,16 +11,25 @@ wabbit-common = { path = "../wabbit-common", features = ["user"] }
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
 aya-log = { workspace = true }
+base64 = "0.22"
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 env_logger = { workspace = true }
+hex = "0.4"
 libc = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true, features = [
+    "io-util",
     "macros",
+    "process",
     "rt",
     "rt-multi-thread",
     "net",
     "signal",
+    "time",
 ] }
+rustix = { version = "1.1.4", features = ["mount", "thread"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }
@@ -42,3 +51,6 @@ wabbit-ebpf = { path = "../wabbit-ebpf" }
 [[bin]]
 name = "wabbit"
 path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
