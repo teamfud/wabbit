@@ -10,11 +10,11 @@ use tokio::{
     process::Command,
 };
 
-const RUN_REQUEST: u8 = 1;
-const RECONFIGURE_REQUEST: u8 = 2;
-const COMPLETED_RESPONSE: u8 = 1;
-const FAILED_RESPONSE: u8 = 2;
-const RECONFIGURED_RESPONSE: u8 = 3;
+const RUN_REQUEST: u8 = 0b01;
+const RECONFIGURE_REQUEST: u8 = 0b10;
+const COMPLETED_RESPONSE: u8 = 0b01;
+const FAILED_RESPONSE: u8 = 0b10;
+const RECONFIGURED_RESPONSE: u8 = 0b11;
 
 #[derive(Debug)]
 enum Request<'a> {

@@ -6,7 +6,7 @@ use rustix::{
 };
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PathOverride {
     /// Whether the path mounted to the privileged namespace should NOT be mounted RDONLY.
     pub inner_writable: bool,
@@ -28,7 +28,7 @@ pub struct PathOverride {
     pub priority: u16,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RootFSConfig {
     pub executable: bool,
     pub writable: bool,

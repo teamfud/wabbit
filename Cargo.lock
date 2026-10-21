@@ -38,7 +38,7 @@ dependencies = [
  "object",
  "once_cell",
  "scopeguard",
- "thiserror",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -106,7 +106,7 @@ dependencies = [
  "aya",
  "aya-log-common",
  "log",
- "thiserror",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -160,7 +160,7 @@ dependencies = [
  "bytes",
  "log",
  "object",
- "thiserror",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -174,6 +174,17 @@ name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
+
+[[package]]
+name = "binary-layout"
+version = "4.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66c7e8da2156abef3421f6226ef339ade8c0d157ec50932d5e624f1c6a5127b4"
+dependencies = [
+ "doc-comment",
+ "paste",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "bitflags"
@@ -226,7 +237,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -315,6 +326,12 @@ dependencies = [
  "block-buffer",
  "crypto-common",
 ]
+
+[[package]]
+name = "doc-comment"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "780955b8b195a21ab8e4ac6b60dd1dbdcec1dc6c51c0617964b08c81785e12c9"
 
 [[package]]
 name = "ed25519"
@@ -535,6 +552,12 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pin-project-lite"
@@ -800,11 +823,31 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
+dependencies = [
+ "thiserror-impl 1.0.69",
+]
+
+[[package]]
+name = "thiserror"
 version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 2.0.20",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -872,6 +915,7 @@ dependencies = [
  "aya-build",
  "aya-log",
  "base64",
+ "binary-layout",
  "cargo_metadata",
  "ed25519-dalek",
  "env_logger",
@@ -891,6 +935,7 @@ name = "wabbit-common"
 version = "0.1.0"
 dependencies = [
  "aya",
+ "binary-layout",
 ]
 
 [[package]]

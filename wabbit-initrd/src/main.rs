@@ -1,7 +1,10 @@
 use std::{env, fs, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
-use wabbit::filesystem::{self, RootFSConfig};
+use wabbit::{
+    filesystem::{self, RootFSConfig},
+    policy,
+};
 
 fn main() -> Result<()> {
     env_logger::init();
@@ -42,9 +45,15 @@ fn parse_args() -> Result<(bool, bool)> {
 fn load_configuration() -> Result<RootFSConfig> {
     if let Some(path) = env::var_os("WABBIT_FILESYSTEM_CONFIGURATION_FILE") {
         let path = PathBuf::from(path);
-        let contents = fs::read_to_string(&path)
-            .with_context(|| format!("reading configuration {}", path.display()))?;
-        return serde_json::from_str(&contents)
+        let bytes =
+            fs::read(&path).with_context(|| format!("reading configuration {}", path.display()))?;
+        if bytes.starts_with(wabbit::policy::MAGIC) {
+            return policy::from_bytes(&bytes)
+                .with_context(|| format!("parsing binary configuration {}", path.display()));
+        }
+        let contents = std::str::from_utf8(&bytes)
+            .with_context(|| format!("configuration {} is not UTF-8", path.display()))?;
+        return serde_json::from_str(contents)
             .with_context(|| format!("parsing configuration {}", path.display()));
     }
 

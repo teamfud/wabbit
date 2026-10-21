@@ -1,10 +1,13 @@
-use aya::programs::TracePoint;
+use anyhow::Context;
+use aya::{Btf, EbpfLoader, programs::TracePoint};
 #[rustfmt::skip]
 use log::{debug, warn};
 use std::{
     env,
+    path::Path,
     process::{Command, ExitStatus},
 };
+
 use tokio::signal;
 use wabbit::{filesystem, ipc};
 
@@ -30,6 +33,20 @@ fn main() -> anyhow::Result<()> {
 
 fn is_namespace_mode() -> bool {
     env::args().any(|arg| arg == NAMESPACE_MODE)
+}
+
+fn copy_self_to_path(dir: &Path) -> anyhow::Result<()> {
+    let executable = env::current_exe()?;
+    let dest = dir.join(
+        executable
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("wabbit"),
+    );
+    match std::fs::copy(&executable, &dest) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(anyhow::anyhow!(e)),
+    }
 }
 
 fn relaunch_in_namespace() -> anyhow::Result<()> {
@@ -74,7 +91,10 @@ async fn run_in_namespace() -> anyhow::Result<()> {
     // runtime. This approach is recommended for most real-world use cases. If you would
     // like to specify the eBPF program at runtime rather than at compile-time, you can
     // reach for `Bpf::load_file` instead.
-    let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
+    let btf = Btf::from_sys_fs().context("loading kernel BTF from /sys/kernel/btf/vmlinux")?;
+    let mut loader = EbpfLoader::new();
+    loader.btf(Some(&btf));
+    let mut ebpf = loader.load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/wabbit"
     )))?;

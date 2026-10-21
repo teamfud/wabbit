@@ -43,9 +43,8 @@ fn decode_signature(encoded: &str) -> Result<Signature> {
 
 fn parse_public_key(encoded: &str) -> Result<VerifyingKey> {
     let encoded = encoded.trim();
-    let bytes = STANDARD
-        .decode(encoded)
-        .or_else(|_| hex::decode(encoded))
+    let bytes = hex::decode(encoded)
+        .or_else(|_| STANDARD.decode(encoded))
         .context("public key must be base64 or hexadecimal")?;
     let bytes: [u8; 32] = bytes
         .try_into()
@@ -55,8 +54,9 @@ fn parse_public_key(encoded: &str) -> Result<VerifyingKey> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    use super::*;
 
     #[test]
     fn extracts_and_verifies_payload() {

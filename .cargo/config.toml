@@ -1,2 +1,7 @@
 [target."cfg(all())"]
 runner = "sudo -E"
+
+[build]
+# Randomize repr(Rust) type layouts to make assumptions about memory layout
+# harder to exploit. This requires a nightly rustc.
+rustflags = ["-Z", "randomize-layout"]

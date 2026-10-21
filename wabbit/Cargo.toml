@@ -3,6 +3,9 @@ name = "wabbit"
 version = "0.1.0"
 edition.workspace = true
 
+# build for musl
+
+
 license.workspace = true
 
 [dependencies]
@@ -30,6 +33,7 @@ tokio = { workspace = true, features = [
 rustix = { version = "1.1.4", features = ["mount", "thread"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+binary-layout = "4.0.2"
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }
@@ -47,6 +51,11 @@ cargo_metadata = { workspace = true }
 # workflows with stable cargo; stable cargo outright refuses to load manifests that use unstable
 # features.
 wabbit-ebpf = { path = "../wabbit-ebpf" }
+
+
+[build]
+target = ["aarch64-unknown-linux-musl"]
+
 
 [[bin]]
 name = "wabbit"

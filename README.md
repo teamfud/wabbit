@@ -8,13 +8,17 @@ NOT an edr
 
 
 
+
 ## Prerequisites
 
-1. stable rust toolchains: `rustup toolchain install stable`
-1. nightly rust toolchains: `rustup toolchain install nightly --component rust-src`
+1. nightly rust toolchain: `rustup toolchain install nightly --component rust-src`
 1. (if cross-compiling) rustup target: `rustup target add ${ARCH}-unknown-linux-musl`
 1. (if cross-compiling) LLVM: (e.g.) `brew install llvm` (on macOS)
 1. bpf-linker: `cargo install bpf-linker` (`--no-default-features` on macOS)
+
+The workspace Cargo configuration enables rustc's nightly `-Z randomize-layout` option. It
+randomizes layouts of ordinary `repr(Rust)` types; explicitly represented FFI layouts such as
+`repr(C)` remain stable.
 
 ## Build & Run
 
@@ -38,6 +42,14 @@ wabbit-initrd --namespace --inner
 
 Use `--outer` before entering a private namespace and `--inner` after entering one. The
 `--namespace` option creates and privatizes a mount namespace before applying the inner policy.
+
+Policies can also be stored as a versioned binary file. Set
+`WABBIT_FILESYSTEM_CONFIGURATION_FILE` to the file path; files beginning with the `WSPF` magic
+are decoded by `wabbit::policy`, while other files retain the JSON fallback. Binary policies
+contain an Ed25519 signature over the policy header and payload and are verified against the
+compiled-in `policy::POLICY_PUBLIC_KEY`; unsigned policies are rejected. The policy module exposes
+`to_signed_bytes`, `from_bytes`, `read_file`, and `write_new_signed` for callers that need to
+generate or validate policy files.
 
 When running with `WABBIT_READ_ONLY_PATHS` and `WABBIT_WRITABLE_PATHS` (both JSON arrays of
 paths), wabbit exposes a Unix-domain IPC socket to the namespace process. A client can use
