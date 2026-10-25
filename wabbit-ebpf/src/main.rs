@@ -1,18 +1,22 @@
 #![no_std]
 #![no_main]
 
-use aya_ebpf::{macros::tracepoint, programs::TracePointContext};
+use aya_ebpf::{macros::btf_tracepoint, programs::BtfTracePointContext};
 use aya_log_ebpf::info;
 
-#[tracepoint]
-pub fn wabbit(ctx: TracePointContext) -> u32 {
+pub mod lsm;
+pub mod maps;
+pub mod tracepoints;
+
+#[btf_tracepoint(function = "sys_enter")]
+pub fn wabbit(ctx: BtfTracePointContext) -> u32 {
     match try_wabbit(ctx) {
         Ok(ret) => ret,
         Err(ret) => ret,
     }
 }
 
-fn try_wabbit(ctx: TracePointContext) -> Result<u32, u32> {
+fn try_wabbit(ctx: BtfTracePointContext) -> Result<u32, u32> {
     info!(&ctx, "tracepoint sys_enter called");
     Ok(0)
 }

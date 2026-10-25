@@ -10,6 +10,8 @@ use tokio::{
     process::Command,
 };
 
+use crate::policy::{self, Policy};
+
 const RUN_REQUEST: u8 = 0b01;
 const RECONFIGURE_REQUEST: u8 = 0b10;
 const COMPLETED_RESPONSE: u8 = 0b01;
@@ -30,7 +32,8 @@ struct RunTask<'a> {
 
 #[derive(Debug)]
 struct Reconfigure<'a> {
-    configuration: &'a crate::filesystem::RootFSConfig,
+    /// A signed binary policy file; see [`policy`].
+    policy: &'a [u8],
 }
 
 #[derive(Debug)]
@@ -91,11 +94,12 @@ impl NamespaceIpc {
         }
     }
 
-    pub async fn reconfigure_filesystems(
-        &self,
-        configuration: &crate::filesystem::RootFSConfig,
-    ) -> Result<()> {
-        let request = encode_request(&Request::Reconfigure(Reconfigure { configuration }))?;
+    /// Apply a new policy to the namespace. Sections the policy omits are left unchanged.
+    ///
+    /// `policy` is a complete signed policy file, as produced by [`policy::sign`].
+    /// The server verifies its signature before applying it.
+    pub async fn reconfigure_filesystems(&self, policy: &[u8]) -> Result<()> {
+        let request = encode_request(&Request::Reconfigure(Reconfigure { policy }))?;
         let mut stream = UnixStream::connect(&self.socket_path)
             .await
             .context("connecting to namespace server")?;
@@ -112,29 +116,23 @@ impl NamespaceIpc {
     }
 }
 
-pub async fn run_server(
-    socket_path: PathBuf,
-    configuration: crate::filesystem::RootFSConfig,
-) -> Result<()> {
+pub async fn run_server(socket_path: PathBuf, active_policy: Policy) -> Result<()> {
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("binding IPC socket {}", socket_path.display()))?;
-    let configuration = Arc::new(Mutex::new(configuration));
+    let active_policy = Arc::new(Mutex::new(active_policy));
     loop {
         let (stream, _) = listener.accept().await?;
-        let configuration = Arc::clone(&configuration);
+        let active_policy = Arc::clone(&active_policy);
         tokio::spawn(async move {
-            if let Err(error) = handle_task(stream, configuration).await {
+            if let Err(error) = handle_task(stream, active_policy).await {
                 log::error!("IPC task failed: {error:#}");
             }
         });
     }
 }
 
-async fn handle_task(
-    stream: UnixStream,
-    configuration: Arc<Mutex<crate::filesystem::RootFSConfig>>,
-) -> Result<()> {
+async fn handle_task(stream: UnixStream, active_policy: Arc<Mutex<Policy>>) -> Result<()> {
     let (mut read_half, mut write_half) = stream.into_split();
     let mut request = Vec::new();
     read_half.read_to_end(&mut request).await?;
@@ -156,12 +154,17 @@ async fn handle_task(
             }))?,
         },
         Ok(RequestOwned::Reconfigure(request)) => {
-            let mut current = configuration
+            let mut current = active_policy
                 .lock()
-                .map_err(|_| anyhow::anyhow!("filesystem configuration lock poisoned"))?;
-            match crate::filesystem::apply_rootfs_config(&request.configuration, true) {
+                .map_err(|_| anyhow::anyhow!("policy lock poisoned"))?;
+            // Apply every section the policy contains; omitted sections are left alone.
+            let applied = match &request.policy.rootfs {
+                Some(rootfs) => crate::filesystem::apply_rootfs_config(rootfs, true),
+                None => Ok(()),
+            };
+            match applied {
                 Ok(()) => {
-                    *current = request.configuration;
+                    current.merge(request.policy);
                     encode_response(&Response::Reconfigured)?
                 }
                 Err(error) => encode_response(&Response::Failed(TaskError {
@@ -191,7 +194,7 @@ struct RunTaskOwned {
 
 #[derive(Debug)]
 struct ReconfigureOwned {
-    configuration: crate::filesystem::RootFSConfig,
+    policy: Policy,
 }
 
 fn encode_request(request: &Request<'_>) -> Result<Vec<u8>> {
@@ -207,8 +210,7 @@ fn encode_request(request: &Request<'_>) -> Result<Vec<u8>> {
         }
         Request::Reconfigure(request) => {
             output.push(RECONFIGURE_REQUEST);
-            let configuration = serde_json::to_string(request.configuration)?;
-            put_string(&mut output, &configuration)?;
+            put_bytes(&mut output, request.policy)?;
         }
     }
     Ok(output)
@@ -228,12 +230,9 @@ fn decode_request(bytes: &[u8]) -> Result<RequestOwned> {
             Ok(RequestOwned::Run(RunTaskOwned { program, args }))
         }
         RECONFIGURE_REQUEST => {
-            let configuration = serde_json::from_str(&cursor.string()?)
-                .context("invalid filesystem configuration")?;
+            let policy = policy::from_bytes(&cursor.bytes()?).context("invalid policy")?;
             cursor.finish()?;
-            Ok(RequestOwned::Reconfigure(ReconfigureOwned {
-                configuration,
-            }))
+            Ok(RequestOwned::Reconfigure(ReconfigureOwned { policy }))
         }
         _ => bail!("unknown IPC request"),
     }
@@ -365,5 +364,35 @@ impl<'a> Cursor<'a> {
         } else {
             bail!("trailing bytes in IPC message")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_request_round_trips() {
+        let args = vec!["a".to_string(), "b".to_string()];
+        let request = encode_request(&Request::Run(RunTask {
+            program: "echo",
+            args: &args,
+        }))
+        .unwrap();
+        match decode_request(&request).unwrap() {
+            RequestOwned::Run(task) => {
+                assert_eq!(task.program, "echo");
+                assert_eq!(task.args, args);
+            }
+            RequestOwned::Reconfigure(_) => panic!("expected a run request"),
+        }
+    }
+
+    #[test]
+    fn reconfigure_rejects_unsigned_policy() {
+        let policy = policy::to_signed_bytes(&Policy::default(), &[0; 64]).unwrap();
+        let request =
+            encode_request(&Request::Reconfigure(Reconfigure { policy: &policy })).unwrap();
+        assert!(decode_request(&request).is_err());
     }
 }

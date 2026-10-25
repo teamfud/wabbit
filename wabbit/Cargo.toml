@@ -31,9 +31,9 @@ tokio = { workspace = true, features = [
     "time",
 ] }
 rustix = { version = "1.1.4", features = ["mount", "thread"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-binary-layout = "4.0.2"
+binrw = "0.15.2"
+bilge = "0.5.0"
+procfs = { version = "0.18.0", features = ["flate2"] }
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }
@@ -56,6 +56,8 @@ wabbit-ebpf = { path = "../wabbit-ebpf" }
 [build]
 target = ["aarch64-unknown-linux-musl"]
 
+[features]
+enclave = []
 
 [[bin]]
 name = "wabbit"

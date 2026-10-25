@@ -1,3 +1,4 @@
+pub mod cgroup;
 pub mod filesystem;
 pub mod ipc;
 pub mod policy;

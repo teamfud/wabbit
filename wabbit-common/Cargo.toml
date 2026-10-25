@@ -12,7 +12,7 @@ user = ["aya"]
 
 [dependencies]
 aya = { workspace = true, optional = true }
-binary-layout = "4.0.2"
+
 
 [lib]
 path = "src/lib.rs"

@@ -9,19 +9,22 @@ use std::{
 };
 
 use tokio::signal;
-use wabbit::{filesystem, ipc};
+use wabbit::{
+    filesystem, ipc,
+    policy::{self, Policy},
+};
 
 const NAMESPACE_MODE: &str = "--wabbit-namespace";
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
 
-    let configuration = configured_configuration()?;
-    filesystem::apply_rootfs_config(&configuration, false)?;
+    let rootfs = configured_policy()?.rootfs.unwrap_or_default();
+    filesystem::apply_rootfs_config(&rootfs, false)?;
     if is_namespace_mode() {
         filesystem::create_namespace()?;
         filesystem::make_mount_tree_private()?;
-        filesystem::apply_rootfs_config(&configuration, true)?;
+        filesystem::apply_rootfs_config(&rootfs, true)?;
         return tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
@@ -72,9 +75,8 @@ fn exit_status_result(status: ExitStatus) -> anyhow::Result<()> {
 
 async fn run_in_namespace() -> anyhow::Result<()> {
     let socket_path = env::var_os("WABBIT_IPC_SOCKET").map(std::path::PathBuf::from);
-    let configuration = configured_configuration()?;
-    let ipc_task =
-        socket_path.map(|path| tokio::spawn(ipc::run_server(path, configuration.clone())));
+    let policy = configured_policy()?;
+    let ipc_task = socket_path.map(|path| tokio::spawn(ipc::run_server(path, policy)));
 
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
     // new memcg based accounting, see https://lwn.net/Articles/837122/
@@ -133,14 +135,10 @@ async fn run_in_namespace() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn configured_configuration() -> anyhow::Result<filesystem::RootFSConfig> {
-    match env::var("WABBIT_FILESYSTEM_CONFIGURATION") {
-        Ok(configuration) => Ok(serde_json::from_str(&configuration)?),
-        Err(env::VarError::NotPresent) => Ok(filesystem::RootFSConfig {
-            writable: true,
-            executable: true,
-            overrides: Vec::new(),
-        }),
-        Err(error) => Err(error.into()),
+/// Load the signed policy file named by `WABBIT_FILESYSTEM_CONFIGURATION_FILE`, if any.
+fn configured_policy() -> anyhow::Result<Policy> {
+    match env::var_os("WABBIT_FILESYSTEM_CONFIGURATION_FILE") {
+        Some(path) => policy::read_file(path),
+        None => Ok(Policy::default()),
     }
 }

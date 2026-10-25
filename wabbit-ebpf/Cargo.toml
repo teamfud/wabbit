@@ -8,6 +8,7 @@ wabbit-common = { path = "../wabbit-common" }
 
 aya-ebpf = { workspace = true }
 aya-log-ebpf = { workspace = true }
+libc.workspace = true
 
 [build-dependencies]
 which = { workspace = true }

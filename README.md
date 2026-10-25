@@ -35,7 +35,7 @@ The `wabbit-initrd` binary is a small initrd entry point for applying the same
 `RootFSConfig` policy without starting the main tracer or IPC server:
 
 ```sh
-WABBIT_FILESYSTEM_CONFIGURATION_FILE=/etc/wabbit/rootfs.json \
+WABBIT_FILESYSTEM_CONFIGURATION_FILE=/etc/wabbit/rootfs.wspf \
   wabbit-initrd --outer
 wabbit-initrd --namespace --inner
 ```
@@ -43,19 +43,20 @@ wabbit-initrd --namespace --inner
 Use `--outer` before entering a private namespace and `--inner` after entering one. The
 `--namespace` option creates and privatizes a mount namespace before applying the inner policy.
 
-Policies can also be stored as a versioned binary file. Set
-`WABBIT_FILESYSTEM_CONFIGURATION_FILE` to the file path; files beginning with the `WSPF` magic
-are decoded by `wabbit::policy`, while other files retain the JSON fallback. Binary policies
-contain an Ed25519 signature over the policy header and payload and are verified against the
-compiled-in `policy::POLICY_PUBLIC_KEY`; unsigned policies are rejected. The policy module exposes
-`to_signed_bytes`, `from_bytes`, `read_file`, and `write_new_signed` for callers that need to
-generate or validate policy files.
+Policies are stored as a versioned binary file (the `WSPF` format). Set
+`WABBIT_FILESYSTEM_CONFIGURATION_FILE` to the file path; both `wabbit` and `wabbit-initrd` read it.
+Policies contain an Ed25519 signature over the policy header and payload and are verified against
+the compiled-in `policy::POLICY_PUBLIC_KEY`; unsigned policies are rejected. A `policy::Policy` is a
+set of optional sections; the filesystem configuration (`RootFSConfig` and `PathOverride`) is the
+`rootfs` section, defined in `policy::rootfs`. The `wabbit::policy` module exposes `sign` (which
+takes a 32-byte Ed25519 private key), `to_signed_bytes`, `from_bytes`, `read_file`, and
+`write_new_signed` for callers that need to generate or validate policy files.
 
-When running with `WABBIT_READ_ONLY_PATHS` and `WABBIT_WRITABLE_PATHS` (both JSON arrays of
-paths), wabbit exposes a Unix-domain IPC socket to the namespace process. A client can use
-`wabbit::ipc::NamespaceIpc::connect(socket_path)` and call `reconfigure_filesystems` with one of
-the `RootFSConfig` fields and `PathOverride` entries to describe writable and executable
-mounts. `apply_rootfs_config(&config, false)` applies the outer policy, while
+When `WABBIT_IPC_SOCKET` is set, wabbit exposes a Unix-domain IPC socket to the namespace process.
+A client can use `wabbit::ipc::NamespaceIpc::connect(socket_path)` and call
+`reconfigure_filesystems` with the bytes of a signed policy file to apply it, for example to replace
+the writable and executable mounts. The server verifies the signature before applying anything.
+`apply_rootfs_config(&config, false)` applies the outer policy, while
 `apply_rootfs_config(&config, true)` applies the inner policy after entering a private namespace.
 
 ## Cross-compiling on macOS

@@ -1,50 +1,11 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rustix::{
     mount::{MountFlags, MountPropagationFlags, mount, mount_bind, mount_change, mount_remount},
     thread::{UnshareFlags, unshare_unsafe},
 };
-use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct PathOverride {
-    /// Whether the path mounted to the privileged namespace should NOT be mounted RDONLY.
-    pub inner_writable: bool,
-    /// Whether the path mounted to the privileged namespace should NOT be mounted NOEXEC.
-    pub inner_executable: bool,
-    /// Whether the path mounted to the root namespace should NOT be mounted RDONLY.
-    pub outer_writable: bool,
-    /// Whether the path mounted to the root namespace should NOT be mounted NOEXEC.
-    pub outer_executable: bool,
-    /// Whether the path mounted to the root namespace should have read permissions for non-root users
-    pub outer_readable: bool,
-    /// Whether the path mounted to the root namespace should NOT be hidden by wabbit-ebpf.
-    pub outer_visible: bool,
-    /// The path to modify in the root namespace.
-    pub path: PathBuf,
-    /// The path to mount to the privileged namespace.
-    pub inner_path: Option<PathBuf>,
-    /// The layer in the mount stack at which this mount should be applied
-    pub priority: u16,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct RootFSConfig {
-    pub executable: bool,
-    pub writable: bool,
-    #[serde(default)]
-    pub overrides: Vec<PathOverride>,
-}
-
-impl Default for RootFSConfig {
-    fn default() -> Self {
-        Self {
-            executable: true,
-            writable: true,
-            overrides: Vec::new(),
-        }
-    }
-}
+use crate::policy::rootfs::{PathOverride, RootFSConfig};
 
 /// Create a private mount namespace for the calling thread.
 pub fn create_namespace() -> rustix::io::Result<()> {
@@ -58,15 +19,21 @@ pub fn create_namespace() -> rustix::io::Result<()> {
 /// `false` before creating a namespace and `true` after creating one. The
 /// operation is intentionally reusable and may be called repeatedly.
 pub fn apply_rootfs_config(config: &RootFSConfig, inner: bool) -> rustix::io::Result<()> {
-    remount("/", config.writable, config.executable, true)?;
+    remount(
+        "/",
+        config.flags.writable(),
+        config.flags.executable(),
+        true,
+    )?;
 
     let mut overrides: Vec<&PathOverride> = config.overrides.iter().collect();
     overrides.sort_by_key(|override_| override_.priority);
     for override_ in overrides {
+        let flags = override_.flags;
         let (writable, executable) = if inner {
-            (override_.inner_writable, override_.inner_executable)
+            (flags.inner_writable(), flags.inner_executable())
         } else {
-            (override_.outer_writable, override_.outer_executable)
+            (flags.outer_writable(), flags.outer_executable())
         };
         for path in &override_.path {
             remount(path, writable, executable, false)?;

@@ -11,6 +11,7 @@
   #
   # https://devenv.sh/packages/
   packages = [ pkgs.git pkgs.sops pkgs.age ];
+  dotenv.enable = true;
 
   # disable mcp
 
