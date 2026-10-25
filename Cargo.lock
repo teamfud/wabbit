@@ -271,6 +271,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bnuuy"
+version = "0.1.0"
+dependencies = [
+ "aya-ebpf",
+ "aya-log-ebpf",
+ "libc",
+ "wabbit-common",
+ "which 6.0.3",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1221,8 +1232,14 @@ name = "wabbit-initrd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aya",
+ "aya-build",
+ "aya-obj",
+ "cargo_metadata",
  "env_logger",
- "wabbit",
+ "libc",
+ "log",
+ "rustix 1.1.4",
 ]
 
 [[package]]

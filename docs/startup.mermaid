@@ -1,0 +1,174 @@
+sequenceDiagram
+    participant kernel as linux kernel
+
+    
+    
+    
+
+    create participant initrd
+    kernel->>initrd: unpack and launch
+    initrd->>initrd: initialize hardware
+    initrd->>initrd: check hash of wabbit-initrd
+    create participant winit as wabbit-initrd
+    initrd->>winit: launch
+    winit->>+kernel: stop the world. freeze all other processes<br>by walking process tree and calling SIGSTOP
+    kernel->>initrd: FREEZE BITCH
+    initrd-->>kernel: [silence]
+    kernel-->>-winit: done.
+    winit->>+kernel: make /lib/modules and<br/>/sysroot/lib/modules immutable via bpf
+    kernel-->>-winit: ack, confirm protections are in place
+    winit->>+kernel: test write perms of /l/m
+    kernel-->>-winit: EPERM
+    winit->>+kernel: attach standalone tracepoint protections against<br/>kmod loading from outside /lib/modules
+    kernel-->>-winit: protections attached, here's an fd
+    winit->>+kernel: test loading a dummy module
+    kernel-->>-winit: errno 0 but no action taken
+    note over winit,kernel: this should ideally cause <br> module loading to fail silently.
+    winit->>+kernel: make bpf maps for allowed bpf pids and<br> whether to allow making new map fds
+    kernel-->>-winit: done, here are fds. no more fds will<br> be handed out
+    winit->>+kernel: restrict bpf syscalls based on pid, temporarily
+    kernel-->>-winit: ok, bpf can't be called by pids not in map
+    winit->>+kernel: verify by spawning another process and<br> doing a bpf syscall
+    kernel-->>-winit: not allowed!
+    
+
+    winit->>+kernel: pin everything to bpffs
+    kernel-->>-winit: done
+    winit->>+kernel: can i access this at the location i expect?
+    kernel-->>-winit: yes
+    winit->>+kernel: copy wabbit to<br>initrd
+    kernel-->>-winit: copied
+    winit->>+kernel: begin poll for /sysroot to be mounted
+    kernel-->>+winit: will notify when sysroot is ready
+    winit->>+kernel: resume the world
+    kernel-->>-winit: done
+    note over initrd: other shit happens
+    note over kernel,initrd: sysroot gets mounted
+    kernel->>-winit: notify of sysroot being mounted
+    winit->>+kernel: stop the world
+    kernel-->>-winit: ack, world stopped
+    winit-->>+kernel: mount necessary runtime filesystems (cgroupfs...)
+    kernel-->>-winit: mounted, here are fds
+    winit->>+kernel: create wabbit cgroup
+    kernel-->>-winit: done, here's fd
+    winit->>+kernel: copy wabbit <br>to initrd
+    kernel-->>-winit: done
+    winit->>+kernel: start wabbit
+    create participant wao as wabbit (outer)
+    kernel->>-wao: start the initializer process with argv[0][0] set to @
+    note over wao: to make sure wabbit-outer can see<br> into userspace later, it needs to<br> grab onto fses now before they<br> are moved to sysroot.
+    wao->>+kernel: open file descriptors for /proc, /sys, /dev, etc
+    kernel-->>-wao: here ya go
+    wao-->>wao: keep those for later
+    wao->>+kernel: read config from rootfs
+    kernel-->>-wao: wspf data
+    wao->>wao: verify config integrity
+    wao->>+kernel: create maps based on configuration
+    kernel-->>-wao: map creation successful
+    wao->>+kernel: check accessibility and integrity of maps
+    kernel-->>-wao: maps accessible
+
+    wao->>+kernel: load and attach bpf protections in non-enforce mode
+    create participant ebpf as wabbit-ebpf
+    kernel->>+ebpf: attach to lsm and tracepoints
+    ebpf-->>kernel: i am active but not enforcing.
+    kernel-->>-wao: bpf programs attached. not enforcing.
+    wao->>+ebpf: start self-tests
+    loop self-test
+        wao->>+kernel: do test action
+        kernel->>+ebpf: can it do that?
+        ebpf-->>-kernel: yes, but i'm logging it
+        kernel-->>-wao: did action
+    end
+    ebpf-->>-wao: end self-tests
+    wao->>+ebpf: did you catch all that?
+    ebpf-->>-wao: yeah, here's a list
+    wao->wao: self-tests done.
+    wao->>ebpf: start enforcing.
+    ebpf-->>wao: ENFORCING.
+    loop self-test
+        wao->>+kernel: do test action
+        kernel->>+ebpf: can it do that?
+        ebpf-->>-kernel: NO.
+        kernel-->>-wao: [errno dependent on action]
+    end
+    wao->>winit: ready for you to back off.
+    loop pre-shutdown self-test
+        winit->>+kernel: do test action
+        kernel->>+ebpf: can it do that?
+        ebpf-->>-kernel: NO.
+        kernel-->>-winit: [errno dependent on action]
+    end
+    note over winit: winit has done its job!
+    winit-->>wao: i'm ready to die
+    wao-->>winit: kys
+    destroy winit
+    winit->>kernel: exit
+
+
+    
+
+
+
+    create participant systemd
+    initrd->>systemd: launch
+    initrd->>systemd: switch root
+    systemd->>systemd: do normal system startup
+    wao->>+kernel: poll for the appearance of /run/systemd/private
+    kernel-->>wao: will lyk
+    note over wao: once systemd has started up, <br>notify wabbit
+    
+
+    wao->>+kernel: use the /proc fd, access "1/root" to see systemd's view of rootfs
+    kernel-->>-wao: get the fd
+    wao-->>+kernel: chroot into main root
+
+
+
+    create actor red as red team
+    red->red: bumble in
+    note over red: red team is gonna<br>try to attack us.
+    red->>kernel: i wanna load a kmod
+    kernel-->>ebpf: check whether the red team's cgroup can load kmods
+    ebpf-->>kernel: fuck no lmao what
+    kernel-->>red: fuck all the way off
+
+    note over blue: blue team sees logs,<br>wants to investigate
+    blue->>wao: signed rpc: spawn /sysroot/bin/sh in rootfs
+    wao->>wao: check signature
+    wao->>kernel: create new child cgroup for process
+    kernel-->>wao: done!
+    wao->>ebpf: grant this cgroup<br>special permissions
+    ebpf-->>wao: done!
+    wao->>kernel: spawn process
+    kernel-->>wao: done, here are its fds
+    wao-->>blue: forward/attach fd to rpc caller binary to allow shell interaction
+    blue-->>blue: you have a secured shell now!
+    
+
+    note over red: try to mess w/ cgroup
+    red->>kernel: attempt to kill wabbit's cgroup
+    kernel->>ebpf: check whether the red team's cgroup can touch wabbit's cgroup
+    ebpf->>kernel: nuh uh :3
+    kernel-->>red: HANDS OFF DA MOICHANDAISE
+
+    note over red: try to edit ebpf map
+    red->>kernel: use bpf() syscall
+    kernel-->>ebpf: check whether the red team's cgroup can do that
+    ebpf-->>kernel: what do you think
+    kernel-->>red: respectfully, go shove a spear up your ass
+    
+    note over red: try to edit firewall rules
+    red->>kernel: we would like to modify iptables configs
+    kernel-->>ebpf: check whether the red team's cgroup can do that
+    ebpf-->>kernel: no
+    kernel-->>red: youw can't mawdify fiewwall wules, sowwy :/
+
+    note over red: red finds a way in, <br> wabbit lets us take<br> it out quickly
+
+    actor blue as blue team
+    note over blue: blue team wins
+    note over blue: blue gets a break from coding
+    note over blue: and kisses a cute girl or smth
+
+    

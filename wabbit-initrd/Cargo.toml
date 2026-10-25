@@ -5,10 +5,19 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-anyhow = { workspace = true, default-features = true }
+anyhow.default-features = true
+anyhow.workspace = true
+aya.workspace = true
+aya-obj.workspace = true
 env_logger = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+rustix = { version = "1.1.4", features = ["fs", "mount", "process"] }
 
-wabbit = { path = "../wabbit" }
+[build-dependencies]
+anyhow = { workspace = true }
+aya-build = { workspace = true }
+cargo_metadata = { workspace = true }
 
 [[bin]]
 name = "wabbit-initrd"

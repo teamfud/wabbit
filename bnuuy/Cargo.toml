@@ -1,0 +1,18 @@
+[package]
+name = "bnuuy"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+wabbit-common = { path = "../wabbit-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+libc.workspace = true
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "wabbit"
+path = "src/main.rs"

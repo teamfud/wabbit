@@ -1,33 +1,74 @@
 [workspace]
-resolver = "2"
-members = [
-    "wabbit",
-    "wabbit-initrd",
-    "wabbit-common",
-    "wabbit-ebpf",
-]
+members = ["wabbit", "wabbit-initrd", "wabbit-common", "wabbit-ebpf", "bnuuy"]
 default-members = ["wabbit", "wabbit-common"]
+resolver = "2"
 
 [workspace.package]
 license = "MIT OR Apache-2.0"
 edition = "2024"
 
-[workspace.dependencies]
-aya = { version = "0.14.0", default-features = false }
-aya-build = { version = "0.2.0", default-features = false }
-aya-ebpf = { version = "0.2.1", default-features = false }
-aya-log = { version = "0.3.0", default-features = false }
-aya-log-ebpf = { version = "0.2.0", default-features = false }
+[workspace.dependencies.anyhow]
+version = "1"
+default-features = false
 
-anyhow = { version = "1", default-features = false }
-cargo_metadata = { version = "0.23.0", default-features = false }
-env_logger = { version = "0.11.5", default-features = false }
-libc = { version = "0.2.159", default-features = false }
-log = { version = "0.4.22", default-features = false }
-tokio = { version = "1.40.0", default-features = false }
-which = { version = "6.0.0", default-features = false }
+[workspace.dependencies.aya]
+version = "0.14.0"
+default-features = false
+
+[workspace.dependencies.aya-build]
+version = "0.2.0"
+default-features = false
+
+[workspace.dependencies.aya-obj]
+version = "0.3.0"
+default-features = false
+
+[workspace.dependencies.aya-ebpf]
+version = "0.2.1"
+default-features = false
+
+[workspace.dependencies.aya-log]
+version = "0.3.0"
+default-features = false
+
+[workspace.dependencies.aya-log-ebpf]
+version = "0.2.0"
+default-features = false
+
+[workspace.dependencies.cargo_metadata]
+version = "0.23.0"
+default-features = false
+
+[workspace.dependencies.env_logger]
+version = "0.11.5"
+default-features = false
+
+[workspace.dependencies.libc]
+version = "0.2.159"
+default-features = false
+
+[workspace.dependencies.log]
+version = "0.4.22"
+default-features = false
+
+[workspace.dependencies.tokio]
+version = "1.40.0"
+default-features = false
+
+[workspace.dependencies.which]
+version = "6.0.0"
+default-features = false
+
+[profile.release]
+strip = "symbols"
+opt-level = 3
 
 [profile.release.package.wabbit-ebpf]
-debug = 2
 codegen-units = 1
+debug = 2
+strip = false
+
+[profile.release.package.bnuuy]
+codegen-units = 1
+debug = 2
 strip = false

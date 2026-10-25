@@ -19,6 +19,9 @@ devenv.local.yaml
 # pre-commit
 .pre-commit-config.yaml
 
-PREFERENCES.toml
-ARCHITECTURE.md
-AGENTS.md
+# VM lab: cached cloud images and downloaded artifacts
+vm/qemu/cache/
+
+# PREFERENCES.toml
+# architecture/
+# AGENTS.md

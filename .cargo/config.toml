@@ -5,3 +5,7 @@ runner = "sudo -E"
 # Randomize repr(Rust) type layouts to make assumptions about memory layout
 # harder to exploit. This requires a nightly rustc.
 rustflags = ["-Z", "randomize-layout"]
+
+[target.'cfg(target_os = "linux")']
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=/home/linuxbrew/.linuxbrew/bin/mold"]

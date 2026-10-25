@@ -6,70 +6,19 @@ THIS IS FOR EDUCATIONAL USE BY BLUE TEAMS IN REGULATED CTFs ONLY. DO NOT USE THI
 
 NOT an edr
 
+abuses cgroups and eBPF to create a "higher-than-root" privileged class of processes on a system, immune to many types of red team tampering.
+
+## Documentation
+
+- [docs/wabbit-initrd.md](docs/wabbit-initrd.md) — the exact boot sequence
+  `wabbit-initrd` follows, its failure-safety design, and the full log of
+  every kernel, verifier, and toolchain problem solved to make it work on
+  real distro kernels.
+- [AGENTS.md](AGENTS.md) — the architecture reference for working on the
+  codebase.
+- [vm/README.md](vm/README.md) — the QEMU + KVM test lab.
 
 
-
-## Prerequisites
-
-1. nightly rust toolchain: `rustup toolchain install nightly --component rust-src`
-1. (if cross-compiling) rustup target: `rustup target add ${ARCH}-unknown-linux-musl`
-1. (if cross-compiling) LLVM: (e.g.) `brew install llvm` (on macOS)
-1. bpf-linker: `cargo install bpf-linker` (`--no-default-features` on macOS)
-
-The workspace Cargo configuration enables rustc's nightly `-Z randomize-layout` option. It
-randomizes layouts of ordinary `repr(Rust)` types; explicitly represented FFI layouts such as
-`repr(C)` remain stable.
-
-## Build & Run
-
-Use `cargo build`, `cargo check`, etc. as normal. Run your program with:
-
-```shell
-cargo run --release
-```
-
-Cargo build scripts are used to automatically build the eBPF correctly and include it in the
-program.
-
-The `wabbit-initrd` binary is a small initrd entry point for applying the same
-`RootFSConfig` policy without starting the main tracer or IPC server:
-
-```sh
-WABBIT_FILESYSTEM_CONFIGURATION_FILE=/etc/wabbit/rootfs.wspf \
-  wabbit-initrd --outer
-wabbit-initrd --namespace --inner
-```
-
-Use `--outer` before entering a private namespace and `--inner` after entering one. The
-`--namespace` option creates and privatizes a mount namespace before applying the inner policy.
-
-Policies are stored as a versioned binary file (the `WSPF` format). Set
-`WABBIT_FILESYSTEM_CONFIGURATION_FILE` to the file path; both `wabbit` and `wabbit-initrd` read it.
-Policies contain an Ed25519 signature over the policy header and payload and are verified against
-the compiled-in `policy::POLICY_PUBLIC_KEY`; unsigned policies are rejected. A `policy::Policy` is a
-set of optional sections; the filesystem configuration (`RootFSConfig` and `PathOverride`) is the
-`rootfs` section, defined in `policy::rootfs`. The `wabbit::policy` module exposes `sign` (which
-takes a 32-byte Ed25519 private key), `to_signed_bytes`, `from_bytes`, `read_file`, and
-`write_new_signed` for callers that need to generate or validate policy files.
-
-When `WABBIT_IPC_SOCKET` is set, wabbit exposes a Unix-domain IPC socket to the namespace process.
-A client can use `wabbit::ipc::NamespaceIpc::connect(socket_path)` and call
-`reconfigure_filesystems` with the bytes of a signed policy file to apply it, for example to replace
-the writable and executable mounts. The server verifies the signature before applying anything.
-`apply_rootfs_config(&config, false)` applies the outer policy, while
-`apply_rootfs_config(&config, true)` applies the inner policy after entering a private namespace.
-
-## Cross-compiling on macOS
-
-Cross compilation should work on both Intel and Apple Silicon Macs.
-
-```shell
-cargo build --package wabbit --release \
-  --target=${ARCH}-unknown-linux-musl \
-  --config=target.${ARCH}-unknown-linux-musl.linker=\"rust-lld\"
-```
-The cross-compiled program `target/${ARCH}-unknown-linux-musl/release/wabbit` can be
-copied to a Linux server or VM and run there.
 
 ## License
 

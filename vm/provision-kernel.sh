@@ -52,12 +52,22 @@ if [[ ! -s /sys/kernel/btf/vmlinux ]]; then
   exit 1
 fi
 
-install -m 0755 /tmp/wabbit /usr/local/bin/wabbit
-rm -f /tmp/wabbit
+install -m 0755 /tmp/wabbit-initrd /usr/local/bin/wabbit-initrd
+rm -f /tmp/wabbit-initrd
+
+# The BPF LSM must be in the kernel's LSM boot list or none of bnuuy can
+# attach; none of the target distros enable it by default.
+if command -v grubby >/dev/null 2>&1; then
+  grubby --update-kernel=ALL --args="lsm=bpf"
+else
+  sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="lsm=bpf /' /etc/default/grub
+  update-grub
+fi
+echo "lsm=bpf set; reboot to activate it"
 
 echo
 echo "wabbit kernel VM ready"
-echo "  artifact: /usr/local/bin/wabbit"
+echo "  artifact: /usr/local/bin/wabbit-initrd (embeds wabbit and bnuuy)"
 echo "  kernel: $(uname -r)"
 echo "  BTF: /sys/kernel/btf/vmlinux"
 echo "  bpftrace: $(bpftrace --version 2>/dev/null || echo unavailable)"

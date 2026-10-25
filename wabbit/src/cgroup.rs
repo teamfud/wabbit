@@ -28,14 +28,22 @@ struct Cgroup {
 
 impl Cgroup {
     /// get the child cgroups of this cgroup
-    fn get_children(&self) -> &[Cgroup] {}
+    fn get_children(&self) -> &[Cgroup] {
+        todo!("walking cgroup children")
+    }
 
     /// get the tasks in this cgroup
-    fn get_tasks(&self) -> &[OwnedFd] {}
+    fn get_tasks(&self) -> &[OwnedFd] {
+        todo!("listing cgroup tasks")
+    }
 
     /// create a cgroup out of thin air
-    fn new(name: &str, allow_children: bool, owner: Cgroup) -> Result<Self, Errno> {}
+    fn new(name: &str, allow_children: bool, owner: Cgroup) -> Result<Self, Errno> {
+        todo!("creating a cgroup")
+    }
 
     /// assemble a wabbit cgroup struct from an existing cgroup.
-    fn assemble(fd: OwnedFd, allow_children: bool) -> Self {}
+    fn assemble(fd: OwnedFd, allow_children: bool) -> Self {
+        todo!("assembling a cgroup from a file descriptor")
+    }
 }
