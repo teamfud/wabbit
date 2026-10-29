@@ -16,8 +16,11 @@
 #   up <distro>      boot a fresh VM (KVM) and wait for ssh
 #   ssh <distro>     open a shell in the running VM
 #   down <distro>    stop the VM and delete its throwaway disks
-#   test <distro>    up → lsm=bpf → reboot → run wabbit-initrd → 
-#                    decode the bnuuy sign → down
+#   test <distro>    up → lsm=bpf → reboot → run wabbit-initrd → wabbit
+#                    → decode the bnuuy sign → down
+#   deploy <distro>  up → wabbit-install (hooks, lsm=bpf, initramfs rebuild)
+#                    → reboot into the real boot chain → watch the console
+#                    for wabbit → down
 #   sign <file>      decode a bnuuy sign file
 #   clean            delete all run state (cached images are kept)
 #
@@ -79,6 +82,11 @@ vm_ssh() {
 }
 
 artifact="${WABBIT_LAB_ARTIFACT:-$repo/target/x86_64-unknown-linux-musl/release/wabbit-initrd}"
+# The installer: musl as well — the lab's build host glibc is newer than
+# every guest's, and a glibc-linked binary would refuse to run there. Its
+# build script bundles the whole chain (the musl wabbit-initrd artifact,
+# which embeds wabbit and bnuuy), so building it refreshes everything.
+installer="${WABBIT_LAB_INSTALLER:-$repo/target/x86_64-unknown-linux-musl/release/wabbit-install}"
 
 require_artifact() {
   if [[ ! -x "$artifact" ]]; then
@@ -86,6 +94,16 @@ require_artifact() {
     echo "run ./vm/build-artifact.sh first" >&2
     exit 1
   fi
+}
+
+require_installer() {
+  # Build (or refresh) the installer: cargo's own freshness check decides
+  # whether anything needs rebuilding — the build script watches every
+  # source that feeds the bundle, so an unconditional build is a no-op when
+  # fresh and a rebuild when not. A stale-but-present binary must never be
+  # uploaded just because it exists.
+  echo "building $installer (its build script bundles the whole chain)"
+  cargo build --locked --release --target x86_64-unknown-linux-musl -p wabbit-install
 }
 
 fetch() {
@@ -148,7 +166,6 @@ make_seed() {
 
 up() {
   local distro="$1" dir image port
-  require_artifact
   fetch "$distro"
   dir="$(run_dir "$distro")"
   image="$(image_file "$distro")"
@@ -260,50 +277,66 @@ run_test() {
   # depending on the session it freezes.
   #
   # The world freezes during bnuuy setup and thaws right after; the sysroot
-  # poll then blocks forever (nothing mounts /sysroot in a booted system),
-  # so the run is bounded by timeout(1) — exit 124 is the expected outcome,
-  # not a failure. The freeze takes the ssh session that started the run
-  # with it, so the process must be detached (setsid) with its output going
-  # to a guest-local file, and the host polls for the exit marker over ssh.
-  # While the guest world is frozen, sshd is frozen too, so a poll just
-  # fails fast (ConnectTimeout) until the world thaws — the freeze is
-  # brief, and a winit that never thaws is caught by the host-side deadline
-  # below, after which the VM is destroyed (a truly hung run leaves its
-  # evidence in console.log; every other outcome's sign is copied out
-  # first).
+  # poll then blocks — nothing mounts /sysroot in a booted system — unless
+  # the harness presents the live root there, which it does: a bind of /
+  # at /sysroot satisfies the poll's own rules (a root at a known mount
+  # point, then the nested mounts its fstab announces, then a few quiet
+  # polls), so the run proceeds through the real launch path — the second
+  # freeze, cgroup2, the memfd wabbit — and wabbit itself gets tested on
+  # every distro, not just its protector.
   #
-  # The window must also stay short: from the moment verification passes
-  # until the timeout kills the process, bnuuy denies every bpf(2) call in
-  # the system except wabbit-initrd's own — by design — and a live systemd
-  # host only tolerates that for so long (udevd's watchdog limit is three
-  # minutes). Verification completes in a couple of seconds, so the default
-  # leaves ample margin.
+  # The success state has no ssh in it: a started wabbit parks waiting for
+  # Ctrl-C, wabbit-initrd babysits it with the world FROZEN (the documented
+  # design until the handoff step exists), and the freeze stops the guest's
+  # timeout(1) and sshd with it. Nothing guest-side can end the run, so the
+  # runner sends wabbit-initrd's output to /dev/console and the host
+  # follows the qemu serial console, which drains no matter what the guest
+  # does. PASS = the console shows wabbit-initrd's phases and wabbit's
+  # parking marker; the teardown destroys the VM (and with it the frozen
+  # world — nothing else can).
+  #
+  # The failure paths thaw (the Drop backstop or the watchdog resume the
+  # world when wabbit-initrd exits), so the host polls for the exit marker
+  # over ssh too and pulls the sign and the full log out for the verdict.
   local seconds="${WABBIT_LAB_TEST_TIMEOUT:-30}"
-  local dir deadline
+  local distro="$1" dir console deadline status
   dir="$(run_dir "$distro")"
-  deadline=$((seconds + 90))
+  console="$dir/console.log"
+  deadline=$((seconds + 120))
 
   # Artifact in (over ssh; /root is never mounted noexec, unlike some /tmp).
   vm_ssh "$distro" 'sudo tee /root/wabbit-initrd >/dev/null' <"$artifact"
   vm_ssh "$distro" 'sudo chmod 700 /root/wabbit-initrd && test -x /root/wabbit-initrd'
 
+  # Present the live root at /sysroot so the sysroot poll completes (see
+  # above). The bind exposes the fstab the poll reads for its nested-mount
+  # expectations, so nothing else is needed.
+  vm_ssh "$distro" 'sudo mkdir -p /sysroot && sudo mount --bind / /sysroot'
+
   # The runner is detached (setsid) so the freeze of the launching session
-  # cannot take it with it, and writes the exit marker to guest tmpfs after
-  # winit exits and the Drop backstop thaws whatever it froze. The sign goes
-  # to /run, which needs no setup and dies with the VM — the host copies it
-  # out below.
+  # cannot take it with it. wabbit-initrd's output goes to the console —
+  # the one channel the host can still read once the world freezes — and
+  # the exit marker to guest tmpfs, for the thawed failure paths.
+  # RUST_LOG=info, not debug: wabbit inherits it, and its guard tracepoint
+  # logs per-syscall at debug — a 30-second window at debug floods the log
+  # with every syscall on every cpu.
   vm_ssh "$distro" 'sudo tee /root/run-winit.sh >/dev/null' <<EOF
 #!/bin/sh
 mkdir -p /run/wabbit
-RUST_LOG=debug timeout --signal=TERM --kill-after=10 $seconds /root/wabbit-initrd \\
-  > /run/wabbit/winit.log 2>&1
+RUST_LOG=info timeout --signal=TERM --kill-after=10 $seconds /root/wabbit-initrd \\
+  >/dev/console 2>&1
 echo \$? > /run/wabbit/exit-status
 EOF
   vm_ssh "$distro" \
     'sudo setsid sh /root/run-winit.sh >/dev/null 2>&1 & echo launched'
 
-  local status=""
   while :; do
+    if grep -q "Waiting for Ctrl-C" "$console" 2>/dev/null; then
+      echo "=== the run as seen on the serial console ==="
+      grep -nE "\[wabbit |Waiting for Ctrl-C" "$console" | tail -30 || true
+      echo "PASS: wabbit started and parked (world frozen by design until teardown)"
+      return 0
+    fi
     if status=$(vm_ssh "$distro" \
         'test -f /run/wabbit/exit-status && cat /run/wabbit/exit-status' \
         2>/dev/null); then
@@ -312,21 +345,115 @@ EOF
     sleep 3
     deadline=$((deadline - 3))
     if [ "$deadline" -le 0 ]; then
-      echo "wabbit-initrd did not finish within its window; hung without resuming?"
-      echo "log so far (empty if the world is still frozen):"
-      vm_ssh "$distro" 'sudo cat /run/wabbit/winit.log 2>/dev/null' || true
+      echo "the run reached neither a parked wabbit nor an exit within its window; console said:"
+      grep -nE "\[wabbit |failed|Waiting for Ctrl-C" "$console" | tail -25 || true
       return 1
     fi
   done
 
-  vm_ssh "$distro" 'sudo cat /run/wabbit/winit.log' >"$dir/winit.log" || true
+  # Thawed exit: wabbit did not park (or never started). Pull everything
+  # the ssh path can reach — the sign explains every failure — and fail.
   vm_ssh "$distro" 'sudo cat /run/bnuuy.bin' >"$dir/bnuuy.bin" || true
-  cat "$dir/winit.log"
-  echo "wabbit-initrd exit code: $status (124 = timed out in the sysroot poll, expected)"
+  echo "=== the bnuuy sign, as read by the host ==="
+  if [ -s "$dir/bnuuy.bin" ]; then
+    decode_sign "$dir/bnuuy.bin"
+  else
+    echo "(no sign was left: wabbit-initrd exited clean, or hung before writing one)"
+  fi
+  echo "=== the run as seen on the serial console ==="
+  grep -nE "\[wabbit |failed" "$console" | tail -30 || true
+  echo "wabbit-initrd exit code: $status"
+  echo "FAIL: wabbit never parked; see the sign and console above"
+  return 1
+}
+
+# Decode a bnuuy sign file: magic "BNUY", u16 LE version, then records of
+# {u64 LE ms since boot, u8 kind, u32 LE length, UTF-8 text}.
+decode_sign() {
+  python3 - "$1" <<'PY'
+import struct, sys
+data = open(sys.argv[1], 'rb').read()
+assert data[:4] == b'BNUY', 'not a bnuuy sign'
+kinds = {0: 'doc', 1: 'phase', 2: 'failure', 3: 'watchdog', 4: 'panic'}
+off = 6
+while off < len(data):
+    ts, kind, length = struct.unpack_from('<QBI', data, off); off += 13
+    print(f'[{ts:>8} ms] {kinds.get(kind, kind):>8}: {data[off:off+length].decode()}')
+    off += length
+PY
 }
 
 test_distros=(noble jammy bookworm rocky)
 [[ $(uname -m) == x86_64 ]] || { echo "the lab is x86_64-only for now" >&2; exit 1; }
+
+# The real deployment flow: install through wabbit-install — the distro's
+# own initramfs extension points, the lsm=bpf enrollment, the initramfs
+# rebuild — then reboot and watch the boot chain run for real.
+#
+# The second boot never finishes: wabbit-initrd babysits wabbit with the
+# world frozen and the pre-switch wait holds the init there, which is the
+# documented choreography until the handoff step exists. So the guest
+# answers no ssh during the test (sshd is frozen; the boot never reaches
+# it anyway) — the host follows the serial console instead, which qemu
+# drains into a host-side file no matter what the guest does. winit's log
+# lines and wabbit's printlns land there; the bnuuy sign itself lives in
+# the initramfs /run and cannot be retrieved, but every phase it records
+# is also logged at info.
+deploy() {
+  # The EXIT trap fires at script exit — long after this function has
+  # returned and its locals have died — so `distro` must be the global,
+  # or `down "$distro"` fails as "unbound variable" and the VM is never
+  # torn down (the frozen world leaks until the qemu process is killed by
+  # hand).
+  distro="$1"
+  local dir console
+  dir="$(run_dir "$distro")"
+  require_installer
+
+  up "$distro"
+  trap 'down "$distro"' EXIT
+
+  # The installer places everything through the distro's own tooling —
+  # this is the flow a real deployment uses, which is the point: `test`
+  # proves the protections, this proves the placement.
+  vm_ssh "$distro" 'cat > /tmp/wabbit-install' <"$installer"
+  vm_ssh "$distro" 'chmod 700 /tmp/wabbit-install'
+  vm_ssh "$distro" 'sudo /tmp/wabbit-install'
+
+  # The test boot. The connection drops mid-reboot; the qemu process and
+  # its serial file persist across the guest reboot.
+  vm_ssh "$distro" 'sudo reboot' 2>/dev/null || true
+  echo "rebooted into the protected boot chain; watching the console"
+
+  console="$dir/console.log"
+  local deadline="${WABBIT_LAB_DEPLOY_TIMEOUT:-300}" waited=0
+  while :; do
+    if grep -q "wabbit-initrd failed:" "$console" 2>/dev/null; then
+      echo "=== the boot chain as seen on the console ==="
+      grep -nE "\[wabbit |wabbit-initrd failed" "$console" | tail -25 || true
+      echo "FAIL: wabbit-initrd failed during the boot chain on $distro"
+      keep=1
+      down "$distro" || true
+      exit 1
+    fi
+    if grep -q "Waiting for Ctrl-C" "$console" 2>/dev/null; then
+      echo "=== the boot chain as seen on the console ==="
+      grep -nE "\[wabbit |Waiting for Ctrl-C" "$console" | tail -25 || true
+      echo "PASS: $distro booted installer → initramfs hooks → wabbit-initrd → wabbit (running, world frozen by design)"
+      break
+    fi
+    if [ "$waited" -ge "$deadline" ]; then
+      echo "the boot chain never reached wabbit within ${deadline}s; the console said:"
+      grep -nE "\[wabbit |bnuuy|failed|Waiting for Ctrl-C" "$console" | tail -25 || true
+      echo "FAIL: the protected boot chain did not reach wabbit on $distro"
+      keep=1
+      down "$distro" || true
+      exit 1
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+}
 
 command="${1:-}"; shift || true
 case "$command" in
@@ -340,52 +467,24 @@ case "$command" in
     ;;
   down) down "${1:?distro}" ;;
   clean) rm -rf "$state"; echo "run state deleted; cached images kept in $cache" ;;
-  sign) python3 - "$@" <<'PY'
-import struct, sys
-data = open(sys.argv[1], 'rb').read()
-assert data[:4] == b'BNUY', 'not a bnuuy sign'
-kinds = {0: 'doc', 1: 'phase', 2: 'failure', 3: 'watchdog', 4: 'panic'}
-off = 6
-while off < len(data):
-    ts, kind, length = struct.unpack_from('<QBI', data, off); off += 13
-    print(f'[{ts:>8} ms] {kinds.get(kind, kind):>8}: {data[off:off+length].decode()}')
-    off += length
-PY
-  ;;
+  sign) decode_sign "${1:?sign file}" ;;
   test)
     distro="${1:?distro}"
+    require_artifact
     up "$distro"
     trap 'down "$distro"' EXIT
     enable_bpf_lsm "$distro"
-    # (The artifact upload and sign retrieval both live inside run_test.)
-    echo "=== running wabbit-initrd in the VM (bounded by a ${WABBIT_LAB_TEST_TIMEOUT:-30}s window, killed at its end by design) ==="
+    echo "=== running wabbit-initrd and wabbit in the VM (wabbit parks with the world frozen; teardown ends it) ==="
     # Ground truth for the tracepoint record layout the fork watcher reads:
     # the kernel's own field offsets for sched_process_fork (tracefs is
-    # root-only, so the read itself needs sudo too).
+    # root-only, so the read itself needs sudo too). wabbit's guard
+    # tracepoint needs tracefs mounted as well — aya reads the event id
+    # from there when attaching.
     vm_ssh "$distro" 'sudo mount -t tracefs none /sys/kernel/tracing 2>/dev/null || true
       sudo cat /sys/kernel/tracing/events/sched/sched_process_fork/format' || true
-    run_test "$distro" || true
-    echo "=== the bnuuy sign, as read by the host ==="
-    if [ ! -s "$(run_dir "$distro")/bnuuy.bin" ]; then
-      echo "(no sign was retrieved: wabbit-initrd hung before writing one, or exited clean)"
+    if run_test "$distro"; then
+      echo "PASS: $distro — bnuuy attached and verified, wabbit started and parked"
     else
-    python3 - "$(run_dir "$distro")/bnuuy.bin" <<'PY'
-import struct, sys
-data = open(sys.argv[1], 'rb').read()
-assert data[:4] == b'BNUY', 'not a bnuuy sign'
-kinds = {0: 'doc', 1: 'phase', 2: 'failure', 3: 'watchdog', 4: 'panic'}
-off = 6
-while off < len(data):
-    ts, kind, length = struct.unpack_from('<QBI', data, off); off += 13
-    print(f'[{ts:>8} ms] {kinds.get(kind, kind):>8}: {data[off:off+length].decode()}')
-    off += length
-PY
-    fi
-    echo "=== verdict ==="
-    if grep -q "bnuuy protections attached and verified" "$(run_dir "$distro")/bnuuy.bin" 2>/dev/null; then
-      echo "PASS: bnuuy attached and verified on $distro"
-    else
-      echo "FAIL: see the sign above and $(run_dir "$distro")/console.log"
       # A real assignment, not a command prefix: the EXIT trap's `down` must
       # also see it, or the state meant for inspection gets deleted.
       keep=1
@@ -393,5 +492,6 @@ PY
       exit 1
     fi
     ;;
-  *) echo "usage: lab.sh {fetch|up|ssh|down|test|sign|clean} <distro>" >&2; exit 1 ;;
+  deploy) deploy "${1:?distro}" ;;
+  *) echo "usage: lab.sh {fetch|up|ssh|down|test|deploy|sign|clean} <distro>" >&2; exit 1 ;;
 esac

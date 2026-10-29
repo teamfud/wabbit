@@ -132,8 +132,35 @@ fn pidfiles() -> (String, String) {
     )
 }
 
+/// The initramfs-tools prereqs protocol: mkinitramfs invokes every script
+/// under `scripts/` with the argument `prereqs` at *build* time to collect
+/// ordering (fed to `tsort`), and only runs the body at boot. Without the
+/// guard, the boot-time body runs during the initramfs rebuild — launching
+/// the protector from the staging host (where the image binary does not
+/// exist) and then waiting forever for a boot-time pin that never comes,
+/// hanging the rebuild inside `tsort`. dracut never passes `prereqs`, so
+/// the same guarded script serves both flavors.
+const PREREQS_PREAMBLE: &str = r#"PREREQ=""
+prereqs() {
+    echo "$PREREQ"
+}
+case "$1" in
+prereqs)
+    prereqs
+    exit 0
+    ;;
+esac
+"#;
+
 /// The launch hook: the documented `/init` recipe, run from the flavor's
 /// launch slot. POSIX sh — initramfs hooks run under busybox too.
+///
+/// `setsid` keeps terminal and job-control signals away from the protector
+/// and everything it spawns, but no initrd guarantees it exists (noble's
+/// carries none), so the hook degrades to a plain background launch when
+/// it is missing rather than failing the boot step. The pin wait is
+/// fail-open for the same reason: a protector that dies before arming
+/// must never hang the boot — an unprotected boot beats a frozen one.
 fn launch_hook() -> String {
     let name = brand::NAME;
     let binary = image_binary();
@@ -141,11 +168,15 @@ fn launch_hook() -> String {
     format!(
         r#"#!/bin/sh
 # {name}: launch the initrd protector. This slot runs after /proc, /sys,
-# and /dev are mounted, before any root mounting. setsid keeps
-# job-control signals away from the protector and everything it spawns;
-# the console never blocks when the world freezes (a pipe-backed stderr
-# would). RUST_LOG matters: env_logger defaults to error-only.
-RUST_LOG=info setsid {binary} </dev/null >/dev/console 2>&1 &
+# and /dev are mounted, before any root mounting. The console never
+# blocks when the world freezes (a pipe-backed stderr would). RUST_LOG
+# matters: env_logger defaults to error-only.
+{PREREQS_PREAMBLE}
+if command -v setsid >/dev/null 2>&1; then
+    RUST_LOG=info setsid {binary} </dev/null >/dev/console 2>&1 &
+else
+    RUST_LOG=info {binary} </dev/null >/dev/console 2>&1 &
+fi
 protector_pid=$!
 pidfile={pidfile_run}
 if ! echo "$protector_pid" >"$pidfile" 2>/dev/null; then
@@ -157,8 +188,16 @@ fi
 # (or systemd) cannot be frozen. This hook runs synchronously from the
 # init flow, so waiting here means nothing proceeds until the
 # protector's first pin exists. The freeze may stop this very wait; the
-# protector resumes it when the world thaws.
-while [ ! -e /sys/fs/bpf/boot/bpf ]; do sleep 0.1; done
+# protector resumes it when the world thaws. Fail-open: a protector that
+# died before arming releases the boot to continue unprotected —
+# waiting for a pin from a dead process would hang the boot forever.
+while [ ! -e /sys/fs/bpf/boot/bpf ]; do
+    if ! kill -0 "$protector_pid" 2>/dev/null; then
+        echo "{name}: the protector exited before arming; continuing unprotected" >/dev/console
+        break
+    fi
+    sleep 0.1
+done
 "#
     )
 }
@@ -176,6 +215,7 @@ fn switch_wait_hook() -> String {
 # runs indefinitely, so a full deployment holds here until it exits —
 # this is the documented choreography, not a defect. Reinstall with
 # --no-switch-wait to omit this hook.
+{PREREQS_PREAMBLE}
 for pidfile in {pidfile_run} {pidfile_dev}; do
     if [ -f "$pidfile" ]; then
         protector_pid=$(cat "$pidfile")
@@ -187,7 +227,10 @@ done
 }
 
 /// The initramfs-tools build hook: carries the binary into the image at
-/// mkinitramfs time, with `$DESTDIR` as the staging tree.
+/// mkinitramfs time, with `$DESTDIR` as the staging tree. `setsid` comes
+/// along when the host has it (the launch hook degrades to a plain
+/// background launch when the image lacks it — best effort, never a
+/// failure).
 fn initramfs_tools_build_hook() -> String {
     let name = brand::NAME;
     let system = system_binary();
@@ -204,6 +247,11 @@ fi
 mkdir -p "$DESTDIR"
 if command -v copy_exec >/dev/null 2>&1; then
     copy_exec {system} {binary}
+    if command -v setsid >/dev/null 2>&1; then
+        copy_exec "$(command -v setsid)"
+    else
+        echo "{name} hook: no setsid on this host; the launch hook will run without it" >&2
+    fi
 else
     cp {system} "$DESTDIR{binary}"
     chmod 0755 "$DESTDIR{binary}"
@@ -232,6 +280,14 @@ install() {{
     # The binary at a stable system path; inside the image it is
     # {binary}, at the initramfs root.
     inst_binary {system} {binary}
+
+    # setsid for the launch hook's session isolation — best effort; the
+    # hook degrades to a plain background launch without it.
+    if command -v setsid >/dev/null 2>&1; then
+        inst_binary setsid
+    else
+        echo "{name}: no setsid on this host; the launch hook will run without it" >&2
+    fi
 
     # The hooks. $hookdir is dracut's in-image hook root (usr/lib on
     # merged-/usr systems); they run in lexical order within each dir.
@@ -480,7 +536,10 @@ fn find_artifact(options: &Options) -> Artifact {
 fn remove(options: &Options, flavor: Flavor) -> ! {
     let name = brand::NAME;
     if flavor == Flavor::InitramfsTools {
-        remove_file(options.dry_run, &format!("/etc/initramfs-tools/hooks/{name}"));
+        remove_file(
+            options.dry_run,
+            &format!("/etc/initramfs-tools/hooks/{name}"),
+        );
         remove_file(
             options.dry_run,
             &format!("/etc/initramfs-tools/scripts/init-premount/{name}"),
@@ -579,7 +638,11 @@ fn install(options: &Options, flavor: Flavor) {
                 &format!("{module}/module-setup.sh"),
                 &dracut_module_setup(),
             );
-            run(options.dry_run, "dracut", &["--force", "--add", brand::NAME]);
+            run(
+                options.dry_run,
+                "dracut",
+                &["--force", "--add", brand::NAME],
+            );
         }
     }
 
@@ -766,6 +829,37 @@ mod tests {
         assert!(switch_wait_hook().contains("kill -0 \"$protector_pid\""));
     }
 
+    /// The launch hook must degrade rather than fail: no `setsid` in the
+    /// image (noble's initramfs ships none — the deploy lab caught the
+    /// resulting hang) means a plain background launch, and a protector
+    /// that dies before arming must release the boot, not hang it in the
+    /// pin wait — an unprotected boot beats a frozen one.
+    #[test]
+    fn the_launch_hook_fails_open() {
+        let hook = launch_hook();
+        assert!(
+            hook.contains("if command -v setsid >/dev/null 2>&1; then"),
+            "the launch must fall back to a plain background launch"
+        );
+        assert!(
+            hook.contains("RUST_LOG=info /") || hook.contains("RUST_LOG=info {"),
+            "the fallback launch line is missing"
+        );
+        assert!(
+            hook.contains("continuing unprotected"),
+            "a dead protector must break the pin wait"
+        );
+    }
+
+    /// Both flavors' build hooks carry `setsid` into the image when the
+    /// host has it, so the launch hook's preferred path exists in the
+    /// initrd.
+    #[test]
+    fn the_build_hooks_carry_setsid() {
+        assert!(initramfs_tools_build_hook().contains("copy_exec \"$(command -v setsid)\""));
+        assert!(dracut_module_setup().contains("inst_binary setsid"));
+    }
+
     #[test]
     fn the_dracut_module_uses_dracut_hook_dirs() {
         let setup = dracut_module_setup();
@@ -787,6 +881,29 @@ mod tests {
         assert!(initramfs_tools_build_hook().contains(&system_binary()));
         assert!(dracut_module_setup().contains(&format!("01-{name}.sh")));
         assert!(system_binary().contains(&format!("/usr/lib/{name}/{name}")));
+    }
+
+    /// Both initramfs-tools hooks must answer the build-time `prereqs`
+    /// invocation and exit before their boot-time body: mkinitramfs runs
+    /// every `scripts/` entry with `prereqs` while collecting ordering,
+    /// and without the guard the rebuild launches the protector from the
+    /// staging host and then waits forever for a boot-time pin — exactly
+    /// the hang the deploy lab caught (`tsort` never seeing EOF).
+    #[test]
+    fn the_hooks_answer_the_prereqs_invocation() {
+        for (hook, body) in [
+            (launch_hook(), "RUST_LOG=info setsid"),
+            (switch_wait_hook(), "for pidfile in"),
+        ] {
+            let guard = hook
+                .find("case \"$1\" in\nprereqs)\n    prereqs\n    exit 0\n    ;;\nesac")
+                .expect("the prereqs guard is missing");
+            let body_at = hook.find(body).expect("the hook's body is missing");
+            assert!(
+                guard < body_at,
+                "the prereqs guard must exit before the boot-time body"
+            );
+        }
     }
 
     /// The build script really did bundle an artifact: a non-empty ELF.

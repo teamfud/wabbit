@@ -1,7 +1,5 @@
 use aya_ebpf::btf_maps::Array;
 
-
-
 // btf_map full of cgroup ids
 static mut CGROUP_IDS: Array<usize, { u8::MAX as usize }> = Array::new();
 

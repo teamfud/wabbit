@@ -41,15 +41,38 @@ behavior is shared rather than duplicated.
 
 The target matrix — Rocky 9, Debian 12, Ubuntu 22.04, Ubuntu 24.04 — is
 exercised by `vm/qemu/lab.sh`, a QEMU + KVM lab that needs no host root:
-it boots disposable overlay VMs over cached cloud images, sets `lsm=bpf`
+it boots disposable overlay VMs over cached cloud images and sets `lsm=bpf`
 on the kernel command line (no target distro enables the BPF LSM by
-default, and without it nothing of bnuuy can attach), runs the musl
-artifact bounded by `timeout(1)` — the sysroot poll never completes in a
-booted system, so exit 124 is the expected outcome — and decodes the bnuuy
-sign from the host side over ssh. `vm/README.md` documents the
-flow and the per-distro kernel-compatibility expectations; a Vagrantfile
-exists for VirtualBox hosts. `./vm/build-artifact.sh` builds the artifact
-the labs consume.
+default, and without it nothing of bnuuy can attach). Two flows:
+
+* `test <distro>` proves the launch path in a booted system: the musl
+  artifact (from `./vm/build-artifact.sh`) is uploaded and run detached,
+  with the live root bind-mounted at `/sysroot` so the sysroot poll
+  completes and the real launch path — the second freeze, cgroup2, the
+  memfd wabbit — actually runs, testing wabbit itself on every distro.
+  The success state has no ssh in it (wabbit parks while wabbit-initrd
+  babysits it with the world frozen, the documented design until the
+  handoff step exists, and the freeze stops the guest's timeout and sshd
+  too), so the runner sends wabbit-initrd's output to the console and
+  the verdict watches the qemu serial console for the phase lines and
+  wabbit's `Waiting for Ctrl-C` marker; teardown destroys the frozen
+  world. The failure paths thaw (the Drop backstop or the watchdog),
+  so the host pulls the bnuuy sign out over ssh as the forensic record.
+* `deploy <distro>` proves the placement: `wabbit-install` (built musl —
+  the host glibc is newer than every guest's) is uploaded and run as
+  root, placing the artifact through the distro's own initramfs
+  extension points, enrolling `lsm=bpf`, and rebuilding the initramfs;
+  the reboot boots the real chain (init → launch hook → wabbit-initrd →
+  sysroot poll → wabbit), which never finishes by design — wabbit is
+  babysat frozen and the pre-switch wait holds the init — so the verdict
+  watches the qemu serial console (the launch hook's `>/dev/console`
+  redirect) for winit's info lines and wabbit's `Waiting for Ctrl-C`
+  marker.
+
+`vm/README.md` documents the flow and the per-distro
+kernel-compatibility expectations; a Vagrantfile exists for VirtualBox
+hosts. `./vm/build-artifact.sh` builds the artifact the `test` flow
+consumes; the `deploy` flow builds its own installer.
 
 ## Startup lifecycle
 

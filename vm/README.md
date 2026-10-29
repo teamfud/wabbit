@@ -1,9 +1,11 @@
 # Wabbit kernel test VMs
 
 The target matrix is Rocky 9, Debian 12, Ubuntu 22.04, and Ubuntu
-24.04. The lab runs the host-built artifact — the `wabbit-initrd`
-executable, static musl, embedding both the `wabbit` binary and the bnuuy
-eBPF object — so no VM ever needs a compiler.
+24.04. The lab runs host-built artifacts — the `wabbit-initrd` executable
+and the `wabbit-install` installer, both static musl, embedding the whole
+chain (the installer bundles the installer-time `wabbit-initrd`, which
+embeds `wabbit` and the bnuuy eBPF object) — so no VM ever needs a
+compiler.
 
 ## QEMU + KVM lab (the active path)
 
@@ -14,26 +16,49 @@ and overlays are deleted on teardown, so steady-state disk use is just the
 cached images. Boot one distro at a time.
 
 ```sh
-./vm/build-artifact.sh            # static musl wabbit-initrd
-./vm/qemu/lab.sh test noble       # Ubuntu 24.04: the whole flow, unattended
+./vm/build-artifact.sh            # static musl wabbit-initrd (for `test`)
+./vm/qemu/lab.sh test noble       # Ubuntu 24.04: booted-system run
+./vm/qemu/lab.sh deploy noble     # Ubuntu 24.04: the real boot chain
 ./vm/qemu/lab.sh test jammy       # Ubuntu 22.04
 ./vm/qemu/lab.sh test bookworm    # Debian 12
 ./vm/qemu/lab.sh test rocky       # Rocky 9
 ```
 
-What `test` does per distro: boots the VM, adds `lsm=bpf` to the kernel
-command line and reboots (the BPF LSM must be in the boot list or nothing of
-bnuuy can attach — no target distro enables it by default), uploads the
-artifact and retrieves the bnuuy sign over ssh, runs `wabbit-initrd`
-detached and bounded by `timeout(1)` — exit 124 is the *expected* outcome,
-since in a booted system the sysroot poll never completes — with its output
-going to a guest-local file the host polls for (the freeze stops sshd too,
-so polls just fail fast on ConnectTimeout until the world thaws), and
-decodes the sign on the host side. (An earlier design carried the artifact
-and sign through a 9p share, which qemu drains even while the guest world
-is frozen — but RHEL-family kernels ship no 9p modules, so it could never
-work on rocky; ssh works everywhere.) The verdict line looks for `bnuuy
-protections attached and verified` in the sign.
+Two flows, proving different things:
+
+**`test <distro>` proves the launch path in a booted system.** Boots the
+VM, adds `lsm=bpf` to the kernel command line and reboots (the BPF LSM
+must be in the boot list or nothing of bnuuy can attach — no target
+distro enables it by default), mounts tracefs, uploads the artifact, and
+bind-mounts the live root at `/sysroot` — nothing mounts `/sysroot` in a
+booted system, and without it the sysroot poll blocks forever, so the bind
+presents the root the poll's own rules accept and the run proceeds
+through the real launch path: the second freeze, cgroup2, the memfd
+`@`-marked wabbit. **The success state has no ssh in it**: a started
+wabbit parks waiting for Ctrl-C, `wabbit-initrd` babysits it with the
+world *frozen* (the documented design until the handoff step exists), and
+the freeze stops the guest's `timeout(1)` and sshd with it — so the runner
+redirects wabbit-initrd's output to `/dev/console` and the host watches
+the qemu serial console (which drains no matter what the guest does) for
+the phase lines and wabbit's `Waiting for Ctrl-C` marker; teardown
+destroys the VM, and with it the frozen world. The failure paths *thaw*
+(the `Drop` backstop or the watchdog resume the world when
+`wabbit-initrd` exits), so the host also polls for the exit marker over
+ssh and pulls the bnuuy sign — the forensic record — out for the verdict.
+
+**`deploy <distro>` proves the placement.** Builds `wabbit-install`
+(musl — the build host's glibc is newer than every guest's) and runs it
+in the VM as root: it places the artifact through the distro's own
+initramfs tooling (`init-premount`/`init-bottom` hooks, or the `90wabbit`
+dracut module), enrolls `lsm=bpf` on the kernel command line, and
+rebuilds the initramfs. The reboot then boots the real chain — init
+script → launch hook → wabbit-initrd → sysroot poll → wabbit — exactly
+what a production deployment would run, and (same frozen-babysit
+reality) never finishes: the host watches the serial console for winit's
+info lines and wabbit's `Waiting for Ctrl-C` marker, where the launch
+hook's `>/dev/console` redirect sends them. The bnuuy sign lives in the
+initramfs `/run` and is lost with the VM; every phase it records is also
+logged at info on the console.
 
 Interactive use: `lab.sh up noble`, `lab.sh ssh noble`, `lab.sh down noble`.
 `WABBIT_LAB_KEEP=1` keeps the overlay and console log after a failure for

@@ -182,7 +182,9 @@ fn gate_instructions_with_trust_fd(trust_fd: RawFd) -> Result<Vec<bpf_insn>> {
         env!("OUT_DIR"),
         "/early"
     )))
-    .context(format!("parsing the {SIGN_NAME} object for the syscall gate"))?;
+    .context(format!(
+        "parsing the {SIGN_NAME} object for the syscall gate"
+    ))?;
 
     let map_defs: Vec<(String, Map)> = object
         .maps
@@ -198,9 +200,9 @@ fn gate_instructions_with_trust_fd(trust_fd: RawFd) -> Result<Vec<bpf_insn>> {
         let fd = if name == TRUST_MAP_NAME { trust_fd } else { -1 };
         (name.as_str(), fd, map)
     });
-    object
-        .relocate_maps(maps, &text_sections)
-        .context(format!("relocating the {SIGN_NAME} object's map references"))?;
+    object.relocate_maps(maps, &text_sections).context(format!(
+        "relocating the {SIGN_NAME} object's map references"
+    ))?;
 
     let program = object
         .programs

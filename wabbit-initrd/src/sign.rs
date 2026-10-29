@@ -118,7 +118,10 @@ pub fn init() {
         }
     };
     drop(file);
-    phase(&format!("starting {NAME}-initrd (pid {pid})", pid = getpid()));
+    phase(&format!(
+        "starting {NAME}-initrd (pid {pid})",
+        pid = getpid()
+    ));
 }
 
 /// Record a startup phase.
@@ -189,12 +192,14 @@ fn encode_record(timestamp_ms: u64, kind: Kind, message: &str) -> Vec<u8> {
 
 /// The self-describing banner, always the first record.
 fn doc_record() -> String {
-    format!("{NAME}-initrd boot log (the {SIGN_NAME} sign). This file \
+    format!(
+        "{NAME}-initrd boot log (the {SIGN_NAME} sign). This file \
              only exists when a boot did not go to plan; a clean boot \
              removes it. Format: magic \"{SIGN_MAGIC}\", u16 LE version, \
              then records of: u64 LE ms since boot, u8 kind (0 doc, 1 \
              phase, 2 failure, 3 watchdog, 4 panic), u32 LE length, UTF-8 \
-             text.")
+             text."
+    )
 }
 
 #[cfg(test)]

@@ -170,8 +170,7 @@ fn spawn_via_memfd() -> Result<Child> {
 /// Spawn wabbit from a file written onto the initrd rootfs.
 fn spawn_via_file() -> Result<Child> {
     let file = blob_file();
-    fs::write(&file, WABBIT_BLOB)
-        .with_context(|| format!("writing the {NAME} blob to {file}"))?;
+    fs::write(&file, WABBIT_BLOB).with_context(|| format!("writing the {NAME} blob to {file}"))?;
     fs::set_permissions(&file, Permissions::from_mode(0o755))
         .with_context(|| format!("making {file} executable"))?;
     let image = ExecImage::at_path(&file)?;
@@ -206,13 +205,16 @@ fn memfd_with_blob() -> Result<File> {
         fd = unsafe { libc::memfd_create(name.as_ptr(), MFD_CLOEXEC) };
     }
     if fd < 0 {
-        return Err(io::Error::last_os_error()).context(format!("memfd_create for the {NAME} blob"));
+        return Err(io::Error::last_os_error())
+            .context(format!("memfd_create for the {NAME} blob"));
     }
     let mut memfd = unsafe { File::from_raw_fd(fd) };
     memfd
         .write_all(WABBIT_BLOB)
         .context(format!("writing the {NAME} blob to the memfd"))?;
-    memfd.rewind().context(format!("rewinding the {NAME} memfd"))?;
+    memfd
+        .rewind()
+        .context(format!("rewinding the {NAME} memfd"))?;
     Ok(memfd)
 }
 
