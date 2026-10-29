@@ -1,0 +1,70 @@
+# rust-analyzer workspace configuration ("ratoml"). Read server-side by the
+# rust-analyzer language server itself, so it applies no matter which editor
+# drives it (Zed, VS Code, Helix, ...) and does not need per-editor settings.
+#
+# Purpose: make rust-analyzer analyze this workspace the way rustc does.
+#
+# What already matches by default, and is therefore NOT repeated here:
+#   * On-save diagnostics come from the default check command,
+#     `cargo check --workspace --all-targets` — a real rustc invocation over
+#     the same workspace, features and host target a developer builds, so
+#     rust-analyzer surfaces exactly the errors rustc reports (try it:
+#     `cargo check --workspace --all-targets`), with one structural
+#     correction under [check] below: the eBPF crates cannot be checked for
+#     the host target at all.
+#   * Features: only the ones the manifests enable. wabbit-common's `user`
+#     feature (which pulls in the userspace `aya` crate) is visible only
+#     through wabbit's dependency edge, exactly as cargo resolves it, and
+#     wabbit's `enclave` feature stays off.
+#   * Toolchain and sysroot come from rust-toolchain.toml (nightly with
+#     rust-src), so `std`/`core` are analyzed from the same sources the
+#     pinned rustc compiles.
+#   * Build scripts run (cargo.buildScripts.enable defaults to true), which
+#     this workspace needs: aya-build embeds the eBPF objects and
+#     wabbit-initrd embeds wabbit through OUT_DIR env vars that
+#     rust-analyzer could not resolve without executing them.
+#   * `.cargo/config.toml`'s `--remap-path-prefix` flags do not need a
+#     diagnostics.remapPrefix reversal: they affect debug info, `file!()`
+#     and panic locations, not rustc diagnostics, whose spans come back with
+#     real paths.
+
+[cargo]
+# The cfg environment rustc actually compiles under, replacing rust-analyzer's
+# default (["debug_assertions", "miri"]):
+#
+#   * `debug_assertions` — set by cargo's dev profile, which `cargo check`
+#     uses.
+#   * `bpf_target_arch="x86_64"` — aya-build (see vendor/aya-build) compiles
+#     the eBPF crates (bnuuy, wabbit-ebpf) for bpfel-unknown-none with
+#     `--cfg=bpf_target_arch="$host_arch"`, and aya-ebpf gates items like
+#     `pt_regs` on it. rust-analyzer analyzes the whole workspace with one
+#     host cfg environment, so `target_arch = "bpf"` cannot be set for just
+#     those two crates without breaking the userspace crates — but this
+#     custom cfg can be mirrored exactly, and nothing outside aya-ebpf
+#     reads it. NOTE: like the remaps in .cargo/config.toml, this value is
+#     host-specific — adjust it on a non-x86_64 host.
+#   * `miri` is dropped: no real rustc build sets it.
+cfgs = ["debug_assertions", "bpf_target_arch=x86_64"]
+
+[check]
+# The two eBPF crates (bnuuy, wabbit-ebpf) are compiled by aya-build for
+# bpfel-unknown-none with `-Z build-std=core` inside wabbit's build script —
+# never for the host. A host `cargo check` of their bin targets is a
+# compilation that does not exist: `#![no_std]` binaries cannot link the
+# host's unwinding panic runtime, so rustc rejects them with "unwinding
+# panics are not supported without std" on every single save — an error no
+# real build can ever produce. Excluding them makes the on-save check report
+# exactly what a host rustc can compile.
+#
+# Nothing is lost by it:
+#   * The eBPF code is still *analyzed* in full (see [cargo] above; the
+#     crates resolve cleanly for the host because they carry no target cfg
+#     gates of their own, and rust-analyzer's own engine still flags errors
+#     in them — e.g. missing-unsafe).
+#   * The eBPF code's *real* compilation still runs — wabbit's build script
+#     (aya-build, bpfel-unknown-none) is executed by the build-script pass
+#     regardless of the check command, and its failures still surface, the
+#     same way they do in a real `cargo build`.
+#   * wabbit-ebpf remains compiled as a host *library* through wabbit's
+#     build-dependency edge (that lib target exists exactly so this works).
+extraArgs = ["--exclude", "bnuuy", "--exclude", "wabbit-ebpf"]

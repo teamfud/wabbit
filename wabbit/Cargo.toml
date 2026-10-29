@@ -6,11 +6,11 @@ edition.workspace = true
 # build for musl
 
 
-
 license.workspace = true
 
 [dependencies]
 wabbit-common = { path = "../wabbit-common", features = ["user"] }
+wabbit-policy = { path = "../wabbit-policy", default-features = false }
 
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }

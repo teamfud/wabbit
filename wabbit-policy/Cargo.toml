@@ -1,0 +1,38 @@
+[package]
+name = "wabbit-policy"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[features]
+# The binary target: the off-box CLI (gen-key, build, inspect).
+cli = [
+    "dep:clap",
+    "dep:serde",
+    "dep:toml",
+    "dep:zeroize",
+    "dep:rand_core",
+]
+
+[dependencies]
+wabbit-common = { path = "../wabbit-common" }
+
+anyhow = { workspace = true }
+base64 = "0.22"
+binrw = "0.15.2"
+bilge = "0.5.0"
+clap = { version = "4", optional = true, features = ["derive"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
+hex = "0.4"
+rand_core = { version = "0.6", features = ["getrandom"], optional = true }
+serde = { version = "1", optional = true, features = ["derive"] }
+toml = { version = "0.8", optional = true }
+zeroize = { version = "1", optional = true }
+
+[[bin]]
+name = "wabbit-policy"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[lib]
+path = "src/lib.rs"

@@ -3,6 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    println!("cargo:rerun-if-env-changed=WABBIT_POLICY_PUBLIC_KEY");
+    println!("cargo:rerun-if-changed=src/keys.rs");
     // The white-label knobs (src/brand.rs): changing one must rebuild every
     // crate that derives a name from it.
     println!("cargo:rerun-if-env-changed=WABBIT_BRAND_NAME");

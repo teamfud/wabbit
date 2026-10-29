@@ -88,22 +88,15 @@ artifact="${WABBIT_LAB_ARTIFACT:-$repo/target/x86_64-unknown-linux-musl/release/
 # which embeds wabbit and bnuuy), so building it refreshes everything.
 installer="${WABBIT_LAB_INSTALLER:-$repo/target/x86_64-unknown-linux-musl/release/wabbit-install}"
 
-require_artifact() {
-  if [[ ! -x "$artifact" ]]; then
-    echo "missing $artifact" >&2
-    echo "run ./vm/build-artifact.sh first" >&2
-    exit 1
-  fi
-}
-
-require_installer() {
-  # Build (or refresh) the installer: cargo's own freshness check decides
-  # whether anything needs rebuilding — the build script watches every
-  # source that feeds the bundle, so an unconditional build is a no-op when
-  # fresh and a rebuild when not. A stale-but-present binary must never be
-  # uploaded just because it exists.
-  echo "building $installer (its build script bundles the whole chain)"
-  cargo build --locked --release --target x86_64-unknown-linux-musl -p wabbit-install
+# Always build before a run: cargo's own freshness check decides what
+# actually rebuilds (the build scripts watch every source that feeds the
+# embedded chain), so an unconditional build is a fast no-op when fresh —
+# and never a stale artifact, which the existence checks it replaced
+# could not tell apart from a current one. Both flows go through the one
+# script so the whole chain (guard object → wabbit → wabbit-initrd →
+# wabbit-install) is always consistent.
+require_fresh_artifacts() {
+  "$repo/vm/build-artifact.sh"
 }
 
 fetch() {
@@ -333,9 +326,30 @@ EOF
   while :; do
     if grep -q "Waiting for Ctrl-C" "$console" 2>/dev/null; then
       echo "=== the run as seen on the serial console ==="
-      grep -nE "\[wabbit |Waiting for Ctrl-C" "$console" | tail -30 || true
+      console_excerpt "$console"
       echo "PASS: wabbit started and parked (world frozen by design until teardown)"
       return 0
+    fi
+    # The watchdog firing is the run's terminal event: it only prints when
+    # wabbit-initrd is dead, so nothing else about the run can change — the
+    # world is thawing, sshd is resuming, and the exit marker follows. Break
+    # here instead of racing those: collecting immediately beats polling
+    # another full deadline round when the outcome is already decided.
+    if grep -q "wabbit watchdog: the parent is gone" "$console" 2>/dev/null; then
+      echo "the watchdog fired: wabbit-initrd is dead; collecting the evidence"
+      # The world is thawed by now; give sshd and the runner's marker write a
+      # brief bounded window before collecting whatever exists.
+      local waited=0
+      while [ $waited -lt 15 ]; do
+        if status=$(vm_ssh "$distro" \
+            'test -f /run/wabbit/exit-status && cat /run/wabbit/exit-status' \
+            2>/dev/null); then
+          break
+        fi
+        sleep 3
+        waited=$((waited + 3))
+      done
+      break
     fi
     if status=$(vm_ssh "$distro" \
         'test -f /run/wabbit/exit-status && cat /run/wabbit/exit-status' \
@@ -346,7 +360,7 @@ EOF
     deadline=$((deadline - 3))
     if [ "$deadline" -le 0 ]; then
       echo "the run reached neither a parked wabbit nor an exit within its window; console said:"
-      grep -nE "\[wabbit |failed|Waiting for Ctrl-C" "$console" | tail -25 || true
+      console_excerpt "$console"
       return 1
     fi
   done
@@ -361,10 +375,20 @@ EOF
     echo "(no sign was left: wabbit-initrd exited clean, or hung before writing one)"
   fi
   echo "=== the run as seen on the serial console ==="
-  grep -nE "\[wabbit |failed" "$console" | tail -30 || true
+  console_excerpt "$console"
   echo "wabbit-initrd exit code: $status"
   echo "FAIL: wabbit never parked; see the sign and console above"
   return 1
+}
+
+# The interesting lines of a serial console: every `[wabbit ...]` log line,
+# the self-test workers' verdicts (`wabbit self-test ...`), the failure
+# block (`Error:` / `Caused by:` / the indented causes), the guard's
+# diagnostics, and the parking marker. Both the PASS and FAIL excerpts use
+# this, so a passing run still shows what actually ran.
+console_excerpt() {
+  grep -nE "\[wabbit |wabbit self-test|wabbit watchdog|Error:|Caused by:|^    [a-z]|guard|Waiting for Ctrl-C" \
+    "${1:?console log}" | tail -40 || true
 }
 
 # Decode a bnuuy sign file: magic "BNUY", u16 LE version, then records of
@@ -408,7 +432,7 @@ deploy() {
   distro="$1"
   local dir console
   dir="$(run_dir "$distro")"
-  require_installer
+  require_fresh_artifacts
 
   up "$distro"
   trap 'down "$distro"' EXIT
@@ -430,7 +454,7 @@ deploy() {
   while :; do
     if grep -q "wabbit-initrd failed:" "$console" 2>/dev/null; then
       echo "=== the boot chain as seen on the console ==="
-      grep -nE "\[wabbit |wabbit-initrd failed" "$console" | tail -25 || true
+      console_excerpt "$console"
       echo "FAIL: wabbit-initrd failed during the boot chain on $distro"
       keep=1
       down "$distro" || true
@@ -438,13 +462,13 @@ deploy() {
     fi
     if grep -q "Waiting for Ctrl-C" "$console" 2>/dev/null; then
       echo "=== the boot chain as seen on the console ==="
-      grep -nE "\[wabbit |Waiting for Ctrl-C" "$console" | tail -25 || true
+      console_excerpt "$console"
       echo "PASS: $distro booted installer → initramfs hooks → wabbit-initrd → wabbit (running, world frozen by design)"
       break
     fi
     if [ "$waited" -ge "$deadline" ]; then
       echo "the boot chain never reached wabbit within ${deadline}s; the console said:"
-      grep -nE "\[wabbit |bnuuy|failed|Waiting for Ctrl-C" "$console" | tail -25 || true
+      console_excerpt "$console"
       echo "FAIL: the protected boot chain did not reach wabbit on $distro"
       keep=1
       down "$distro" || true
@@ -470,7 +494,7 @@ case "$command" in
   sign) decode_sign "${1:?sign file}" ;;
   test)
     distro="${1:?distro}"
-    require_artifact
+    require_fresh_artifacts
     up "$distro"
     trap 'down "$distro"' EXIT
     enable_bpf_lsm "$distro"

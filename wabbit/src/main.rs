@@ -1,12 +1,12 @@
 use anyhow::Context;
-use aya::{Btf, EbpfLoader, programs::TracePoint};
+use aya::Btf;
 #[rustfmt::skip]
 use log::{debug, info, warn};
 use std::{env, io::Write as _, os::fd::AsRawFd as _};
 
 use tokio::signal;
 use wabbit::{
-    filesystem, ipc,
+    filesystem, guard, ipc,
     policy::{self, Policy},
     runtime,
 };
@@ -18,6 +18,12 @@ fn ipc_socket_var() -> String {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Self-test workers re-execute this binary and must exit before any of
+    // the real startup runs: they touch no mounts, no maps, no logger.
+    if let Some(code) = guard::worker_main() {
+        std::process::exit(code);
+    }
+
     // The brand, not the crate's module path, prefixes console output.
     env_logger::Builder::from_env(env_logger::Env::default())
         .format(|buf, record| {
@@ -83,7 +89,7 @@ async fn run(fds: runtime::RuntimeFds, policy: Policy) -> anyhow::Result<()> {
     // The IPC server is optional: only the socket path's presence decides
     // whether one exists.
     let socket_path = env::var_os(ipc_socket_var()).map(std::path::PathBuf::from);
-    let ipc_task = socket_path.map(|path| tokio::spawn(ipc::run_server(path, policy)));
+    let ipc_task = socket_path.map(|path| tokio::spawn(ipc::run_server(path, policy.clone())));
 
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
     // new memcg based accounting, see https://lwn.net/Articles/837122/
@@ -96,18 +102,17 @@ async fn run(fds: runtime::RuntimeFds, policy: Policy) -> anyhow::Result<()> {
         debug!("remove limit on locked memory failed, ret is: {ret}");
     }
 
-    // This will include your eBPF object file as raw bytes at compile-time and load it at
-    // runtime. This approach is recommended for most real-world use cases. If you would
-    // like to specify the eBPF object at runtime rather than compile-time, you can
-    // reach for `Bpf::load_file` instead.
     let btf = Btf::from_sys_fs().context("loading kernel BTF from /sys/kernel/btf/vmlinux")?;
-    let mut loader = EbpfLoader::new();
-    loader.btf(Some(&btf));
-    let mut ebpf = loader.load(aya::include_bytes_aligned!(concat!(
-        env!("OUT_DIR"),
-        "/guard"
-    )))?;
-    match aya_log::EbpfLogger::init(&mut ebpf) {
+
+    // The startup diagram's `wabbit` steps: load the guard (maps created,
+    // wabbit trusted, every gate attached observing), then the self-test
+    // loops and the enforcing flip. The `Guard` handle is held for this
+    // process's whole lifetime — the attachment's lifetime *is* the
+    // enforcement, and its links detach the moment it drops.
+    let mut guard = guard::Guard::load(&btf, &policy).context("loading the guard")?;
+
+    // The eBPF logger's sink: a ring buffer in the kernel this task drains.
+    match aya_log::EbpfLogger::init(guard.ebpf_mut()) {
         Err(e) => {
             // This can happen if you remove all log statements from your eBPF program.
             warn!("failed to initialize eBPF logger: {e}");
@@ -117,26 +122,21 @@ async fn run(fds: runtime::RuntimeFds, policy: Policy) -> anyhow::Result<()> {
                 tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)?;
             tokio::task::spawn(async move {
                 loop {
-                    let mut guard = logger.readable_mut().await.unwrap();
-                    guard.get_inner_mut().flush();
-                    guard.clear_ready();
+                    let mut log = logger.readable_mut().await.unwrap();
+                    log.get_inner_mut().flush();
+                    log.clear_ready();
                 }
             });
         }
     }
-    // The guard's programs are `tracepoint/`-sectioned, so they load as
-    // `aya::programs::TracePoint` — a `tp_btf/` section loads as
-    // `BtfTracePoint`, and the two types do not convert into each other.
-    // The category is the kernel's own (`raw_syscalls`), which aya resolves
-    // against `<tracefs>/events/<category>/<event>/id`.
-    let program: &mut TracePoint = ebpf.program_mut("sys_enter_trace").unwrap().try_into()?;
-    program.load()?;
-    program.attach("raw_syscalls", "sys_enter")?;
+
+    guard.self_test().context("the guard self-test")?;
 
     let ctrl_c = signal::ctrl_c();
     println!("Waiting for Ctrl-C...");
     ctrl_c.await?;
     println!("Exiting...");
+    drop(guard);
 
     if let Some(ipc_task) = ipc_task {
         ipc_task.abort();

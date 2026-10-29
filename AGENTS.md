@@ -1,7 +1,7 @@
 # Wabbit architecture
 
-Wabbit is a Linux-only Rust workspace with two user-space binaries and one
-eBPF program:
+Wabbit is a Linux-only Rust workspace with two user-space binaries, a
+policy tool, and one eBPF program:
 
 | Component | Role |
 | --- | --- |
@@ -9,6 +9,7 @@ eBPF program:
 | `wabbit-initrd` | Initrd entry point. Freezes and resumes the system, establishes early protections, waits for `/sysroot`, prepares runtime filesystems and the wabbit cgroup, then launches `wabbit`. |
 | `wabbit-ebpf` | `no_std` eBPF LSM and tracepoint programs built into `wabbit` at compile time. |
 | `wabbit-common` | Shared `no_std`/user-compatible types used by the process, eBPF program, maps, and authorization protocol. |
+| `wabbit-policy` | The WSPF format library (types, signing, verification, sections) plus the off-box CLI (`--features cli`: `gen-key`, `build`, `inspect`). |
 
 The project is intended for controlled blue-team and regulated CTF use. It
 requires Linux mount and eBPF privileges and is not an EDR.
@@ -19,6 +20,39 @@ The root `Cargo.toml` defines the workspace. Building the `wabbit` package
 also runs `wabbit/build.rs`, which invokes the Aya build tooling to compile
 `wabbit-ebpf`. The resulting object is embedded in the user-space executable
 with `aya::include_bytes_aligned!`; no eBPF object path is required at runtime.
+Before embedding, both build scripts strip the DWARF out of the copied
+objects with `llvm-strip --strip-debug`: bpf-linker derives `.BTF` (the
+definitions behind every `#[map]`) and `.BTF.ext` (func/line info, and CO-RE
+relocations where they exist) from DWARF types, so the `debug = 2` the eBPF
+profiles pin is load-bearing at link time (`debug = 0` produces no `.BTF` at
+all and aya-obj refuses the object; `debug = 1` loses the type records and
+the `#[map]` maps vanish silently), but past the link nothing reads the
+DWARF — aya-obj parses `.BTF`, `.BTF.ext`, and the symbol table, and the
+kernel consumes BTF and instructions alone. `--strip-debug` keeps all of
+those — and every instruction byte for byte — and removes roughly 85% of
+each object; `--strip-all`/cargo `strip = "symbols"` would delete `.BTF` and
+the symbol table and is never used on the eBPF profiles. A missing
+`llvm-strip` downgrades to a warning: the unstripped object loads
+identically and is merely larger.
+
+The build host's own paths are host-path disclosure and are remapped out of
+every distributed artifact: rustc's `--remap-path-prefix` rewrites the paths
+in `#[track_caller]` panic locations (userspace) and the BTF line info
+(eBPF). The userspace builds take their flags from `.cargo/config.toml`
+(`[target]` rustflags — they *replace* `[build]` rustflags, so they live in
+the same section as the existing mold linker flags, which keeps the existing
+`-Z randomize-layout` in `[build]` intact). The eBPF nested builds cannot:
+`aya-build` constructs `CARGO_ENCODED_RUSTFLAGS` for them itself, and cargo
+resolves that variable ahead of `RUSTFLAGS` and every config rustflags
+section (verified empirically), so the workspace vendors a small fork of
+`aya-build` (`vendor/aya-build`, verbatim 0.2.0 plus two marked
+`PATCH(wabbit)` hunks) whose one addition appends
+`AYA_BUILD_EXTRA_RUSTFLAGS` (\x1f-separated) to that flag list; the two
+build scripts compute that value from the live environment (`CARGO_MANIFEST_DIR`,
+`CARGO_HOME`/`HOME`, `RUSTUP_HOME`, each in both its `$HOME`-spelled and
+canonicalized forms, since this host's `/home` is a symlink to
+`/var/home`). Upgrades re-vendor from crates.io and re-apply the patch;
+`vendor/aya-build/README.md` documents the why.
 
 Building the `wabbit-initrd` package runs `wabbit-initrd/build.rs`, which
 compiles the `bnuuy` eBPF object the same way and additionally compiles the
@@ -109,12 +143,29 @@ The intended startup path begins in the initrd:
    only `wabbit` crosses the transition.
 5. `wabbit` starts as the outer process. It opens and retains descriptors for
    `/proc`, `/sys`, `/dev`, and related filesystems before they move under
-   `/sysroot`; reads and verifies the WSPF configuration; creates and checks
-   the configured maps; and loads the eBPF programs in non-enforcing mode.
-6. The outer process runs self-tests while eBPF logs allowed actions, confirms
-   that all expected events were observed, and switches the protections to
-   enforcing mode. It repeats denied-action tests, performs a final pre-shutdown
-   test with `wabbit-initrd`, then allows the initrd process to exit.
+   `/sysroot` (`wabbit/src/runtime.rs`); reads and verifies the WSPF
+   configuration; and loads the eBPF programs in non-enforcing mode
+   (`wabbit/src/guard.rs`): the `guard` object loads with its maps, wabbit's
+   own PID, cgroup, and cgroup path are trusted *before the first program
+   attaches* (the gates would otherwise deny the `bpf(2)` calls that attach
+   them), and every LSM gate and tracepoint attaches observing
+   (`ENFORCING == 0`).
+6. The outer process runs self-tests (`Guard::self_test`): workers re-execute
+   the binary from a sacrificial cgroup under wabbit's own — outside its
+   trust — each performs exactly one syscall, and the observing phase asserts
+   the gates fired and traced their decisions into `DECISIONS` (with the
+   workers' forks kernel-recorded in `FORK_EVENTS`) before the enforcing
+   flip re-runs the steps expecting `EPERM`. Under wabbit-initrd's babysit,
+   bnuuy's earlier-attached gates shadow guard's for the hooks both defend
+   (`bpf`, `kernel_read_file`, module-tree writes, bpffs opens) — those
+   steps run enforcing-only, proving *a* denial, while the reachable steps
+   (mount over the protected cgroup paths, netfilter netlink socket, a
+   writable cgroupfs open, legacy firewall `setsockopt`) prove guard's own
+   gates in both phases. Policy-driven map content (`AUTHORIZATIONS`,
+   `PATH_RULES`) is the next phase: the gates consult them, nothing populates
+   them yet.
+   The final pre-shutdown test with `wabbit-initrd`, and letting the initrd
+   process exit, is the not-yet-implemented handoff step.
 7. After initrd handoff, `wabbit` waits for systemd, obtains systemd's view of
    the root through `/proc/1/root`, and chroots into the main root. Signed IPC
    requests can then create an authorized child cgroup, grant that cgroup
@@ -454,32 +505,112 @@ into filesystem configuration loading or IPC authorization.
 
 ## Binary policy files
 
-`wabbit/src/policy/` defines a versioned binary policy file, declared with
-`binrw` with boolean flags packed into `bilge` bitfields. A `Policy` is a set of
-optional sections, one per kind of configuration; the filesystem policy
-(`RootFSConfig`) is the `rootfs` section, and further kinds such as initrd
-modification or a kernel module allowlist are meant to be added as new sections.
+The `wabbit-policy` crate defines a versioned binary policy file, declared
+with `binrw` with boolean flags packed into `bilge` bitfields. A `Policy` is
+a set of optional sections, one per kind of configuration; the filesystem
+policy (`RootFSConfig`) is the `rootfs` section, the steady-state
+authorization classes (`AuthorizationConfig`) are the `authorization`
+section, and further kinds such as initrd modification or a kernel module
+allowlist are meant to be added as new sections. `wabbit/src/policy/` is a
+re-export shim; the types live in the crate.
 
-- `policy/mod.rs`: the `Policy` container, the header, signing and verification,
-  and file I/O. It documents the file layout and the steps for adding a section.
-- `policy/rootfs.rs`: the `rootfs` section.
-- `policy/wire.rs`: `binrw` helpers shared by sections, such as path encoding.
+- `wabbit-policy/src/lib.rs`: the `Policy` container, the header, signing
+  and verification, and file I/O. It documents the file layout and the
+  steps for adding a section.
+- `wabbit-policy/src/rootfs.rs`: the `rootfs` section.
+- `wabbit-policy/src/authorization.rs`: the `authorization` section and
+  its `validate` (the generator- and loader-side contract enforcement).
+- `wabbit-policy/src/wire.rs`: `binrw` helpers shared by sections, such as
+  path encoding.
 
 The file begins with the four-byte `WSPF` magic, a little-endian version
-(currently 3) and the signature, followed by a byte with one bit per section
-and then the sections that bit announces, in bit order. Each section appears at
-most once, so a policy has a single encoding. The decoder rejects unknown
-versions, section bits it does not know (rather than ignoring a section it cannot
-enforce), reserved flag bits, invalid markers, oversized override counts,
-truncated input, invalid UTF-8, and trailing bytes.
+(currently 4), the key id and the signature, followed by a byte with one bit
+per section and then the sections that bit announces, in bit order. Each
+section appears at most once, so a policy has a single encoding. The decoder
+rejects unknown versions, unknown key ids, section bits it does not know
+(rather than ignoring a section it cannot enforce), reserved flag bits,
+invalid markers, oversized override counts, truncated input, invalid UTF-8,
+and trailing bytes.
 
 `to_signed_bytes`/`from_bytes` handle in-memory conversion; `read_file` and
-`write_new_signed` provide file operations. `write_new_signed` uses exclusive creation so an existing
-policy is not silently replaced. Binary policies are verified by the policy
-loader with the compile-time `policy::POLICY_PUBLIC_KEY`. The signature covers the policy header and payload;
-unsigned or tampered files are rejected. Policy generation requires the caller
-to provide either a finished signature (`to_signed_bytes`) or a 32-byte Ed25519
-private key (`sign`), so no private signing key is embedded in wabbit.
+`write_new_signed` provide file operations. `write_new_signed` uses exclusive
+creation so an existing policy is not silently replaced. Binary policies are
+verified by the policy loader against the compile-time `keys::POLICY_PUBLIC_KEYS`
+(by key id, from the header). The signature covers the policy header and
+payload; unsigned or tampered files are rejected. Policy generation requires
+the caller to provide either a finished signature (`to_signed_bytes`) or a
+32-byte Ed25519 private key (`sign`), so no private signing key is embedded
+in wabbit.
+
+### The `wabbit-policy` crate (implemented)
+
+The format lives in the `wabbit-policy` workspace member — `Policy`, the
+header, signing, the sections — which both `wabbit` (via the
+`wabbit::policy` re-export shim) and the off-box CLI depend on. The CLI
+is the crate's `bin` (`cargo build -p wabbit-policy --features cli`).
+
+**Header v4: a key id.** One byte naming the signing key, before the
+signature. `keys.rs` carries `POLICY_PUBLIC_KEYS: &[(id, key)]`; the
+compile-time `WABBIT_POLICY_PUBLIC_KEY` env override (the white-label
+pattern) replaces id 0, and `gen-key` prints the exact line to paste.
+v3→v4 is one version bump; the v3 single-key format has shipped nowhere.
+
+**Off-box CLI** (`wabbit-policy <subcommand>`):
+
+* `gen-key` — keypair; prints the `keys.rs` line; writes the 0600-mode
+  secret. **The private key never lives on a target box** — this is what
+  makes the existing "no embedded signing key" rule operational.
+* `build` — TOML source → signed WSPF. **TOML is the committed format**:
+  diffable in git, reviewable in PRs, validated by the generator.
+  Generator-side validation lives here and nowhere else: canonical paths
+  (no trailing `/` — the `path_hash` key convention), rule keys ≤
+  `PATH_WALK_CAP` (64 bytes — the eBPF walk's documented loader contract),
+  known action names (`AuthorizationConfig::validate`).
+* `inspect` — verify against the compiled-in key(s) + decode to TOML,
+  for audit on any box.
+* One tool serves both flows: boot-time policy *and* runtime rotation (the
+  IPC `Reconfigure` request applies a complete signed policy — same file,
+  same tool).
+
+**TOML source** (the `authorization` section, v4, alongside `rootfs`):
+
+```toml
+[[authorization]]
+cgroup       = "/sys/fs/cgroup/wabbit"   # resolved to a kernfs id at load
+actions      = ["mount", "bpf-attach", "kmods", "firewall"]
+default_deny = false                      # FLAG_PATH_RULES_DEFAULT_DENY
+
+[[authorization.path_rules]]
+prefix  = "/etc/ssh"
+verdict = "allow"                         # or "deny"
+```
+
+**Loader semantics** (the wabbit side, `Guard::load` →
+`populate_authorizations`):
+
+* **Naming is by path, resolution is at load.** Policy cannot name cgroups
+  by kernfs id — inode numbers are runtime state. The loader resolves each
+  `cgroup` path with `stat(2)` (`st_ino` is the same id
+  `bpf_get_current_cgroup_id` reports) and hashes path-rule prefixes with
+  the shared `path_hash`. This is why `CgroupKey` was designed to agree
+  with `stat(2)`.
+* **Timing.** Load runs in `Guard::load`, between `trust_self` (bootstrap
+  trust) and the first program attach, under winit's frozen world —
+  population is race-free. A missing/unreadable cgroup path warns and
+  skips that entry; the file's own bootstrap entries are load-order
+  independent.
+* **Failure asymmetry.** A rootfs policy failure aborts startup (fail-open
+  boot, current behavior). An authorization policy failure does **not**
+  abort `Guard::load`: the gates come up with bootstrap trust only, every
+  untrusted cgroup stays deny-by-default (the maps' empty state), and the
+  failure is logged. Enforcement-with-no-authorizations is safe;
+  no-enforcement-because-policy-file-missing is not.
+* **Boot path plumbing.** The installer's launch hook sets
+  `<prefix>_FILESYSTEM_CONFIGURATION_FILE` — it knows its initrd flavor
+  (`/sysroot` for dracut/systemd, `/root` for initramfs-tools) and the
+  file lives on the real root; wabbit inherits the environment from winit.
+  Wabbit itself keeps only the env var (plus `Policy::default()` fallback)
+  — no path probing.
 
 ## eBPF component
 
@@ -494,6 +625,61 @@ The user-space process loads the embedded object, initializes `aya_log`, loads
 and attaches the required LSM and tracepoint programs, and consumes logger
 events asynchronously. The program has a dual MIT/GPL license declaration and
 a minimal panic handler suitable for eBPF.
+
+The steady-state gate set (the `guard` object) is authored and
+matrix-compatible; the userspace loading, map population, self-test, and
+enforce-flip steps are the next implementation phase:
+
+| Gate | Hook | Enforces |
+| --- | --- | --- |
+| `bpf_gate` | `bpf` | the classed `bpf(2)` gate: full trust keeps everything; `ACTION_BPF_ATTACH` (the systemd class) gets map creates + element ops + cgroup-family program loads/attaches/links + BTF loads; fd-by-ID lookups and LSM/tracing program types never relax below full trust |
+| `kmod_gate` | `kernel_read_file` | module loads (`READING_MODULE`) denied outside full trust and `ACTION_KMODS`; identity-keyed (no `bpf_d_path`), so it loads on every target kernel including vanilla 5.15 where the hook is not sleepable |
+| `file_open_modern`/`_legacy` | `file_open` | untrusted opens of bpffs (reads included — with the fd-by-ID gate, wabbit's maps become unreachable); opens under a denied path rule (the per-cgroup allow/deny profiles in `PATH_RULES`, longest-prefix-wins, default-deny via the `Authorization` flag); writable opens under the module trees (`ACTION_KMODS` lifts); writable opens under protected cgroupfs paths — the `cgroup.procs`/`cgroup.freeze`/`cgroup.kill` migration wall (`ACTION_CGROUPFS_WRITE` lifts) |
+| `sb_mount` | `sb_mount` | mounts over module trees/bpffs (never lifted); mounts over the cgroupfs root and protected cgroup paths (`ACTION_MOUNT` lifts) |
+| `firewall_gate` | `socket_setsockopt` | iptables-legacy rule changes (`IPT_SO_SET_REPLACE`/`ADD_COUNTERS` at `SOL_IP`/`SOL_IPV6`) denied outside full trust and `ACTION_FIREWALL` |
+| `netfilter_netlink_gate` | `socket_create` | creating a `NETLINK_NETFILTER` netlink socket — the nftables path: `nft`, `iptables-nft`/`ip6tables-nft`/`ebtables-nft`/`arptables-nft` (the distro defaults), firewalld, ipset, conntrack-tools — denied outside full trust and `ACTION_FIREWALL`; kernel-internal creation (`kern == 1`) exempt |
+| `fork_watcher_vanilla`/`_preempt_lazy`, `module_load_logger` | tracepoints | `sched_process_fork` (both record layouts; the loader picks by format file) into `FORK_EVENTS`, `module_load` into `MODULE_LOADS` |
+
+Every gate short-circuits trusted callers (wabbit's PID and cgroup), then
+closes through one `verdict()` that consults the `ENFORCING` map: observing
+traces the decision into `DECISIONS` (hit-markers, never counters) and allows,
+enforcing applies it. `PROTECTED_PATHS` keys on the shared FNV-1a
+`wabbit-common::authorization::path_hash` of the canonical cgroupfs path (no
+trailing `/`), and `CgroupKey` keys on the kernfs id that
+`bpf_get_current_cgroup_id` reports and `stat(2)` shows as `st_ino`.
+
+`PATH_RULES` carries the policy path rules — the reference model's
+`PathProfile`, deliberately simplified (the full `PathAction` set —
+`Enoent`, `Sigkill`, `Sigill`, `Sigsegv` — needs retval rewriting an LSM
+program cannot do): one map entry per (cgroup, path prefix), hashed with
+the same shared `path_hash`, resolution longest-prefix-wins over a single
+forward walk, and the cgroup's `Authorization` flag
+`FLAG_PATH_RULES_DEFAULT_DENY` flips its list from deny-list (default
+allow) to allow-list (default deny). Both prefix walks (`PROTECTED_PATHS`
+and `PATH_RULES`) are capped at `PATH_WALK_CAP` = 64 bytes — a constant
+bound the eBPF verifier can afford (a runtime-length walk is quadratic in
+the verifier's state space; the first lab run measured 51k states and the
+1M-insn limit) — so **rule keys longer than 64 bytes are a loader
+contract**: the userspace map-loading step rejects them, and nothing
+silent truncates. Rules apply to the exact cgroup keyed — children do not
+inherit, so the userspace writes a rule per cgroup (a cgroup walk would
+need the struct walks this design forbids); the userspace knows the tree
+because it creates the authorized children. Slice comparisons in the eBPF
+path code are hand-rolled byte loops: `==` on slices outlines a `memcmp`
+into `.text`, and bnuuy's matrix-proven object carries `memset` alone, so
+the guard stays in exactly that call class.
+
+Residuals, documented in the module docs: `move_mount`/`umount2` (not
+sleepable anywhere in the matrix — mount shuffling past `sb_mount`), writes
+through fds opened before wabbit started, inherited firewall/bpf sockets
+(an fd handed across a cgroup boundary before the gate armed keeps its
+access), direct `kill(2)` signals to wabbit's processes (the target task's
+cgroup is unreadable without the deep `task_struct` walks this design
+forbids; the cgroupfs walls cover the cgroup-level kill paths). The
+firewall gates close both rule paths on every target kernel: the legacy
+xtables `setsockopt` and the nftables nfnetlink socket
+(`netfilter_netlink_gate` on `socket_create`, exempting kernel-internal
+creation).
 
 ## Configuration and operational boundaries
 

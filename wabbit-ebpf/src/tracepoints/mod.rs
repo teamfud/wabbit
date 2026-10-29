@@ -1,1 +1,4 @@
-mod obfuscation;
+//! Tracepoint programs.
+
+pub mod obfuscation;
+pub mod watch;

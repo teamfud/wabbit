@@ -8,4 +8,21 @@ rustflags = ["-Z", "randomize-layout"]
 
 [target.'cfg(target_os = "linux")']
 linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=/home/linuxbrew/.linuxbrew/bin/mold"]
+rustflags = [
+    "-C", "link-arg=-fuse-ld=/home/linuxbrew/.linuxbrew/bin/mold",
+    # Strip build-host paths out of everything compiled for a Linux target:
+    # `#[track_caller]` panic locations (and the DWARF behind any BTF line
+    # info) embed the paths rustc was given, and the userspace artifacts are
+    # distributed. Both filesystem spellings of this host are remapped ($HOME
+    # preserves the /home symlink, canonicalize() does not). The prefixes are
+    # disjoint, so their order does not matter. The eBPF builds do not pass
+    # through here (aya-build sets CARGO_ENCODED_RUSTFLAGS, which outranks
+    # every config section); the vendored fork in vendor/aya-build appends
+    # the same remaps, computed from the live environment, for those.
+    "--remap-path-prefix=/var/home/blue/Projects/code/wabbit=/build",
+    "--remap-path-prefix=/home/blue/Projects/code/wabbit=/build",
+    "--remap-path-prefix=/var/home/blue/.cargo=/cargo",
+    "--remap-path-prefix=/home/blue/.cargo=/cargo",
+    "--remap-path-prefix=/var/home/blue/.rustup=/rustup",
+    "--remap-path-prefix=/home/blue/.rustup=/rustup",
+]

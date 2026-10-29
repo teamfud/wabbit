@@ -1,7 +1,23 @@
 [workspace]
-members = ["wabbit", "wabbit-initrd", "wabbit-common", "wabbit-ebpf", "bnuuy", "wabbit-install"]
+members = [
+    "wabbit",
+    "wabbit-initrd",
+    "wabbit-common",
+    "wabbit-ebpf",
+    "bnuuy",
+    "wabbit-install",
+    "wabbit-policy",
+]
 default-members = ["wabbit", "wabbit-common"]
 resolver = "2"
+
+# The vendored aya-build fork in vendor/aya-build (same version, one small
+# patch) exists so the nested eBPF builds can take --remap-path-prefix flags:
+# aya-build constructs CARGO_ENCODED_RUSTFLAGS itself, which cargo resolves
+# ahead of RUSTFLAGS and every config rustflags section, so nothing else can
+# contribute flags there. See vendor/aya-build/README.md.
+[patch.crates-io]
+aya-build = { path = "vendor/aya-build" }
 
 [workspace.package]
 license = "MIT OR Apache-2.0"
@@ -60,6 +76,22 @@ version = "6.0.0"
 default-features = false
 
 [profile.release]
+strip = "symbols"
+opt-level = 3
+
+[profile.release.package.wabbit]
+strip = "symbols"
+opt-level = 3
+
+[profile.release.package.wabbit-initrd]
+strip = "symbols"
+opt-level = 3
+
+[profile.release.package.wabbit-common]
+strip = "symbols"
+opt-level = 3
+
+[profile.release.package.wabbit-install]
 strip = "symbols"
 opt-level = 3
 

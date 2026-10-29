@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn reconfigure_rejects_unsigned_policy() {
-        let policy = policy::to_signed_bytes(&Policy::default(), &[0; 64]).unwrap();
+        let policy = policy::to_signed_bytes(&Policy::default(), 0, &[0; 64]).unwrap();
         let request =
             encode_request(&Request::Reconfigure(Reconfigure { policy: &policy })).unwrap();
         assert!(decode_request(&request).is_err());

@@ -18,8 +18,17 @@ if ! command -v cargo >/dev/null || ! command -v bpf-linker >/dev/null; then
 fi
 
 rustup target add "$target"
+# Both artifacts: `test` consumes the wabbit-initrd executable directly,
+# `deploy` consumes the wabbit-install installer (which bundles its own
+# wabbit-initrd). One command refreshes the whole chain — wabbit-initrd
+# embeds the wabbit binary (guard included) and the bnuuy eBPF object, and
+# wabbit-install bundles wabbit-initrd.
 cargo build --locked --release --target "$target" -p wabbit-initrd
+cargo build --locked --release --target "$target" -p wabbit-install
 
 artifact="target/$target/release/wabbit-initrd"
-echo "built $artifact"
+installer="target/$target/release/wabbit-install"
+echo "built $artifact (test flow)"
+echo "built $installer (deploy flow)"
 file "$artifact" | head -1
+file "$installer" | head -1
