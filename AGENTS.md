@@ -280,6 +280,19 @@ error-only. After the script mounts the real root and its nested mounts, it
 must not race to `switch_root`: the handoff choreography (and the second
 freeze) belongs to wabbit-initrd.
 
+The `wabbit-install` crate (a dependency-free workspace member;
+`cargo build -p wabbit-install`, run as root) automates the whole
+placement through each flavor's own extension points —
+init-premount/init-bottom hooks for initramfs-tools, pre-mount/pre-pivot
+hooks via a 90wabbit dracut module — plus the `lsm=bpf` kernel command
+line (skipped where the BPF LSM is already active) and the initramfs
+rebuild, with `--dry-run`, `--remove`, and `--no-switch-wait` (omit the
+pre-switch_root wait) available. Its build script bundles the
+`wabbit-initrd` artifact into the installer — a nested musl build in a
+private target directory, the same arrangement `wabbit-initrd` uses to
+embed wabbit — so the installer carries its artifact and needs no
+checkout on the target system; `--artifact` overrides the bundle.
+
 All of wabbit-initrd's mounts (bpffs at `/sys/fs/bpf`, tracefs at
 `/sys/kernel/tracing`, cgroup2 at `/sys/fs/cgroup`) target mount points the
 kernel pre-creates in sysfs, so nothing of the initrd's own is shadowed. They

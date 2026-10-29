@@ -1,5 +1,5 @@
 [workspace]
-members = ["wabbit", "wabbit-initrd", "wabbit-common", "wabbit-ebpf", "bnuuy"]
+members = ["wabbit", "wabbit-initrd", "wabbit-common", "wabbit-ebpf", "bnuuy", "wabbit-install"]
 default-members = ["wabbit", "wabbit-common"]
 resolver = "2"
 
