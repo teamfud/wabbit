@@ -44,9 +44,61 @@ use std::{
     process::Command,
 };
 
+/// Compile-time branding, mirrored from `wabbit-common`'s `brand` module.
+/// This crate is deliberately dependency-free, so the few constants it
+/// needs are duplicated here; the defaults reproduce the stock names, and
+/// a white-label build sets the same environment variables.
+mod brand {
+    /// The product name: paths, the in-image binary, and message wording.
+    pub const NAME: &str = match option_env!("WABBIT_BRAND_NAME") {
+        Some(name) => name,
+        None => "wabbit",
+    };
+
+    /// The name of the boot sign: `<name>.bin`.
+    pub const SIGN_NAME: &str = match option_env!("WABBIT_BRAND_SIGN_NAME") {
+        Some(name) => name,
+        None => "bnuuy",
+    };
+
+    /// Whether `value` is safe as one path/shell component (the same
+    /// compile-time validation `wabbit-common` applies).
+    const fn is_safe_component(value: &str) -> bool {
+        let bytes = value.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let byte = bytes[i];
+            if !(byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.') {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    const _: () = {
+        assert!(!NAME.is_empty(), "WABBIT_BRAND_NAME must not be empty");
+        assert!(
+            is_safe_component(NAME),
+            "WABBIT_BRAND_NAME must be one path- and shell-safe component"
+        );
+        assert!(
+            !SIGN_NAME.is_empty(),
+            "WABBIT_BRAND_SIGN_NAME must not be empty"
+        );
+        assert!(
+            is_safe_component(SIGN_NAME),
+            "WABBIT_BRAND_SIGN_NAME must be one path- and shell-safe component"
+        );
+    };
+}
+
 /// The stable system path for the artifact; both flavors reference it so
 /// initramfs rebuilds do not need the repository.
-const SYSTEM_BINARY: &str = "/usr/lib/wabbit/wabbit-initrd";
+fn system_binary() -> String {
+    let name = brand::NAME;
+    format!("/usr/lib/{name}/{name}-initrd")
+}
 
 /// The wabbit-initrd artifact, compiled into this installer by its build
 /// script (static musl, complete with its embedded bnuuy object and
@@ -65,66 +117,100 @@ enum Artifact {
 
 // ------------------------------------------------------------------ the hooks
 
+/// The protector's in-image path: the initramfs root.
+fn image_binary() -> String {
+    format!("/{}-initrd", brand::NAME)
+}
+
+/// The launch hook's pidfiles: `/run`, with `/dev` as the pre-`/run`
+/// fallback.
+fn pidfiles() -> (String, String) {
+    let name = brand::NAME;
+    (
+        format!("/run/{name}-initrd.pid"),
+        format!("/dev/.{name}-initrd.pid"),
+    )
+}
+
 /// The launch hook: the documented `/init` recipe, run from the flavor's
 /// launch slot. POSIX sh — initramfs hooks run under busybox too.
-const LAUNCH_HOOK: &str = r#"#!/bin/sh
-# wabbit: launch the initrd protector (see AGENTS.md, "Initrd integration").
-# This slot runs after /proc, /sys, and /dev are mounted, before any root
-# mounting. setsid keeps job-control signals away from the protector and
-# everything it spawns; the console never blocks when the world freezes
-# (a pipe-backed stderr would). RUST_LOG matters: env_logger defaults to
-# error-only.
-RUST_LOG=info setsid /wabbit-initrd </dev/null >/dev/console 2>&1 &
-wabbit_initrd_pid=$!
-pidfile=/run/wabbit-initrd.pid
-if ! echo "$wabbit_initrd_pid" >"$pidfile" 2>/dev/null; then
-    pidfile=/dev/.wabbit-initrd.pid
-    echo "$wabbit_initrd_pid" >"$pidfile"
+fn launch_hook() -> String {
+    let name = brand::NAME;
+    let binary = image_binary();
+    let (pidfile_run, pidfile_dev) = pidfiles();
+    format!(
+        r#"#!/bin/sh
+# {name}: launch the initrd protector. This slot runs after /proc, /sys,
+# and /dev are mounted, before any root mounting. setsid keeps
+# job-control signals away from the protector and everything it spawns;
+# the console never blocks when the world freezes (a pipe-backed stderr
+# would). RUST_LOG matters: env_logger defaults to error-only.
+RUST_LOG=info setsid {binary} </dev/null >/dev/console 2>&1 &
+protector_pid=$!
+pidfile={pidfile_run}
+if ! echo "$protector_pid" >"$pidfile" 2>/dev/null; then
+    pidfile={pidfile_dev}
+    echo "$protector_pid" >"$pidfile"
 fi
 
 # Cooperation: the kernel discards SIGSTOP for PID 1, so a busybox /init
 # (or systemd) cannot be frozen. This hook runs synchronously from the
-# init flow, so waiting here means nothing proceeds until bnuuy's first
-# pin exists. The freeze may stop this very wait; wabbit-initrd resumes
-# it when the world thaws.
+# init flow, so waiting here means nothing proceeds until the
+# protector's first pin exists. The freeze may stop this very wait; the
+# protector resumes it when the world thaws.
 while [ ! -e /sys/fs/bpf/boot/bpf ]; do sleep 0.1; done
-"#;
+"#
+    )
+}
 
 /// The pre-switch wait: after the real root is mounted and settled, the
-/// rest belongs to wabbit-initrd. Do not race it to switch_root.
-const SWITCH_WAIT_HOOK: &str = r#"#!/bin/sh
-# wabbit: hold until wabbit-initrd exits (see AGENTS.md). It owns the
-# handoff choreography; the boot must not race it to switch_root.
-# NOTE: until the switch-root handoff protocol exists, wabbit runs
-# indefinitely, so a full deployment holds here until it exits — this is
-# the documented choreography, not a defect. Reinstall with
+/// rest belongs to the protector. Do not race it to switch_root.
+fn switch_wait_hook() -> String {
+    let name = brand::NAME;
+    let (pidfile_run, pidfile_dev) = pidfiles();
+    format!(
+        r#"#!/bin/sh
+# {name}: hold until {name}-initrd exits. It owns the handoff
+# choreography; the boot must not race it to switch_root.
+# NOTE: until the switch-root handoff protocol exists, the protector
+# runs indefinitely, so a full deployment holds here until it exits —
+# this is the documented choreography, not a defect. Reinstall with
 # --no-switch-wait to omit this hook.
-for pidfile in /run/wabbit-initrd.pid /dev/.wabbit-initrd.pid; do
+for pidfile in {pidfile_run} {pidfile_dev}; do
     if [ -f "$pidfile" ]; then
-        wabbit_initrd_pid=$(cat "$pidfile")
-        while kill -0 "$wabbit_initrd_pid" 2>/dev/null; do sleep 0.5; done
+        protector_pid=$(cat "$pidfile")
+        while kill -0 "$protector_pid" 2>/dev/null; do sleep 0.5; done
     fi
 done
-"#;
+"#
+    )
+}
 
 /// The initramfs-tools build hook: carries the binary into the image at
 /// mkinitramfs time, with `$DESTDIR` as the staging tree.
-const INITRAMFS_TOOLS_BUILD_HOOK: &str = r#"#!/bin/sh
-# wabbit: carry wabbit-initrd into the image (see AGENTS.md).
-# This is an initramfs-tools build hook: $DESTDIR is the staging tree.
+fn initramfs_tools_build_hook() -> String {
+    let name = brand::NAME;
+    let system = system_binary();
+    let binary = image_binary();
+    format!(
+        r#"#!/bin/sh
+# {name}: carry {name}-initrd into the image. This is an initramfs-tools
+# build hook: $DESTDIR is the staging tree.
 set -e
-if [ -z "${DESTDIR:-}" ]; then
-    echo "wabbit hook: DESTDIR is not set — run me via mkinitramfs" >&2
+if [ -z "${{DESTDIR:-}}" ]; then
+    echo "{name} hook: DESTDIR is not set — run me via mkinitramfs" >&2
     exit 1
 fi
 mkdir -p "$DESTDIR"
 if command -v copy_exec >/dev/null 2>&1; then
-    copy_exec /usr/lib/wabbit/wabbit-initrd /wabbit-initrd
+    copy_exec {system} {binary}
 else
-    cp /usr/lib/wabbit/wabbit-initrd "$DESTDIR/wabbit-initrd"
-    chmod 0755 "$DESTDIR/wabbit-initrd"
+    cp {system} "$DESTDIR{binary}"
+    chmod 0755 "$DESTDIR{binary}"
 fi
-"#;
+"#
+    )
+}
 
 /// The dracut module: installs the binary and the hook scripts into the
 /// image when the image is generated. `$initdir` is the image staging
@@ -132,33 +218,50 @@ fi
 /// root. Hook scripts are sourced into the init shell by busybox-style
 /// inits and run as dracut-pre-mount / dracut-pre-pivot services in
 /// systemd initrds — the same slots, either way.
-const DRACUT_MODULE_SETUP: &str = r#"#!/bin/sh
-# dracut module: wabbit-initrd (see AGENTS.md, "Initrd integration").
-check() { return 0; }
-depends() { return 0; }
+fn dracut_module_setup() -> String {
+    let name = brand::NAME;
+    let system = system_binary();
+    let binary = image_binary();
+    format!(
+        r#"#!/bin/sh
+# dracut module: {name}-initrd.
+check() {{ return 0; }}
+depends() {{ return 0; }}
 
-install() {
+install() {{
     # The binary at a stable system path; inside the image it is
-    # /wabbit-initrd, at the initramfs root.
-    inst_binary /usr/lib/wabbit/wabbit-initrd /wabbit-initrd
+    # {binary}, at the initramfs root.
+    inst_binary {system} {binary}
 
     # The hooks. $hookdir is dracut's in-image hook root (usr/lib on
     # merged-/usr systems); they run in lexical order within each dir.
-    hooks="$initdir${hookdir:-/usr/lib/dracut/hooks}"
+    hooks="$initdir${{hookdir:-/usr/lib/dracut/hooks}}"
     mkdir -p "$hooks/pre-mount" "$hooks/pre-pivot"
-    install -m 0755 "$moddir/launch.sh" "$hooks/pre-mount/01-wabbit.sh"
+    install -m 0755 "$moddir/launch.sh" "$hooks/pre-mount/01-{name}.sh"
     if [ -e "$moddir/switch-wait.sh" ]; then
-        install -m 0755 "$moddir/switch-wait.sh" "$hooks/pre-pivot/99-wabbit.sh"
+        install -m 0755 "$moddir/switch-wait.sh" "$hooks/pre-pivot/99-{name}.sh"
     fi
+}}
+"#
+    )
 }
-"#;
+
+/// The dracut module's own directory, `90<name>`.
+fn dracut_module_dir() -> String {
+    format!("/usr/lib/dracut/modules.d/90{}", brand::NAME)
+}
 
 /// The grub drop-in: a LATER numbered file wins over a cloud image's
 /// `50-cloudimg-settings.cfg` without having to know what it says.
-const GRUB_LSM_DROP_IN: &str = r#"# wabbit: enroll the BPF LSM — no bnuuy hook can attach without it.
+fn grub_lsm_drop_in() -> String {
+    format!(
+        r#"# {name}: enroll the BPF LSM — the boot protections cannot attach without it.
 GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT lsm=bpf"
 GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX lsm=bpf"
-"#;
+"#,
+        name = brand::NAME
+    )
+}
 
 // -------------------------------------------------------------------- helpers
 
@@ -193,15 +296,16 @@ struct Options {
 }
 
 fn die(message: &str) -> ! {
-    eprintln!("wabbit-install: {message}");
+    eprintln!("{}-install: {message}", brand::NAME);
     std::process::exit(1);
 }
 
 fn usage(code: i32) -> ! {
+    let name = brand::NAME;
     print!(
         "\
-usage: wabbit-install [options]
-  --artifact PATH   install this wabbit-initrd binary instead of the one
+usage: {name}-install [options]
+  --artifact PATH   install this {name}-initrd binary instead of the one
                     bundled at build time
   --flavor NAME     dracut | initramfs-tools (default: autodetect)
   --no-switch-wait  do not install the pre-switch_root wait hook
@@ -374,27 +478,28 @@ fn find_artifact(options: &Options) -> Artifact {
 // ------------------------------------------------------------------ the flows
 
 fn remove(options: &Options, flavor: Flavor) -> ! {
+    let name = brand::NAME;
     if flavor == Flavor::InitramfsTools {
-        remove_file(options.dry_run, "/etc/initramfs-tools/hooks/wabbit");
+        remove_file(options.dry_run, &format!("/etc/initramfs-tools/hooks/{name}"));
         remove_file(
             options.dry_run,
-            "/etc/initramfs-tools/scripts/init-premount/wabbit",
+            &format!("/etc/initramfs-tools/scripts/init-premount/{name}"),
         );
         remove_file(
             options.dry_run,
-            "/etc/initramfs-tools/scripts/init-bottom/wabbit",
+            &format!("/etc/initramfs-tools/scripts/init-bottom/{name}"),
         );
         run(options.dry_run, "update-initramfs", &["-u", "-k", "all"]);
     } else {
-        let module = "/usr/lib/dracut/modules.d/90wabbit";
+        let module = dracut_module_dir();
         remove_file(options.dry_run, &format!("{module}/module-setup.sh"));
         remove_file(options.dry_run, &format!("{module}/launch.sh"));
         remove_file(options.dry_run, &format!("{module}/switch-wait.sh"));
-        remove_dir_if_empty(options.dry_run, module);
+        remove_dir_if_empty(options.dry_run, &module);
         run(options.dry_run, "dracut", &["--force"]);
     }
-    remove_file(options.dry_run, SYSTEM_BINARY);
-    remove_dir_if_empty(options.dry_run, "/usr/lib/wabbit");
+    remove_file(options.dry_run, &system_binary());
+    remove_dir_if_empty(options.dry_run, &format!("/usr/lib/{name}"));
     // The lsm=bpf addition is deliberately left in place: it is additive
     // (it only enrolls one more LSM) and other tooling may rely on it.
     println!("removed. any lsm=bpf added to the kernel command line was left alone.");
@@ -402,29 +507,30 @@ fn remove(options: &Options, flavor: Flavor) -> ! {
 }
 
 fn install(options: &Options, flavor: Flavor) {
+    let name = brand::NAME;
+    let sign_name = brand::SIGN_NAME;
+    let system = system_binary();
     let artifact = find_artifact(options);
     let artifact_name = match &artifact {
-        Artifact::Bundled => "<bundled wabbit-initrd>".to_string(),
+        Artifact::Bundled => format!("<bundled {name}-initrd>"),
         Artifact::Path(path) => path.display().to_string(),
     };
 
     println!("flavor: {}", flavor.as_str());
-    println!("+ install -m 0755 {artifact_name} {SYSTEM_BINARY}");
+    println!("+ install -m 0755 {artifact_name} {system}");
     if !options.dry_run {
-        if let Some(parent) = Path::new(SYSTEM_BINARY).parent() {
+        if let Some(parent) = Path::new(&system).parent() {
             let _ = fs::create_dir_all(parent);
         }
         let write = match &artifact {
-            Artifact::Bundled => fs::write(SYSTEM_BINARY, BUNDLED_WABBIT_INITRD),
-            Artifact::Path(path) => fs::copy(path, SYSTEM_BINARY).map(|_| ()),
+            Artifact::Bundled => fs::write(&system, BUNDLED_WABBIT_INITRD),
+            Artifact::Path(path) => fs::copy(path, &system).map(|_| ()),
         };
         if let Err(error) = write {
-            die(&format!(
-                "installing the artifact to {SYSTEM_BINARY}: {error}"
-            ));
+            die(&format!("installing the artifact to {system}: {error}"));
         }
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(SYSTEM_BINARY, std::fs::Permissions::from_mode(0o755));
+        let _ = fs::set_permissions(&system, std::fs::Permissions::from_mode(0o755));
     }
 
     match flavor {
@@ -432,48 +538,48 @@ fn install(options: &Options, flavor: Flavor) {
             write_file(
                 options.dry_run,
                 0o755,
-                "/etc/initramfs-tools/hooks/wabbit",
-                INITRAMFS_TOOLS_BUILD_HOOK,
+                &format!("/etc/initramfs-tools/hooks/{name}"),
+                &initramfs_tools_build_hook(),
             );
             write_file(
                 options.dry_run,
                 0o755,
-                "/etc/initramfs-tools/scripts/init-premount/wabbit",
-                LAUNCH_HOOK,
+                &format!("/etc/initramfs-tools/scripts/init-premount/{name}"),
+                &launch_hook(),
             );
             if options.switch_wait {
                 write_file(
                     options.dry_run,
                     0o755,
-                    "/etc/initramfs-tools/scripts/init-bottom/wabbit",
-                    SWITCH_WAIT_HOOK,
+                    &format!("/etc/initramfs-tools/scripts/init-bottom/{name}"),
+                    &switch_wait_hook(),
                 );
             }
             run(options.dry_run, "update-initramfs", &["-u", "-k", "all"]);
         }
         Flavor::Dracut => {
-            let module = "/usr/lib/dracut/modules.d/90wabbit";
+            let module = dracut_module_dir();
             write_file(
                 options.dry_run,
                 0o755,
                 &format!("{module}/launch.sh"),
-                LAUNCH_HOOK,
+                &launch_hook(),
             );
             if options.switch_wait {
                 write_file(
                     options.dry_run,
                     0o755,
                     &format!("{module}/switch-wait.sh"),
-                    SWITCH_WAIT_HOOK,
+                    &switch_wait_hook(),
                 );
             }
             write_file(
                 options.dry_run,
                 0o755,
                 &format!("{module}/module-setup.sh"),
-                DRACUT_MODULE_SETUP,
+                &dracut_module_setup(),
             );
-            run(options.dry_run, "dracut", &["--force", "--add", "wabbit"]);
+            run(options.dry_run, "dracut", &["--force", "--add", brand::NAME]);
         }
     }
 
@@ -487,22 +593,23 @@ fn install(options: &Options, flavor: Flavor) {
         enroll_bpf_lsm(options);
     }
 
+    let image = image_binary();
     let switch_summary = if options.switch_wait {
-        "waits for wabbit-initrd to exit (see the handoff note in --help)"
+        format!("waits for {name}-initrd to exit (see the handoff note in --help)")
     } else {
-        "NOT INSTALLED (--no-switch-wait)"
+        "NOT INSTALLED (--no-switch-wait)".to_string()
     };
     print!(
         "
 installed via {flavor}:
-  binary:        /wabbit-initrd in the image (installed from {artifact_name})
+  binary:        {image} in the image (installed from {artifact_name})
   launch:        after /proc, /sys, /dev are mounted, before root mounting;
-                 holds the init flow until bnuuy's /sys/fs/bpf/boot/bpf pin
+                 holds the init flow until the protector's /sys/fs/bpf/boot/bpf pin
   before
   switch_root:   {switch_summary}
 
-takes effect on the next boot. any wabbit-initrd failure leaves the bnuuy
-sign at /run/bnuuy.bin explaining why — the boot itself continues
+takes effect on the next boot. any {name}-initrd failure leaves the {sign_name}
+sign at /run/{sign_name}.bin explaining why — the boot itself continues
 unprotected rather than not at all.
 "
     );
@@ -511,10 +618,11 @@ unprotected rather than not at all.
 /// Best-effort confirmation that the rebuilt image actually carries the
 /// wiring; a warning, not a failure.
 fn verify_image(flavor: Flavor) {
+    let name = brand::NAME;
     let carrying = |listing: String| {
         listing
             .lines()
-            .filter(|line| line.contains("wabbit"))
+            .filter(|line| line.contains(name))
             .map(str::to_string)
             .collect::<Vec<_>>()
     };
@@ -527,7 +635,10 @@ fn verify_image(flavor: Flavor) {
     };
     match found {
         Some(lines) if !lines.is_empty() => println!("image carries: {}", lines.join(" ")),
-        _ => eprintln!("warning: could not confirm wabbit inside the image (lsinitrd/lsinitramfs)"),
+        _ => eprintln!(
+            "warning: could not confirm {} inside the image (lsinitrd/lsinitramfs)",
+            brand::NAME
+        ),
     }
 }
 
@@ -558,8 +669,8 @@ fn enroll_bpf_lsm(options: &Options) {
         write_file(
             options.dry_run,
             0o644,
-            "/etc/default/grub.d/99-wabbit-lsm.cfg",
-            GRUB_LSM_DROP_IN,
+            &format!("/etc/default/grub.d/99-{}-lsm.cfg", brand::NAME),
+            &grub_lsm_drop_in(),
         );
         run(options.dry_run, "update-grub", &[]);
     } else {
@@ -642,27 +753,40 @@ mod tests {
 
     #[test]
     fn the_launch_hook_is_the_documented_recipe() {
-        assert!(
-            LAUNCH_HOOK
-                .contains("RUST_LOG=info setsid /wabbit-initrd </dev/null >/dev/console 2>&1 &")
-        );
-        assert!(LAUNCH_HOOK.contains("/sys/fs/bpf/boot/bpf"));
+        let name = brand::NAME;
+        let hook = launch_hook();
+        assert!(hook.contains(&format!(
+            "RUST_LOG=info setsid /{name}-initrd </dev/null >/dev/console 2>&1 &"
+        )));
+        assert!(hook.contains("/sys/fs/bpf/boot/bpf"));
     }
 
     #[test]
-    fn the_switch_wait_holds_on_wabbit_initrd() {
-        assert!(SWITCH_WAIT_HOOK.contains("kill -0 \"$wabbit_initrd_pid\""));
+    fn the_switch_wait_holds_on_the_protector() {
+        assert!(switch_wait_hook().contains("kill -0 \"$protector_pid\""));
     }
 
     #[test]
     fn the_dracut_module_uses_dracut_hook_dirs() {
-        assert!(DRACUT_MODULE_SETUP.contains("hooks/pre-mount"));
-        assert!(DRACUT_MODULE_SETUP.contains("hooks/pre-pivot"));
+        let setup = dracut_module_setup();
+        assert!(setup.contains("hooks/pre-mount"));
+        assert!(setup.contains("hooks/pre-pivot"));
     }
 
     #[test]
     fn the_grub_drop_in_enrolls_the_bpf_lsm() {
-        assert!(GRUB_LSM_DROP_IN.contains("lsm=bpf"));
+        assert!(grub_lsm_drop_in().contains("lsm=bpf"));
+    }
+
+    /// The hooks carry the brand — and no other name — in every path
+    /// they touch.
+    #[test]
+    fn the_hooks_carry_the_brand() {
+        let name = brand::NAME;
+        assert!(launch_hook().contains(&format!("/{name}-initrd")));
+        assert!(initramfs_tools_build_hook().contains(&system_binary()));
+        assert!(dracut_module_setup().contains(&format!("01-{name}.sh")));
+        assert!(system_binary().contains(&format!("/usr/lib/{name}/{name}")));
     }
 
     /// The build script really did bundle an artifact: a non-empty ELF.
@@ -670,13 +794,13 @@ mod tests {
     fn the_bundle_is_a_real_artifact() {
         assert!(
             BUNDLED_WABBIT_INITRD.len() > 1_000_000,
-            "the bundled wabbit-initrd is suspiciously small ({} bytes)",
+            "the bundled artifact is suspiciously small ({} bytes)",
             BUNDLED_WABBIT_INITRD.len()
         );
         assert_eq!(
             &BUNDLED_WABBIT_INITRD[..4],
             b"\x7fELF",
-            "the bundled wabbit-initrd is not an ELF binary"
+            "the bundled artifact is not an ELF binary"
         );
     }
 }

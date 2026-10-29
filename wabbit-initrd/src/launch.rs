@@ -64,16 +64,23 @@ use std::{
 use anyhow::{Context, Result, bail};
 use aya::{Ebpf, maps::HashMap};
 use log::{debug, info, warn};
+use wabbit_common::brand::NAME;
 
 /// The wabbit userspace binary, compiled into this executable by `build.rs`.
 const WABBIT_BLOB: &[u8] = include_bytes!(env!("WABBIT_BLOB"));
 
-/// Where the file fallback materializes the blob.
-const WABBIT_FILE: &str = "/wabbit";
+/// Where the file fallback materializes the blob: the brand name at the
+/// initramfs root.
+fn blob_file() -> String {
+    format!("/{NAME}")
+}
 
-/// The first byte marks the process as exempt from systemd's switch-root
-/// kill; the rest is a name worth reading in a `ps` listing.
-const WABBIT_ARG0: &str = "@wabbit";
+/// `argv[0]` of the outer process. The first byte marks it as exempt from
+/// systemd's switch-root kill; the rest is a name worth reading in a
+/// `ps` listing.
+fn arg0() -> String {
+    format!("@{NAME}")
+}
 
 /// `memfd_create` flags, from the kernel UAPI
 /// (`include/uapi/linux/memfd.h`); libc does not export them for Linux.
@@ -103,32 +110,33 @@ pub fn launch_embedded_wabbit(ebpf: &mut Ebpf, cgroup: &Path) -> Result<i32> {
     // mount-namespace setup, far enough away that this write — microseconds
     // after the spawn — always wins the race.
     fs::write(cgroup.join("cgroup.procs"), format!("{}\n", child.id()))
-        .with_context(|| format!("moving wabbit into its cgroup at {}", cgroup.display()))?;
+        .with_context(|| format!("moving {NAME} into its cgroup at {}", cgroup.display()))?;
 
     let mut trusted_pids: HashMap<_, u32, u8> = ebpf
         .map_mut("TRUSTED_BPF_PIDS")
-        .context("finding bnuuy trusted PID map")?
+        .context("finding the trusted-PID map")?
         .try_into()
-        .context("opening bnuuy trusted PID map")?;
+        .context("opening the trusted-PID map")?;
     trusted_pids
         .insert(child.id(), 1, 0)
-        .context("trusting the wabbit PID in bnuuy")?;
+        .context("trusting the child PID in the trusted-PID map")?;
 
+    let argv0 = arg0();
     info!(
-        "started embedded wabbit as pid {} (argv[0] {WABBIT_ARG0:?}) in its \
+        "started embedded {NAME} as pid {} (argv[0] {argv0:?}) in its \
          cgroup at {}; babysitting it",
         child.id(),
         cgroup.display()
     );
     crate::sign::phase(&format!(
-        "started embedded wabbit as pid {} in its cgroup at {}",
+        "started embedded {NAME} as pid {} in its cgroup at {}",
         child.id(),
         cgroup.display()
     ));
-    let status = child.wait().context("waiting for wabbit")?;
+    let status = child.wait().context(format!("waiting for {NAME}"))?;
     match status.code() {
         Some(code) => Ok(code),
-        None => bail!("wabbit terminated by signal: {status}"),
+        None => bail!("{NAME} terminated by signal: {status}"),
     }
 }
 
@@ -136,12 +144,12 @@ pub fn launch_embedded_wabbit(ebpf: &mut Ebpf, cgroup: &Path) -> Result<i32> {
 fn spawn_wabbit() -> Result<Child> {
     match spawn_via_memfd() {
         Ok(child) => {
-            debug!("launched wabbit from an anonymous memfd");
+            debug!("launched {NAME} from an anonymous memfd");
             Ok(child)
         }
         Err(error) => {
             warn!(
-                "launching wabbit from a memfd failed ({error:#}); \
+                "launching {NAME} from a memfd failed ({error:#}); \
                  falling back to a file on the initrd rootfs"
             );
             spawn_via_file()
@@ -156,17 +164,18 @@ fn spawn_via_memfd() -> Result<Child> {
     // execveat call in the child, then closes atomically when that exec
     // succeeds, so wabbit never sees the fd.
     let image = ExecImage::at_empty_path(memfd.as_raw_fd());
-    spawn_with_image(image, "wabbit")
+    spawn_with_image(image, NAME)
 }
 
 /// Spawn wabbit from a file written onto the initrd rootfs.
 fn spawn_via_file() -> Result<Child> {
-    fs::write(WABBIT_FILE, WABBIT_BLOB)
-        .with_context(|| format!("writing the wabbit blob to {WABBIT_FILE}"))?;
-    fs::set_permissions(WABBIT_FILE, Permissions::from_mode(0o755))
-        .with_context(|| format!("making {WABBIT_FILE} executable"))?;
-    let image = ExecImage::at_path(WABBIT_FILE)?;
-    spawn_with_image(image, WABBIT_FILE)
+    let file = blob_file();
+    fs::write(&file, WABBIT_BLOB)
+        .with_context(|| format!("writing the {NAME} blob to {file}"))?;
+    fs::set_permissions(&file, Permissions::from_mode(0o755))
+        .with_context(|| format!("making {file} executable"))?;
+    let image = ExecImage::at_path(&file)?;
+    spawn_with_image(image, &file)
 }
 
 /// Fork with the image's execveat hooked in before std's own exec.
@@ -185,9 +194,10 @@ fn spawn_with_image(image: ExecImage, placeholder: &str) -> Result<Child> {
     Ok(command.spawn()?)
 }
 
-/// Create an executable memfd holding the wabbit blob.
+/// Create an executable memfd holding the wabbit blob. Its name — the
+/// brand — is what `/proc/<pid>/exe` and the process's `comm` show.
 fn memfd_with_blob() -> Result<File> {
-    let name = CString::new("wabbit").expect("the memfd name contains no NUL");
+    let name = CString::new(NAME).expect("the memfd name contains no NUL");
     let mut fd = unsafe { libc::memfd_create(name.as_ptr(), MFD_CLOEXEC | MFD_EXEC) };
     if fd < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
         // The kernel predates MFD_EXEC (6.6); on those, memfds are
@@ -196,13 +206,13 @@ fn memfd_with_blob() -> Result<File> {
         fd = unsafe { libc::memfd_create(name.as_ptr(), MFD_CLOEXEC) };
     }
     if fd < 0 {
-        return Err(io::Error::last_os_error()).context("memfd_create for the wabbit blob");
+        return Err(io::Error::last_os_error()).context(format!("memfd_create for the {NAME} blob"));
     }
     let mut memfd = unsafe { File::from_raw_fd(fd) };
     memfd
         .write_all(WABBIT_BLOB)
-        .context("writing the wabbit blob to the memfd")?;
-    memfd.rewind().context("rewinding the wabbit memfd")?;
+        .context(format!("writing the {NAME} blob to the memfd"))?;
+    memfd.rewind().context(format!("rewinding the {NAME} memfd"))?;
     Ok(memfd)
 }
 
@@ -260,7 +270,7 @@ impl ExecImage {
     }
 
     fn new(dirfd: libc::c_int, path: CString, flags: libc::c_int) -> Self {
-        let argv = vec![CString::new(WABBIT_ARG0).expect("argv contains no NUL")];
+        let argv = vec![CString::new(arg0()).expect("argv contains no NUL")];
         let argv_pointers = ExecPointers(c_pointers(&argv));
         let envp = environment();
         let envp_pointers = ExecPointers(c_pointers(&envp));
@@ -331,7 +341,7 @@ mod tests {
 
     #[test]
     fn exec_pointer_arrays_are_nul_terminated() {
-        let argv = vec![CString::new(WABBIT_ARG0).unwrap()];
+        let argv = vec![CString::new(arg0()).unwrap()];
         let pointers = c_pointers(&argv);
         assert_eq!(pointers.len(), 2);
         assert!(!pointers[0].is_null());

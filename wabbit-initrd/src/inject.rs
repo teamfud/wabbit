@@ -51,6 +51,7 @@ use aya_obj::{
     obj::{Function, Object},
 };
 use log::{info, warn};
+use wabbit_common::brand::SIGN_NAME;
 
 /// The syscall family the gate covers: loading modules by fd, loading by
 /// buffer, unloading (an attacker dropping a security-relevant module is
@@ -179,9 +180,9 @@ fn obj_get(path: &Path) -> Result<OwnedFd> {
 fn gate_instructions_with_trust_fd(trust_fd: RawFd) -> Result<Vec<bpf_insn>> {
     let mut object = Object::parse(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
-        "/wabbit"
+        "/early"
     )))
-    .context("parsing the bnuuy object for the syscall gate")?;
+    .context(format!("parsing the {SIGN_NAME} object for the syscall gate"))?;
 
     let map_defs: Vec<(String, Map)> = object
         .maps
@@ -199,12 +200,12 @@ fn gate_instructions_with_trust_fd(trust_fd: RawFd) -> Result<Vec<bpf_insn>> {
     });
     object
         .relocate_maps(maps, &text_sections)
-        .context("relocating the bnuuy object's map references")?;
+        .context(format!("relocating the {SIGN_NAME} object's map references"))?;
 
     let program = object
         .programs
         .get(GATE_NAME)
-        .with_context(|| format!("finding the {GATE_NAME} program in the bnuuy object"))?;
+        .with_context(|| format!("finding the {GATE_NAME} program in the {SIGN_NAME} object"))?;
     let function: &Function = object
         .functions
         .get(&program.function_key())

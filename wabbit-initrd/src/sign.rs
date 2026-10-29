@@ -39,30 +39,36 @@ use std::{
 
 use log::debug;
 use rustix::process::getpid;
+use wabbit_common::brand::{NAME, SIGN_MAGIC, SIGN_NAME};
 
 /// Where the sign lives by default: the runtime directory the initrd
 /// already provides. No mount is ever made for it.
 const DEFAULT_SIGN_DIR: &str = "/run";
 
-const SIGN_FILE: &str = "bnuuy.bin";
-
-const MAGIC: &[u8; 4] = b"BNUY";
+/// The sign's magic: `<sign magic>` by default, exactly four bytes,
+/// validated at compile time.
+const MAGIC: &[u8] = SIGN_MAGIC.as_bytes();
 
 /// The format version, little-endian after the magic.
 const FORMAT_VERSION: u16 = 1;
 
+/// The sign's file name, `<sign name>.bin`.
+fn sign_file() -> String {
+    format!("{SIGN_NAME}.bin")
+}
+
 /// Where the sign directory actually is: overridable for testing with
-/// `WABBIT_SIGN_DIR` (the watchdog re-exec inherits the environment and so
+/// `<prefix>_SIGN_DIR` (the watchdog re-exec inherits the environment and so
 /// writes to the same place).
 fn sign_dir() -> PathBuf {
-    env::var_os("WABBIT_SIGN_DIR")
+    env::var_os(format!("{}_SIGN_DIR", wabbit_common::brand::ENV_PREFIX))
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_SIGN_DIR))
 }
 
 fn sign_path() -> PathBuf {
-    sign_dir().join(SIGN_FILE)
+    sign_dir().join(sign_file())
 }
 
 /// The record kinds, as written into the file.
@@ -103,7 +109,7 @@ pub fn init() {
         Ok(mut file) => {
             let _ = file.write_all(MAGIC);
             let _ = file.write_all(&FORMAT_VERSION.to_le_bytes());
-            let _ = file.write_all(&encode_record(now_ms(), Kind::Doc, DOC_RECORD));
+            let _ = file.write_all(&encode_record(now_ms(), Kind::Doc, &doc_record()));
             file
         }
         Err(error) => {
@@ -112,10 +118,7 @@ pub fn init() {
         }
     };
     drop(file);
-    phase(&format!(
-        "starting wabbit-initrd (pid {pid})",
-        pid = getpid()
-    ));
+    phase(&format!("starting {NAME}-initrd (pid {pid})", pid = getpid()));
 }
 
 /// Record a startup phase.
@@ -185,12 +188,14 @@ fn encode_record(timestamp_ms: u64, kind: Kind, message: &str) -> Vec<u8> {
 }
 
 /// The self-describing banner, always the first record.
-const DOC_RECORD: &str = "wabbit-initrd boot log (the bnuuy sign). This \
-                          file only exists when a boot did not go to plan; a \
-                          clean boot removes it. Format: magic \"BNUY\", u16 \
-                          LE version, then records of: u64 LE ms since boot, \
-                          u8 kind (0 doc, 1 phase, 2 failure, 3 watchdog, 4 \
-                          panic), u32 LE length, UTF-8 text.";
+fn doc_record() -> String {
+    format!("{NAME}-initrd boot log (the {SIGN_NAME} sign). This file \
+             only exists when a boot did not go to plan; a clean boot \
+             removes it. Format: magic \"{SIGN_MAGIC}\", u16 LE version, \
+             then records of: u64 LE ms since boot, u8 kind (0 doc, 1 \
+             phase, 2 failure, 3 watchdog, 4 panic), u32 LE length, UTF-8 \
+             text.")
+}
 
 #[cfg(test)]
 mod tests {
@@ -222,7 +227,7 @@ mod tests {
         let mut file = Vec::new();
         file.extend_from_slice(MAGIC);
         file.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        file.extend_from_slice(&encode_record(0, Kind::Doc, DOC_RECORD));
+        file.extend_from_slice(&encode_record(0, Kind::Doc, &doc_record()));
         file.extend_from_slice(&encode_record(7, Kind::Phase, "stopped the world"));
         file.extend_from_slice(&encode_record(9, Kind::Failure, "no /sys: found magic 0x0"));
         file.extend_from_slice(&encode_record(12, Kind::Watchdog, "parent gone; thawed"));
@@ -251,9 +256,9 @@ mod tests {
 
     #[test]
     fn the_banner_self_documents() {
-        let banner = DOC_RECORD;
-        assert!(banner.contains("BNUY"));
-        assert!(banner.contains("wabbit-initrd"));
+        let banner = doc_record();
+        assert!(banner.contains(SIGN_MAGIC));
+        assert!(banner.contains(&format!("{NAME}-initrd")));
         assert!(banner.contains("clean boot removes"));
     }
 }

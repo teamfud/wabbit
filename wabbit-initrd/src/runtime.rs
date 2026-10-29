@@ -61,13 +61,14 @@ use rustix::{
     io::Errno,
     mount::{MountFlags, mount},
 };
+use wabbit_common::brand::NAME;
 
 /// Where the unified cgroup hierarchy lives.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
-/// The name of wabbit's cgroup inside [`CGROUP_ROOT`], matching
-/// `wabbit::cgroup`'s convention.
-const WABBIT_CGROUP: &str = "wabbit";
+/// The name of the outer process's cgroup inside [`CGROUP_ROOT`],
+/// matching `wabbit::cgroup`'s convention. The brand name by default.
+const WABBIT_CGROUP: &str = wabbit_common::brand::NAME;
 
 /// Filesystem magics, from the kernel UAPI (`include/uapi/linux/magic.h`).
 pub(crate) const SYSFS_MAGIC: i64 = 0x62656572;
@@ -104,7 +105,7 @@ fn ensure_cgroupfs() -> Result<()> {
     if sys != SYSFS_MAGIC {
         bail!(
             "expected sysfs at /sys (magic {SYSFS_MAGIC:#x}), found magic \
-             {sys:#x}: the init script must mount /sys before wabbit-initrd runs"
+             {sys:#x}: the init script must mount /sys before {NAME}-initrd runs"
         );
     }
 
@@ -116,7 +117,7 @@ fn ensure_cgroupfs() -> Result<()> {
         // A cgroup v1 hierarchy cannot back the unified-hierarchy
         // authorization model.
         Ok(CGROUP_V1_MAGIC) => {
-            bail!("found a cgroup v1 hierarchy at {CGROUP_ROOT}; wabbit needs cgroup2")
+            bail!("found a cgroup v1 hierarchy at {CGROUP_ROOT}; {NAME} needs cgroup2")
         }
         // The kernel creates an empty mount point for cgroup2 in sysfs
         // (4.6+); nothing is mounted there yet.
@@ -156,29 +157,29 @@ fn ensure_wabbit_cgroup() -> Result<WabbitCgroup> {
                 .with_context(|| format!("reading {}", path.join("cgroup.procs").display()))?;
             if !procs_is_empty(&procs) {
                 bail!(
-                    "the wabbit cgroup at {} already contains processes: {:?}",
+                    "the {NAME} cgroup at {} already contains processes: {:?}",
                     path.display(),
                     procs
                 );
             }
-            info!("reusing the existing wabbit cgroup at {}", path.display());
+            info!("reusing the existing {NAME} cgroup at {}", path.display());
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // A directory created inside cgroupfs *is* a cgroup.
             fs::create_dir(&path)
-                .with_context(|| format!("creating the wabbit cgroup at {}", path.display()))?;
-            info!("created the wabbit cgroup at {}", path.display());
+                .with_context(|| format!("creating the {NAME} cgroup at {}", path.display()))?;
+            info!("created the {NAME} cgroup at {}", path.display());
         }
         Err(error) => {
             return Err(error)
-                .with_context(|| format!("inspecting the wabbit cgroup at {}", path.display()));
+                .with_context(|| format!("inspecting the {NAME} cgroup at {}", path.display()));
         }
     }
 
     // The "done, here's fd" of the startup diagram: a descriptor on the
     // cgroup directory, held until this process exits.
     let fd = rustix::fs::open(&path, OFlags::DIRECTORY | OFlags::PATH, Mode::empty())
-        .with_context(|| format!("opening the wabbit cgroup at {}", path.display()))?;
+        .with_context(|| format!("opening the {NAME} cgroup at {}", path.display()))?;
     Ok(WabbitCgroup { path, fd })
 }
 

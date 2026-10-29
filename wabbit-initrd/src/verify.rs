@@ -43,10 +43,13 @@ use rustix::{
     fs::{Mode, OFlags},
     io::Errno,
 };
+use wabbit_common::brand::{NAME, SIGN_NAME};
 
-const WORKER_BPF: &str = "--wabbit-verify-bpf";
-const WORKER_KMOD: &str = "--wabbit-verify-kmod";
-const WORKER_MODULES_WRITE: &str = "--wabbit-verify-modules-write";
+/// The `--<name>-verify-<kind>` flag that re-execs this binary as a
+/// verification worker.
+fn worker_flag(kind: &str) -> String {
+    format!("--{NAME}-verify-{kind}")
+}
 
 /// Exit codes shared by the workers and their spawner.
 mod verdict {
@@ -75,7 +78,9 @@ const CAP_SYS_MODULE: u32 = 16;
 
 /// Scratch space for test files. The initrd root is writable, but `/tmp`
 /// may not exist yet.
-const SCRATCH_DIR: &str = "/tmp/wabbit-verify";
+fn scratch_dir_path() -> PathBuf {
+    PathBuf::from(format!("/tmp/{NAME}-verify"))
+}
 
 /// Dispatch a verification worker — or the freeze watchdog — if the command
 /// line asks for one.
@@ -85,37 +90,47 @@ const SCRATCH_DIR: &str = "/tmp/wabbit-verify";
 /// `None` means this is the real initrd process.
 pub fn worker_main() -> Option<i32> {
     let mut args = env::args().skip(1);
-    match args.next().as_deref() {
-        Some(crate::freeze::WATCHDOG_ARG) => match args.next() {
+    let first = args.next()?;
+    if first == crate::freeze::watchdog_arg() {
+        return match args.next() {
             Some(raw) => match crate::freeze::watchdog_main(&raw) {
                 Ok(()) => Some(0),
                 Err(error) => {
-                    eprintln!("wabbit watchdog: {error:#}");
+                    eprintln!("{NAME} watchdog: {error:#}");
                     Some(1)
                 }
             },
             None => {
-                eprintln!("usage: {} <pipe-fd>", crate::freeze::WATCHDOG_ARG);
+                eprintln!("usage: {} <pipe-fd>", crate::freeze::watchdog_arg());
                 Some(verdict::SETUP_FAILED)
             }
-        },
-        Some(WORKER_BPF) => Some(worker_verify_bpf()),
-        Some(WORKER_KMOD) => match args.next() {
+        };
+    }
+    if first == worker_flag("bpf") {
+        return Some(worker_verify_bpf());
+    }
+    if first == worker_flag("kmod") {
+        return match args.next() {
             Some(path) => Some(worker_verify_kmod(Path::new(&path))),
             None => {
-                eprintln!("usage: {WORKER_KMOD} <path-to-dummy-module>");
+                eprintln!("usage: {} <path-to-dummy-module>", worker_flag("kmod"));
                 Some(verdict::SETUP_FAILED)
             }
-        },
-        Some(WORKER_MODULES_WRITE) => match args.next() {
+        };
+    }
+    if first == worker_flag("modules-write") {
+        return match args.next() {
             Some(path) => Some(worker_verify_modules_write(Path::new(&path))),
             None => {
-                eprintln!("usage: {WORKER_MODULES_WRITE} <path-under-module-tree>");
+                eprintln!(
+                    "usage: {} <path-under-module-tree>",
+                    worker_flag("modules-write")
+                );
                 Some(verdict::SETUP_FAILED)
             }
-        },
-        _ => None,
+        };
     }
+    None
 }
 
 /// `bpf()` must be denied for PIDs outside `TRUSTED_BPF_PIDS`.
@@ -174,7 +189,7 @@ fn worker_verify_kmod(path: &Path) -> i32 {
             verdict::WRONG_ERRNO
         }
         other => {
-            eprintln!("finit_module() failed with errno {other}: expected EPERM from bnuuy");
+            eprintln!("finit_module() failed with errno {other}: expected EPERM from {SIGN_NAME}");
             verdict::WRONG_ERRNO
         }
     }
@@ -193,7 +208,7 @@ fn worker_verify_modules_write(path: &Path) -> i32 {
         }
         Err(Errno::PERM) => verdict::BLOCKED,
         Err(error) => {
-            eprintln!("open failed with {error}: expected EPERM from bnuuy");
+            eprintln!("open failed with {error}: expected EPERM from {SIGN_NAME}");
             verdict::WRONG_ERRNO
         }
     }
@@ -227,7 +242,7 @@ pub fn verify_protections(
     tracepoints_attached: bool,
     module_load_gate_attached: bool,
 ) -> Result<()> {
-    info!("verifying bnuuy protections from spawned workers");
+    info!("verifying {SIGN_NAME} protections from spawned workers");
     trusted_bpf_syscall_works()?;
 
     let mut fork_events: HashMap<MapData, u32, u8> = ebpf
@@ -252,13 +267,13 @@ pub fn verify_protections(
     // so its denial has nothing to come from, and running the worker would
     // only "prove" a protection the kernel never offered.
     if module_load_gate_attached {
-        let dummy_module = scratch.join("wabbit-dummy.ko");
+        let dummy_module = scratch.join(format!("{NAME}-dummy.ko"));
         fs::write(
             &dummy_module,
-            "wabbit verification: this is not an ELF module\n",
+            format!("{NAME} verification: this is not an ELF module\n"),
         )
         .with_context(|| format!("writing {}", dummy_module.display()))?;
-        let (pid, code) = run_worker(WORKER_KMOD, Some(&dummy_module))?;
+        let (pid, code) = run_worker(&worker_flag("kmod"), Some(&dummy_module))?;
         check_verdict(code, "finit_module() of an out-of-tree image is denied")?;
         if tracepoints_attached {
             verify_fork_event(&mut fork_events, pid)
@@ -276,7 +291,7 @@ pub fn verify_protections(
 
     // The diagram: "verify by spawning another process and doing a bpf
     // syscall" → "not allowed!".
-    let (pid, code) = run_worker(WORKER_BPF, None)?;
+    let (pid, code) = run_worker(&worker_flag("bpf"), None)?;
     check_verdict(code, "bpf() from a PID outside TRUSTED_BPF_PIDS is denied")?;
     if tracepoints_attached {
         verify_fork_event(&mut fork_events, pid)
@@ -286,8 +301,8 @@ pub fn verify_protections(
     // The diagram: "test write perms of /l/m" → "EPERM". Only meaningful
     // when the initrd carries a module tree to protect.
     if Path::new("/lib/modules").is_dir() {
-        let target = Path::new("/lib/modules/wabbit-verify-write");
-        let (pid, code) = run_worker(WORKER_MODULES_WRITE, Some(target))?;
+        let target = PathBuf::from(format!("/lib/modules/{NAME}-verify-write"));
+        let (pid, code) = run_worker(&worker_flag("modules-write"), Some(&target))?;
         // The file_open hook records what it decided and why in its trace
         // map; a failed writable-open test is undecipherable without it
         // (was the hook called? was f_mode read? did d_path resolve?), so
@@ -318,9 +333,9 @@ pub fn verify_protections(
         }
     }
 
-    let _ = fs::remove_file(scratch.join("wabbit-dummy.ko"));
+    let _ = fs::remove_file(scratch.join(format!("{NAME}-dummy.ko")));
     let _ = fs::remove_dir(&scratch);
-    info!("bnuuy protections verified");
+    info!("{SIGN_NAME} protections verified");
     Ok(())
 }
 
@@ -431,7 +446,7 @@ fn check_verdict(code: i32, what: &str) -> Result<()> {
 }
 
 fn scratch_dir() -> Result<PathBuf> {
-    let dir = PathBuf::from(SCRATCH_DIR);
+    let dir = scratch_dir_path();
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir)
 }

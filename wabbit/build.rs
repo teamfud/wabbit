@@ -2,6 +2,17 @@ use anyhow::{Context as _, anyhow};
 use aya_build::Toolchain;
 
 fn main() -> anyhow::Result<()> {
+    // The white-label knobs: the embedded wabbit-ebpf object is compiled
+    // by a nested cargo (which inherits the environment), so a change
+    // must rerun this build script to re-invoke it.
+    for var in [
+        "WABBIT_BRAND_NAME",
+        "WABBIT_BRAND_ENV_PREFIX",
+        "WABBIT_BRAND_SIGN_NAME",
+        "WABBIT_BRAND_SIGN_MAGIC",
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
     let cargo_metadata::Metadata { packages, .. } = cargo_metadata::MetadataCommand::new()
         .no_deps()
         .exec()

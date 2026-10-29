@@ -16,6 +16,13 @@ use std::{
 };
 
 fn main() {
+    // The white-label knobs: they change both this crate's strings and the
+    // nested wabbit-initrd build (which inherits the environment), so a
+    // change must rebuild the bundle.
+    println!("cargo:rerun-if-env-changed=WABBIT_BRAND_NAME");
+    println!("cargo:rerun-if-env-changed=WABBIT_BRAND_ENV_PREFIX");
+    println!("cargo:rerun-if-env-changed=WABBIT_BRAND_SIGN_NAME");
+    println!("cargo:rerun-if-env-changed=WABBIT_BRAND_SIGN_MAGIC");
     if let Err(error) = bundle() {
         panic!("building the bundled wabbit-initrd failed: {error}");
     }

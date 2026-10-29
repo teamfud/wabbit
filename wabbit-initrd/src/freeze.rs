@@ -65,6 +65,7 @@ use rustix::{
     io::Errno,
     process::{Pid, Signal, getpid, kill_process},
 };
+use wabbit_common::brand::NAME;
 
 /// Where the process table lives.
 const PROC: &str = "/proc";
@@ -232,7 +233,9 @@ impl Drop for FrozenWorld {
 }
 
 /// The command-line flag that re-execs this binary as the watchdog.
-pub const WATCHDOG_ARG: &str = "--wabbit-watchdog";
+pub fn watchdog_arg() -> String {
+    format!("--{NAME}-watchdog")
+}
 
 /// The watchdog that thaws the world if `wabbit-initrd` dies frozen.
 ///
@@ -295,7 +298,7 @@ impl Watchdog {
 
         let executable = env::current_exe().context("resolving the current executable")?;
         let child = Command::new(executable)
-            .arg(WATCHDOG_ARG)
+            .arg(watchdog_arg())
             .arg(read_end.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -347,7 +350,7 @@ pub fn watchdog_main(raw: &str) -> Result<()> {
     let _ = pipe.read(&mut byte);
 
     let me = getpid();
-    eprintln!("wabbit watchdog: the parent is gone; thawing the world");
+    eprintln!("{NAME} watchdog: the parent is gone; thawing the world");
     for pid in scan_pids(Path::new(PROC)).context("watchdog scanning /proc")? {
         if pid == me {
             continue;

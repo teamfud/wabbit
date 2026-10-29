@@ -9,14 +9,14 @@ pub mod maps;
 pub mod tracepoints;
 
 #[btf_tracepoint(function = "sys_enter")]
-pub fn wabbit(ctx: BtfTracePointContext) -> u32 {
-    match try_wabbit(ctx) {
+pub fn sys_enter_trace(ctx: BtfTracePointContext) -> u32 {
+    match try_sys_enter_trace(ctx) {
         Ok(ret) => ret,
         Err(ret) => ret,
     }
 }
 
-fn try_wabbit(ctx: BtfTracePointContext) -> Result<u32, u32> {
+fn try_sys_enter_trace(ctx: BtfTracePointContext) -> Result<u32, u32> {
     info!(&ctx, "tracepoint sys_enter called");
     Ok(0)
 }

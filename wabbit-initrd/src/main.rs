@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, io::Write as _, path::Path};
 
 use anyhow::{Context, Result, bail};
 use aya::{
@@ -12,6 +12,7 @@ use rustix::{
     mount::{MountFlags, mount},
     process::getpid,
 };
+use wabbit_common::brand::{NAME, SIGN_NAME};
 
 mod freeze;
 mod inject;
@@ -78,7 +79,7 @@ fn main() {
             // continues, the world is thawed (the `Drop` backstop or the
             // watchdog), and the boot proceeds unprotected.
             sign::failure(&error);
-            eprintln!("wabbit-initrd failed: {error:#}");
+            eprintln!("{NAME}-initrd failed: {error:#}");
             1
         }
     };
@@ -90,7 +91,10 @@ fn main() {
 }
 
 fn run() -> Result<i32> {
-    env_logger::init();
+    // The brand, not the crate's module path, prefixes console output.
+    env_logger::Builder::from_env(env_logger::Env::default())
+        .format(|buf, record| writeln!(buf, "[{} {}] {}", NAME, record.level(), record.args()))
+        .init();
     // Panics go through the sign too: the world's rescue is the `Drop`
     // backstop's job, this is only the forensic trail.
     sign::install_panic_hook();
@@ -120,11 +124,11 @@ fn run() -> Result<i32> {
     // the logged, deliberate path.
     world.resume().context("resuming the world")?;
     sign::phase("resumed the world");
-    let (mut ebpf, module_gates) = initialized.context("initializing bnuuy")?;
+    let (mut ebpf, module_gates) = initialized.context(format!("initializing {SIGN_NAME}"))?;
     // The binding's lifetime *is* the enforcement: the gate fds detach —
     // and the denials with them — the moment wabbit-initrd exits.
     let _module_gates = module_gates;
-    sign::phase("bnuuy protections attached and verified");
+    sign::phase(&format!("{SIGN_NAME} protections attached and verified"));
 
     // The startup sequence: poll for the real root (and its nested
     // filesystems) to be mounted, then stop the world again so the handoff
@@ -152,7 +156,7 @@ fn run() -> Result<i32> {
     // that line.
     let cgroup = runtime::prepare_runtime()?;
     sign::phase(&format!(
-        "the wabbit cgroup is ready at {}",
+        "the {NAME} cgroup is ready at {}",
         cgroup.path.display()
     ));
 
@@ -166,7 +170,7 @@ fn run() -> Result<i32> {
     world.resume().context("resuming the world")?;
     sign::phase("resumed the world");
     let code = launched?;
-    sign::phase(&format!("wabbit exited with code {code}"));
+    sign::phase(&format!("{NAME} exited with code {code}"));
     Ok(code)
 }
 
@@ -181,7 +185,7 @@ fn preflight() -> Result<()> {
     if sys != runtime::SYSFS_MAGIC {
         bail!(
             "expected sysfs at /sys (magic {:#x}), found magic {sys:#x}: \
-             the init script must mount /sys before wabbit-initrd runs",
+             the init script must mount /sys before {NAME}-initrd runs",
             runtime::SYSFS_MAGIC
         );
     }
@@ -204,29 +208,29 @@ fn initialize_bnuuy() -> Result<(Ebpf, inject::Gates)> {
              found magic {mounted:#x}"
         );
     }
-    fs::create_dir_all(BNUUY_PIN_ROOT).context("creating bnuuy pin directory")?;
+    fs::create_dir_all(BNUUY_PIN_ROOT).context(format!("creating {SIGN_NAME} pin directory"))?;
 
     let btf = Btf::from_sys_fs().context("loading kernel BTF")?;
     let mut ebpf = EbpfLoader::new()
         .btf(Some(&btf))
         .load(aya::include_bytes_aligned!(concat!(
             env!("OUT_DIR"),
-            "/wabbit"
+            "/early"
         )))
-        .context("loading bnuuy eBPF object")?;
+        .context(format!("loading {SIGN_NAME} eBPF object"))?;
 
     let pid = std::process::id();
     let mut trusted_pids: HashMap<_, u32, u8> = ebpf
         .map_mut("TRUSTED_BPF_PIDS")
-        .context("finding bnuuy trusted PID map")?
+        .context("finding the trusted-PID map")?
         .try_into()
-        .context("opening bnuuy trusted PID map")?;
+        .context("opening the trusted-PID map")?;
     trusted_pids
         .insert(pid, 1, 0)
-        .context("trusting wabbit-initrd PID in bnuuy")?;
+        .context("trusting this PID in the trusted-PID map")?;
     trusted_pids
         .pin(Path::new(BNUUY_PIN_ROOT).join("trusted_bpf_pids"))
-        .context("pinning bnuuy trusted PID map")?;
+        .context("pinning the trusted-PID map")?;
 
     // Hook by hook, try the candidate programs in order: the first that the
     // running kernel accepts is the one whose layout matches it, so a
@@ -241,9 +245,9 @@ fn initialize_bnuuy() -> Result<(Ebpf, inject::Gates)> {
         for candidate in *candidates {
             let program: &mut Lsm = ebpf
                 .program_mut(candidate)
-                .with_context(|| format!("finding bnuuy program {candidate}"))?
+                .with_context(|| format!("finding {SIGN_NAME} program {candidate}"))?
                 .try_into()
-                .with_context(|| format!("opening bnuuy program {candidate}"))?;
+                .with_context(|| format!("opening {SIGN_NAME} program {candidate}"))?;
             if let Err(error) = program.load(hook, &btf) {
                 // The kernel's own verdict when the hook is not in its
                 // sleepable set: "bpf_lsm_<hook> is not sleepable". That is
@@ -257,16 +261,16 @@ fn initialize_bnuuy() -> Result<(Ebpf, inject::Gates)> {
                 // The compact reason is operationally important; the full
                 // verifier dump can be kilobytes, which is fine on a console
                 // but would flood anything pipe-backed.
-                warn!("bnuuy program {candidate} does not fit this kernel: {error}");
+                warn!("{SIGN_NAME} program {candidate} does not fit this kernel: {error}");
                 debug!("full verifier output for {candidate}: {error:#}");
                 continue;
             }
             program
                 .attach()
-                .with_context(|| format!("attaching bnuuy LSM hook {hook}"))?;
+                .with_context(|| format!("attaching {SIGN_NAME} LSM hook {hook}"))?;
             program
                 .pin(Path::new(BNUUY_PIN_ROOT).join(hook))
-                .with_context(|| format!("pinning bnuuy LSM hook {hook}"))?;
+                .with_context(|| format!("pinning {SIGN_NAME} LSM hook {hook}"))?;
             attached.push(format!("{hook}={candidate}"));
             attached_hooks.push(hook);
             loaded = true;
@@ -278,27 +282,27 @@ fn initialize_bnuuy() -> Result<(Ebpf, inject::Gates)> {
                 // nothing: the protection cannot exist on the kernel, so
                 // record the limitation and keep the gates that can.
                 warn!(
-                    "bnuuy hook {hook} is not in this kernel's sleepable set; \
+                    "{SIGN_NAME} hook {hook} is not in this kernel's sleepable set; \
                        the protection cannot exist on this kernel"
                 );
                 sign::phase(&format!(
-                    "bnuuy hook {hook}: not sleepable on this kernel; \
+                    "{SIGN_NAME} hook {hook}: not sleepable on this kernel; \
                      the protection cannot exist here (kernel limitation)"
                 ));
                 attached.push(format!("{hook}=not-sleepable"));
             } else if *required {
-                bail!("no bnuuy program fits this kernel for the {hook} hook");
+                bail!("no {SIGN_NAME} program fits this kernel for the {hook} hook");
             } else {
                 // Tree hardening around the core gates: degrade with a
                 // warning and a sign record rather than leaving the distro
                 // with no protections at all.
-                warn!("bnuuy hook {hook} does not fit this kernel; continuing without it");
+                warn!("{SIGN_NAME} hook {hook} does not fit this kernel; continuing without it");
                 attached.push(format!("{hook}=unavailable"));
             }
         }
     }
     sign::phase(&format!(
-        "bnuuy hooks attached ({}): {}",
+        "{SIGN_NAME} hooks attached ({}): {}",
         attached.len(),
         attached.join(", ")
     ));
@@ -366,7 +370,7 @@ fn initialize_bnuuy() -> Result<(Ebpf, inject::Gates)> {
     // run while the world is frozen: nothing else can fork or load modules
     // meanwhile.
     verify::verify_protections(&mut ebpf, tracepoints_attached, module_load_gate_attached)
-        .context("verifying bnuuy protections")?;
+        .context(format!("verifying {SIGN_NAME} protections"))?;
 
     Ok((ebpf, module_gates))
 }

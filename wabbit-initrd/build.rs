@@ -8,6 +8,17 @@ use anyhow::{Context as _, anyhow};
 use aya_build::Toolchain;
 
 fn main() -> anyhow::Result<()> {
+    // The white-label knobs: the embedded bnuuy object and wabbit binary
+    // are compiled by nested cargo runs (which inherit the environment),
+    // so a change must rerun this build script to re-invoke them.
+    for var in [
+        "WABBIT_BRAND_NAME",
+        "WABBIT_BRAND_ENV_PREFIX",
+        "WABBIT_BRAND_SIGN_NAME",
+        "WABBIT_BRAND_SIGN_MAGIC",
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
     let cargo_metadata::Metadata { packages, .. } = cargo_metadata::MetadataCommand::new()
         .no_deps()
         .exec()
@@ -90,7 +101,7 @@ fn build_wabbit_blob() -> anyhow::Result<()> {
         anyhow::bail!("building the embedded wabbit binary failed: {status}");
     }
 
-    // The bnuuy eBPF object is embedded as OUT_DIR/wabbit, so the blob gets
+    // The bnuuy eBPF object is embedded as OUT_DIR/early, so the blob gets
     // its own name.
     let built = target_dir.join(&target).join("release").join("wabbit");
     let blob = out_dir.join("wabbit-blob");
