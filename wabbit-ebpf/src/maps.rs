@@ -82,6 +82,15 @@ pub static PATH_RULES: HashMap<PathRuleKey, u32, 4096> = HashMap::new();
 #[btf_map]
 pub static ENFORCING: Array<u32, 1> = Array::new();
 
+/// The network gates' reach, from the policy's `network` section: index
+/// [`wabbit_common::authorization::NET_POSTURE_BIND`] holds a
+/// `BIND_GATE_*` value, index
+/// [`wabbit_common::authorization::NET_POSTURE_RAW_CAPTURE`] a
+/// `RAW_CAPTURE_GATE_*` value. Both strictest postures are `0`, so an
+/// unpopulated map gates as much as the gates can.
+#[btf_map]
+pub static NET_POSTURE: Array<u32, 2> = Array::new();
+
 /// Which decision points the gates reached, so the self-test suite can
 /// assert what it observed. A `BPF_ANY` insert marks a code as hit, not
 /// counted — a read-modify-write counter here trips the 6.8 verifier's

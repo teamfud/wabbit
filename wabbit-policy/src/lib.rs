@@ -1,8 +1,9 @@
 //! Signed binary policy files in the WSPF ("Wabbit Signed Policy File") format.
 //!
 //! A [`Policy`] is a set of optional sections, one per kind of configuration:
-//! [`rootfs`] (how the root filesystem and individual paths are mounted) and
-//! [`authorization`] (per-cgroup classes for the steady-state gates). Each
+//! [`rootfs`] (how the root filesystem and individual paths are mounted),
+//! [`authorization`] (per-cgroup classes for the steady-state gates), and
+//! [`network`] (how far the network gates reach). Each
 //! future kind (for example initrd modification or a kernel module allowlist)
 //! is another section in its own submodule.
 //!
@@ -10,15 +11,17 @@
 //!
 //! ```text
 //! magic       "WSPF"
-//! version     u16, currently 5
+//! version     u16, currently 6
 //! key_id      u8, an index into POLICY_PUBLIC_KEYS naming the signing key
 //! signature   [u8; 64], Ed25519 over (magic || version || key_id || sections)
 //! sections    u8, one bit per section that follows; unknown bits must be 0
 //!               bit 0: rootfs
 //!               bit 1: authorization
+//!               bit 2: network
 //! rootfs      a `rootfs::RootFSConfig`, present only if bit 0 is set
 //! authorization an `authorization::AuthorizationConfig`, present only if
 //!             bit 1 is set
+//! network     a `network::NetworkConfig`, present only if bit 2 is set
 //! ```
 //!
 //! Sections appear in bit order and each appears at most once, so every policy
@@ -58,10 +61,12 @@ use binrw::{BinRead, BinWrite, binrw};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 pub mod authorization;
+pub mod network;
 pub mod rootfs;
 mod wire;
 
 use authorization::{AuthorizationConfig, AuthorizationEntry};
+use network::NetworkConfig;
 use rootfs::RootFSConfig;
 
 /// WSPF / "Wabbit Signed Policy File"
@@ -69,7 +74,7 @@ pub const MAGIC: &[u8; 4] = b"WSPF";
 /// Every trusted policy-signing public key, as `(id, key)` pairs: the
 /// header names the signing key, verification looks it up here.
 pub const POLICY_PUBLIC_KEYS: &[(u8, &str)] = wabbit_common::keys::POLICY_PUBLIC_KEYS;
-const VERSION: u16 = 5;
+const VERSION: u16 = 6;
 const SIGNATURE_SIZE: usize = 64;
 /// Size of an Ed25519 private key: the 32-byte secret seed.
 pub const PRIVATE_KEY_SIZE: usize = 32;
@@ -78,23 +83,24 @@ const PREFIX_SIZE: usize = MAGIC.len() + size_of::<u16>() + size_of::<u8>();
 const MAX_POLICY_SIZE: usize = 16 * 1024 * 1024;
 
 /// Which sections a policy contains, one bit each, in wire order.
-#[bitsize(2)]
+#[bitsize(3)]
 #[derive(FromBits, Clone, Copy)]
 struct Sections {
     rootfs: bool,
     authorization: bool,
+    network: bool,
 }
 
 impl Sections {
     /// Decode the sections byte, rejecting bits for sections this version doesn't know about.
     fn from_byte(byte: u8) -> Result<Self, &'static str> {
-        u2::try_new(byte)
+        u3::try_new(byte)
             .map(Self::from)
             .map_err(|_| "policy contains unsupported sections")
     }
 
     fn to_byte(self) -> u8 {
-        u2::from(self).value()
+        u3::from(self).value()
     }
 }
 
@@ -104,7 +110,10 @@ impl Sections {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Policy {
     #[br(temp, try_map = Sections::from_byte)]
-    #[bw(calc = Sections::new(rootfs.is_some(), authorization.is_some()), map = Sections::to_byte)]
+    #[bw(
+        calc = Sections::new(rootfs.is_some(), authorization.is_some(), network.is_some()),
+        map = Sections::to_byte
+    )]
     sections: Sections,
     /// How the root filesystem and individual paths are mounted.
     #[br(if(sections.rootfs()))]
@@ -112,6 +121,10 @@ pub struct Policy {
     /// Per-cgroup authorization classes for the steady-state gates.
     #[br(if(sections.authorization()))]
     pub authorization: Option<AuthorizationConfig>,
+    /// How far the network gates reach. Absent, both gate at the
+    /// strictest posture.
+    #[br(if(sections.network()))]
+    pub network: Option<NetworkConfig>,
 }
 
 impl Default for Policy {
@@ -140,6 +153,7 @@ impl Default for Policy {
                     path_rules: Vec::new(),
                 }],
             }),
+            network: None,
         }
     }
 }
@@ -149,6 +163,7 @@ impl Policy {
     pub fn merge(&mut self, newer: Policy) {
         self.rootfs = newer.rootfs.or(self.rootfs.take());
         self.authorization = newer.authorization.or(self.authorization.take());
+        self.network = newer.network.or(self.network.take());
     }
 }
 
@@ -329,6 +344,10 @@ mod tests {
                 }],
             }),
             authorization: Some(authorization::AuthorizationConfig::default()),
+            network: Some(network::NetworkConfig {
+                bind: network::BindPosture::Ports,
+                raw_capture: network::RawCapturePosture::Icmp,
+            }),
         }
     }
 
@@ -363,10 +382,11 @@ mod tests {
         let with_rootfs = Policy {
             rootfs: Some(RootFSConfig::default()),
             authorization: None,
+            network: None,
         };
         let expected = [
             b"WSPF".as_slice(),
-            &5u16.to_le_bytes(),
+            &6u16.to_le_bytes(),
             // key id
             &[TEST_KEY_ID],
             &[7; SIGNATURE_SIZE],
@@ -387,7 +407,7 @@ mod tests {
         // (see `Policy::default`), proven by the section byte below.
         let sectionless = [
             b"WSPF".as_slice(),
-            &5u16.to_le_bytes(),
+            &6u16.to_le_bytes(),
             &[TEST_KEY_ID],
             &[7; SIGNATURE_SIZE],
             &[0b0],
@@ -398,6 +418,7 @@ mod tests {
                 &Policy {
                     rootfs: None,
                     authorization: None,
+                    network: None,
                 },
                 TEST_KEY_ID,
                 &[7; SIGNATURE_SIZE],
@@ -410,7 +431,7 @@ mod tests {
         // may signal (the boot's failure paths thaw from there).
         let default = [
             b"WSPF".as_slice(),
-            &5u16.to_le_bytes(),
+            &6u16.to_le_bytes(),
             &[TEST_KEY_ID],
             &[7; SIGNATURE_SIZE],
             &[0b10], // sections: authorization
@@ -495,7 +516,7 @@ mod tests {
     fn rejects_unknown_sections() {
         // A section bit this version doesn't know about must not be silently ignored.
         let mut bytes = signed_sample();
-        bytes[BODY_START] |= 0b100;
+        bytes[BODY_START] |= 0b1000;
         resign(&mut bytes);
         assert!(parse(&bytes).is_err());
     }
@@ -523,12 +544,14 @@ mod tests {
         current.merge(Policy {
             rootfs: None,
             authorization: None,
+            network: None,
         });
         assert_eq!(current, sample());
 
         let replacement = Policy {
             rootfs: Some(RootFSConfig::default()),
             authorization: None,
+            network: None,
         };
         current.merge(replacement.clone());
         assert_eq!(current.rootfs, replacement.rootfs);
@@ -542,6 +565,7 @@ mod tests {
         let mut current = Policy {
             rootfs: None,
             authorization: None,
+            network: None,
         };
         current.merge(Policy::default());
         assert_eq!(current, Policy::default());

@@ -1,0 +1,160 @@
+# The wabbit policy. Build with:
+#   vm/generate-deployment.sh --source ./policy.toml --bake
+# or sign it directly:
+#   wabbit-policy build policy.toml policy.wspf --key policy.key
+#
+# Everything not granted here is denied by default. Starts from the
+# generator's starter policy (vm/generate-deployment.sh) and adds the
+# network grants below.
+
+# --- Network gate reach -----------------------------------------------------
+#
+# What the bind and raw-capture gates gate at all, for every cgroup
+# (the bind-net / raw-capture grants below decide who is exempt).
+#   bind:        "all"   - every AF_INET/AF_INET6 bind(2), port 0 included
+#                "ports" - only binds naming a specific port; port-0 binds
+#                          (what clients do before connecting) pass
+#                "off"   - no bind is gated
+#   raw_capture: "all"  - AF_PACKET and raw IP (SOCK_RAW) sockets
+#                "icmp" - as "all", except raw ICMP/ICMPv6 passes (ping,
+#                         traceroute); raw TCP/UDP stays gated, since it
+#                         can sniff inbound traffic
+#                "off"  - no raw socket is gated
+[network]
+bind        = "ports"
+raw_capture = "icmp"
+
+# --- Classes ----------------------------------------------------------------
+
+# A spawnable class: `wabbit-ipc --key policy.key --class shell run bash`
+# runs in its own throwaway cgroup under /sys/fs/cgroup/wabbit/class/shell
+# with exactly these rules. `signal` keeps job control working (Ctrl-C,
+# `kill %1`): the task_kill gate exempts only self-signals.
+[[class]]
+name         = "shell"
+cgroup       = "/sys/fs/cgroup/wabbit"
+actions      = ["signal"]
+default_deny = true
+protect      = true
+
+[[class.path_rules]]
+prefix  = "/usr"
+verdict = "allow"
+[[class.path_rules]]
+prefix  = "/bin"
+verdict = "allow"
+[[class.path_rules]]
+prefix  = "/dev"
+verdict = "allow"
+
+# What systemd needs to load modules at boot (PID 1's /boot/efi mount
+# autoloads its NLS charset in PID 1's context).
+[[class]]
+name    = "boot-hardware"
+actions = ["kmods"]
+
+# What a network daemon needs: bind-net to bind AF_INET/AF_INET6 sockets
+# (both are deny-by-default), raw-capture for DHCP (AF_PACKET) and IPv6
+# neighbor/router discovery (raw ICMPv6).
+[[class]]
+name    = "network-daemon"
+actions = ["bind-net", "raw-capture"]
+
+# --- Boot-time grants (every distro needs these) ---------------------------
+
+# PID 1 starts in the root cgroup and migrates itself into init.scope, so
+# init.scope opts out of the wall (protect = false). cgroupfs-write lets
+# it spawn services into walled cgroups; signal is unit management.
+# bind-net covers socket activation: systemd binds the listener itself
+# (Ubuntu 24.04's ssh.socket binds port 22 from PID 1).
+[[authorization]]
+cgroup  = "/sys/fs/cgroup/init.scope"
+class   = "boot-hardware"
+actions = ["cgroupfs-write", "signal", "bind-net"]
+protect = false
+
+[[authorization]]
+cgroup = "/sys/fs/cgroup/system.slice/systemd-modules-load.service"
+class  = "boot-hardware"
+
+# udevd SIGTERMs its idle workers.
+[[authorization]]
+cgroup  = "/sys/fs/cgroup/system.slice/systemd-udevd.service"
+class   = "boot-hardware"
+actions = ["signal"]
+
+# Module autoloads run as kernel usermode helpers in the root cgroup, and
+# wabbit-initrd's boot-failure rescues thaw from there.
+[[authorization]]
+cgroup  = "/sys/fs/cgroup"
+actions = ["kmods", "signal"]
+
+# --- Network ----------------------------------------------------------------
+#
+# Without these, DHCP never completes and the *-wait-online units hold
+# the boot until they time out. Unit names differ per distro; an entry
+# for a unit a box does not have only creates an empty, inert cgroup.
+# To find where a daemon actually runs: cat /proc/<pid>/cgroup
+
+# SSH: sshd.service on Rocky/Debian, ssh.service on Ubuntu. sshd signals
+# its privilege-separated children.
+[[authorization]]
+cgroup  = "/sys/fs/cgroup/system.slice/sshd.service"
+actions = ["bind-net", "signal"]
+
+[[authorization]]
+cgroup  = "/sys/fs/cgroup/system.slice/ssh.service"
+actions = ["bind-net", "signal"]
+
+# DHCP/RA clients. NetworkManager (Rocky) and ifupdown (Debian) also
+# signal the dhclient they spawn.
+[[authorization]]
+cgroup  = "/sys/fs/cgroup/system.slice/NetworkManager.service"
+class   = "network-daemon"
+actions = ["signal"]
+
+[[authorization]]
+cgroup = "/sys/fs/cgroup/system.slice/systemd-networkd.service"
+class  = "network-daemon"
+
+[[authorization]]
+cgroup  = "/sys/fs/cgroup/system.slice/networking.service"
+class   = "network-daemon"
+actions = ["signal"]
+
+# ifupdown brings allow-hotplug interfaces up in a per-interface unit,
+# and the interface name is part of the path: ens3 is the lab's
+# virtio-net NIC. Add one entry per interface on real hardware.
+[[authorization]]
+cgroup  = "/sys/fs/cgroup/system.slice/system-ifup.slice/ifup@ens3.service"
+class   = "network-daemon"
+actions = ["signal"]
+
+# cloud-init's ephemeral DHCP while it looks for its datasource.
+[[authorization]]
+cgroup = "/sys/fs/cgroup/system.slice/cloud-init-local.service"
+class  = "network-daemon"
+
+# DNS: systemd-resolved binds its stub listener on 127.0.0.53.
+[[authorization]]
+cgroup  = "/sys/fs/cgroup/system.slice/systemd-resolved.service"
+actions = ["bind-net"]
+
+# Time: chronyd.service on Rocky, chrony.service on Debian/Ubuntu.
+[[authorization]]
+cgroup  = "/sys/fs/cgroup/system.slice/chronyd.service"
+actions = ["bind-net"]
+
+[[authorization]]
+cgroup  = "/sys/fs/cgroup/system.slice/chrony.service"
+actions = ["bind-net"]
+
+# Firewall daemons that load rules at boot (firewalld is on by default
+# on Rocky; nftables.service loads /etc/nftables.conf).
+[[authorization]]
+cgroup  = "/sys/fs/cgroup/system.slice/firewalld.service"
+actions = ["firewall"]
+
+[[authorization]]
+cgroup  = "/sys/fs/cgroup/system.slice/nftables.service"
+actions = ["firewall"]

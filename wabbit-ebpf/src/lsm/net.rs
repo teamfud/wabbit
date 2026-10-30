@@ -23,6 +23,28 @@
 //!   service's local listener — the machine's connective tissue) and
 //!   netlink binds (udev's uevents, rtnl, audit) are not gated at all.
 //!
+//! # Posture
+//!
+//! Each gate's reach is a separate policy choice (the `network` section,
+//! loaded into [`NET_POSTURE`]), so either can be narrowed or switched
+//! off without touching the other:
+//!
+//! * bind: [`BIND_GATE_ALL`] gates every IP bind — the port-0 binds
+//!   clients make before connecting included; [`BIND_GATE_PORTS`] gates
+//!   only a bind naming a specific port (`sin_port`/`sin6_port`, both at
+//!   offset 2 of the uapi sockaddr), so claiming a port needs the bit
+//!   and outbound connectivity never does; [`BIND_GATE_OFF`] gates
+//!   nothing.
+//! * raw capture: [`RAW_CAPTURE_GATE_ALL`] gates `AF_PACKET` and raw IP;
+//!   [`RAW_CAPTURE_GATE_ICMP`] exempts raw ICMP (`IPPROTO_ICMP` at
+//!   `AF_INET`, `IPPROTO_ICMPV6` at `AF_INET6` — `ping`, `traceroute`)
+//!   and still gates `AF_PACKET` and every other raw IP protocol (a raw
+//!   TCP or UDP socket receives copies of every inbound packet of its
+//!   protocol); [`RAW_CAPTURE_GATE_OFF`] gates
+//!   nothing.
+//!
+//! Both strictest postures are `0`, the unpopulated map's value.
+//!
 //! # Residuals
 //!
 //! * **an inherited socket fd** — the gates sit on socket *creation*
@@ -37,11 +59,22 @@
 //! * **`connect(2)` is ungated** — an outbound-only socket reaches the
 //!   network without ever binding; the sketch's `socket_connect` shape
 //!   would need `struct sock` walks for the interesting fields.
+//! * **ephemeral listeners under [`BIND_GATE_PORTS`]** — a port-0 bind
+//!   (or a `listen(2)` with no bind at all, which autobinds) still
+//!   yields a listener, on a port the kernel picks: the posture gates
+//!   claiming a *chosen* port, not listening as such.
 
 use aya_ebpf::{bindings, helpers::bpf_probe_read_kernel, macros::lsm, programs::LsmContext};
-use wabbit_common::authorization::{ACTION_BIND_NET, ACTION_RAW_CAPTURE};
+use wabbit_common::authorization::{
+    ACTION_BIND_NET, ACTION_RAW_CAPTURE, BIND_GATE_ALL, BIND_GATE_OFF, BIND_GATE_PORTS,
+    NET_POSTURE_BIND, NET_POSTURE_RAW_CAPTURE, RAW_CAPTURE_GATE_ALL, RAW_CAPTURE_GATE_ICMP,
+    RAW_CAPTURE_GATE_OFF,
+};
 
-use crate::lsm::trust::{self, EPERM};
+use crate::{
+    lsm::trust::{self, EPERM},
+    maps::NET_POSTURE,
+};
 
 /// `AF_INET` (2) — IPv4 sockets.
 const AF_INET: i32 = 2;
@@ -50,11 +83,23 @@ const AF_INET6: i32 = 10;
 /// `AF_PACKET` (17) — the packet socket: every frame on every interface.
 const AF_PACKET: i32 = 17;
 
+/// `IPPROTO_ICMP` (1) — raw ICMP at `AF_INET`: `ping`'s socket.
+const IPPROTO_ICMP: i32 = 1;
+/// `IPPROTO_ICMPV6` (58) — raw ICMPv6 at `AF_INET6`: `ping -6`'s socket.
+const IPPROTO_ICMPV6: i32 = 58;
+
 /// `SOCK_TYPE_MASK` (`0xf`, from `uapi/linux/socket.h`): the type bits
 /// of the socket(2) flags argument, below `SOCK_CLOEXEC`/`SOCK_NONBLOCK`.
 const SOCK_TYPE_MASK: i32 = 0xf;
 /// `SOCK_RAW` (3): the type raw IP sockets — and sniffers — carry.
 const SOCK_RAW: i32 = 3;
+
+/// One gate's posture from [`NET_POSTURE`]; a missing slot reads as the
+/// strictest posture (`0`).
+#[inline(always)]
+fn posture(index: u32) -> u32 {
+    NET_POSTURE.get(index).copied().unwrap_or(0)
+}
 
 /// Deny raw packet capture (see the module docs).
 ///
@@ -73,10 +118,22 @@ pub fn raw_capture_gate(ctx: LsmContext) -> i32 {
     }
     // Narrow first: not a capture surface at all? Untouched, trusted or
     // not — the machine's ordinary sockets must never depend on a gate.
+    let icmp_exempt = match posture(NET_POSTURE_RAW_CAPTURE) {
+        RAW_CAPTURE_GATE_ALL => false,
+        RAW_CAPTURE_GATE_ICMP => true,
+        RAW_CAPTURE_GATE_OFF => return 0,
+        // An unknown value is a loader bug: gate as strictly as `ALL`.
+        _ => false,
+    };
     let family = ctx.arg::<i32>(0);
+    let raw = ctx.arg::<i32>(1) & SOCK_TYPE_MASK == SOCK_RAW;
+    // The ICMP exception matches the protocol to its own family only:
+    // `IPPROTO_ICMP` at `AF_INET6` (or the reverse) is no ping socket.
+    let protocol = ctx.arg::<i32>(2);
     let capture = match family {
         AF_PACKET => true,
-        AF_INET | AF_INET6 => ctx.arg::<i32>(1) & SOCK_TYPE_MASK == SOCK_RAW,
+        AF_INET => raw && !(icmp_exempt && protocol == IPPROTO_ICMP),
+        AF_INET6 => raw && !(icmp_exempt && protocol == IPPROTO_ICMPV6),
         _ => false,
     };
     if !capture {
@@ -96,18 +153,23 @@ pub fn raw_capture_gate(ctx: LsmContext) -> i32 {
 }
 
 /// Deny acquiring a **network** endpoint (see the module docs): the
-/// `AF_INET`/`AF_INET6` bind needs [`ACTION_BIND_NET`]; every other
-/// family — local `AF_UNIX` IPC and netlink above all — passes
-/// untouched, trusted or not.
+/// `AF_INET`/`AF_INET6` bind needs [`ACTION_BIND_NET`] — every such bind
+/// under [`BIND_GATE_ALL`], only one naming a specific port under
+/// [`BIND_GATE_PORTS`]; every other family — local `AF_UNIX` IPC and
+/// netlink above all — passes untouched, trusted or not.
 ///
 /// `security_socket_bind(sock, address, addrlen)` — the address is arg 1
 /// (the kernel's copy of the caller's sockaddr), phony retval at index
-/// 3. Only `sa_family` (the first member, offset 0) is read, through
-/// `bpf_probe_read_kernel`: the uapi `struct sockaddr` head is stable
-/// across the matrix, and a probe read of it cannot fail for a kernel
+/// 3. Only `sa_family` (offset 0) and, under [`BIND_GATE_PORTS`], the
+/// port (offset 2 in both `sockaddr_in` and `sockaddr_in6`) are read,
+/// through `bpf_probe_read_kernel`: the uapi sockaddr heads are stable
+/// across the matrix, and a probe read of them cannot fail for a kernel
 /// resident address — but if it somehow does, the bind falls to
 /// fail-open (allow), the house rule for a protection whose failure
-/// must never wedge the machine.
+/// must never wedge the machine. (The kernel's copy is a
+/// `sockaddr_storage`, so the port read stays in bounds even for an
+/// `addrlen` too short to carry one — and `inet_bind`/`inet6_bind`
+/// reject such an address with `EINVAL` after this hook anyway.)
 #[lsm(hook = "socket_bind")]
 pub fn bind_gate(ctx: LsmContext) -> i32 {
     // LSM_HOOK(int, 0, socket_bind, struct socket *sock,
@@ -117,6 +179,13 @@ pub fn bind_gate(ctx: LsmContext) -> i32 {
     if retval != 0 {
         return retval;
     }
+    let ports_only = match posture(NET_POSTURE_BIND) {
+        BIND_GATE_ALL => false,
+        BIND_GATE_PORTS => true,
+        BIND_GATE_OFF => return 0,
+        // An unknown value is a loader bug: gate as strictly as `ALL`.
+        _ => false,
+    };
     // Narrow first: only the two IP families are the gate's business.
     // Everything else a machine binds — the local IPC surface, udev's
     // and rtnl's netlink — passes untouched.
@@ -127,6 +196,18 @@ pub fn bind_gate(ctx: LsmContext) -> i32 {
     match i32::from(family) {
         AF_INET | AF_INET6 => {}
         _ => return 0,
+    }
+    if ports_only {
+        // Port 0 asks the kernel for an ephemeral port: the client
+        // shape, never a claim on a chosen one. Zero is zero in either
+        // byte order.
+        let Ok(port) = (unsafe { bpf_probe_read_kernel((address as *const u16).wrapping_add(1)) })
+        else {
+            return 0;
+        };
+        if port == 0 {
+            return 0;
+        }
     }
     if trust::trusted() {
         return 0;

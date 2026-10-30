@@ -117,6 +117,37 @@ pub const ACTION_RAW_CAPTURE: u64 = 1 << 10;
 /// connective tissue and is deliberately ungated.
 pub const ACTION_BIND_NET: u64 = 1 << 11;
 
+/// `NET_POSTURE` index: how far the `bind_gate` reaches — one of the
+/// `BIND_GATE_*` values. The policy's `network` section sets it; an
+/// unpopulated map reads `0`, the strictest posture.
+pub const NET_POSTURE_BIND: u32 = 0;
+/// `NET_POSTURE` index: how far the `raw_capture_gate` reaches — one of
+/// the `RAW_CAPTURE_GATE_*` values.
+pub const NET_POSTURE_RAW_CAPTURE: u32 = 1;
+
+/// Every `AF_INET`/`AF_INET6` `bind(2)` needs [`ACTION_BIND_NET`] — the
+/// ephemeral port-0 binds clients make included.
+pub const BIND_GATE_ALL: u32 = 0;
+/// Only a bind that names a specific port needs [`ACTION_BIND_NET`]: a
+/// port-0 bind (the kernel picks an ephemeral port — the client shape)
+/// passes, so outbound connectivity is never gated, only claiming a port.
+pub const BIND_GATE_PORTS: u32 = 1;
+/// The bind gate decides nothing: every bind passes.
+pub const BIND_GATE_OFF: u32 = 2;
+
+/// `AF_PACKET` sockets and `SOCK_RAW` at the IP families both need
+/// [`ACTION_RAW_CAPTURE`].
+pub const RAW_CAPTURE_GATE_ALL: u32 = 0;
+/// The ICMP exception: raw `IPPROTO_ICMP` sockets at `AF_INET` and raw
+/// `IPPROTO_ICMPV6` sockets at `AF_INET6` pass (`ping`, `traceroute -I`,
+/// and the ICMP-error receive side of classic `traceroute`); `AF_PACKET`
+/// and every other raw IP protocol still need [`ACTION_RAW_CAPTURE`] —
+/// a raw `IPPROTO_TCP`/`IPPROTO_UDP` socket receives copies of every
+/// inbound packet of its protocol, which is sniffing by another name.
+pub const RAW_CAPTURE_GATE_ICMP: u32 = 1;
+/// The raw-capture gate decides nothing: every socket passes.
+pub const RAW_CAPTURE_GATE_OFF: u32 = 2;
+
 /// Allow signaling any task other than the caller's own: `kill(2)`,
 /// `tgkill(2)`, `tkill(2)`, `pidfd_send_signal(2)` — gated at
 /// `task_kill` by the `signal_gate` eBPF program.

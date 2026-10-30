@@ -95,6 +95,8 @@ use wabbit_common::{
     brand::NAME,
 };
 
+use wabbit_policy::network::{BindPosture, NetworkConfig, RawCapturePosture};
+
 use crate::policy::Policy;
 
 /// The unified cgroup hierarchy's mount point (wabbit-initrd mounts or
@@ -124,6 +126,9 @@ pub struct Guard {
     /// `bpf_get_current_cgroup_id` reports for a task inside it and
     /// `stat(2)` reports as the directory's `st_ino`.
     cgroup_id: u64,
+    /// The network gates' reach as loaded into `NET_POSTURE`: the
+    /// self-test proves exactly the postures in force.
+    network: NetworkConfig,
 }
 
 /// What [`Guard::seed_path_rule_steps`] seeded, for
@@ -181,6 +186,8 @@ impl Guard {
         trust_self(&mut ebpf, &cgroup, cgroup_id)?;
         populate_authorizations(&mut ebpf, policy, &cgroup)
             .context("populating the authorization maps")?;
+        let network = policy.network.clone().unwrap_or_default();
+        populate_net_posture(&mut ebpf, &network).context("populating NET_POSTURE")?;
 
         // Every gate attaches observing (`ENFORCING == 0`, its loaded
         // default): the self-test phase of the diagram.
@@ -215,6 +222,7 @@ impl Guard {
             ebpf,
             cgroup,
             cgroup_id,
+            network,
         })
     }
 
@@ -240,7 +248,7 @@ impl Guard {
         // These steps are the hooks bnuuy does not wall (see the module
         // docs): guard's gates provably fire under wabbit-initrd's babysit
         // and standalone alike.
-        let reachable: Vec<(&str, String)> = vec![
+        let mut reachable: Vec<(&str, String)> = vec![
             (STEP_MOUNT, self.cgroup_string()),
             (STEP_NETFILTER, String::new()),
             (
@@ -248,8 +256,6 @@ impl Guard {
                 selftest_cgroup.join("cgroup.procs").display().to_string(),
             ),
             (STEP_FIREWALL, String::new()),
-            (STEP_RAW_CAPTURE, String::new()),
-            (STEP_BIND_NET, String::new()),
             // kill(getppid(), 0): signal 0 performs the whole permission
             // walk — LSM hook included — without delivering anything, so
             // the step is side-effect-free even when it passes. Denied
@@ -257,17 +263,36 @@ impl Guard {
             // is a *listed* boundary without the `signal` bit.
             (STEP_SIGNAL, String::new()),
         ];
+        // The network gates are tested at exactly the reach the policy
+        // gave them: a gate switched off has nothing to deny, and an
+        // ephemeral bind is a deny step only where the posture gates it.
+        // (`AF_PACKET` is gated under both `all` and `icmp`.)
+        let mut always_allowed: Vec<&str> = vec![STEP_SIGNAL_SELF];
+        if self.network.raw_capture != RawCapturePosture::Off {
+            reachable.push((STEP_RAW_CAPTURE, String::new()));
+        }
+        if self.network.bind != BindPosture::Off {
+            reachable.push((STEP_BIND_NET, String::new()));
+        }
+        if self.network.bind == BindPosture::All {
+            reachable.push((STEP_BIND_EPHEMERAL, String::new()));
+        } else {
+            always_allowed.push(STEP_BIND_EPHEMERAL);
+        }
         for (step, arg) in &reachable {
             let pid = self.run_worker(&selftest_cgroup, step, arg.as_str(), false)?;
             self.check_fork_event(pid, step)?;
         }
 
-        // The signal gate's exemption: `kill(getpid(), 0)` — the one
-        // target every cgroup may always reach. It must stay allowed in
-        // *both* phases (the enforcing round below repeats it), because
-        // the flip must never cost a process `raise(3)`.
-        let pid = self.run_worker(&selftest_cgroup, STEP_SIGNAL_SELF, "", false)?;
-        self.check_fork_event(pid, STEP_SIGNAL_SELF)?;
+        // The exemptions, allowed in *both* phases (the enforcing round
+        // below repeats them): the signal gate's `kill(getpid(), 0)` —
+        // the flip must never cost a process `raise(3)` — and, unless
+        // the bind posture is `all`, the port-0 bind a client makes
+        // before connecting.
+        for step in &always_allowed {
+            let pid = self.run_worker(&selftest_cgroup, step, "", false)?;
+            self.check_fork_event(pid, step)?;
+        }
 
         // The per-operation path-rule steps: a seeded rule denies write
         // and exec under one prefix and leaves read to the default, so
@@ -321,8 +346,10 @@ impl Guard {
             let pid = self.run_worker(&selftest_cgroup, step, arg.as_str(), true)?;
             self.check_fork_event(pid, step)?;
         }
-        let pid = self.run_worker(&selftest_cgroup, STEP_SIGNAL_SELF, "", false)?;
-        self.check_fork_event(pid, STEP_SIGNAL_SELF)?;
+        for step in &always_allowed {
+            let pid = self.run_worker(&selftest_cgroup, step, "", false)?;
+            self.check_fork_event(pid, step)?;
+        }
 
         // The per-operation rule steps under enforcement: write and exec
         // under the seeded prefix must now be denied with `EPERM`, and
@@ -747,14 +774,19 @@ impl Guard {
             .collect::<Result<Vec<u32>, MapError>>()
             .context("reading DECISIONS keys")?;
         let mut missing: Vec<u32> = Vec::new();
-        for hook in [
+        // A bind gate switched off decides nothing; `socket_create` is
+        // traced by the netfilter step whatever the raw-capture posture.
+        let mut hooks = vec![
             HOOK_SB_MOUNT,
             HOOK_SOCKET_CREATE,
             HOOK_FILE_OPEN,
             HOOK_SETSOCKOPT,
-            HOOK_BIND,
             HOOK_TASK_KILL,
-        ] {
+        ];
+        if self.network.bind != BindPosture::Off {
+            hooks.push(HOOK_BIND);
+        }
+        for hook in hooks {
             match decisions.get(&decision_key(hook, CODE_WOULD_DENY), 0) {
                 Ok(_) => {}
                 Err(MapError::KeyNotFound) => missing.push(hook),
@@ -795,6 +827,7 @@ const STEP_RULES_WRITE: &str = "path-rules-write";
 const STEP_RULES_EXEC: &str = "path-rules-exec";
 const STEP_RAW_CAPTURE: &str = "raw-capture";
 const STEP_BIND_NET: &str = "bind-net";
+const STEP_BIND_EPHEMERAL: &str = "bind-ephemeral";
 const STEP_SIGNAL: &str = "signal";
 const STEP_SIGNAL_SELF: &str = "signal-self";
 /// Not a step but a re-exec target: `worker_main` dispatches it before
@@ -846,7 +879,8 @@ pub fn worker_main() -> Option<i32> {
         STEP_RULES_WRITE => Some(worker_step_rules_write(arg.as_deref())),
         STEP_RULES_EXEC => Some(worker_step_rules_exec(arg.as_deref())),
         STEP_RAW_CAPTURE => Some(worker_step_raw_capture()),
-        STEP_BIND_NET => Some(worker_step_bind_net()),
+        STEP_BIND_NET => Some(worker_step_bind(SELFTEST_BIND_PORT)),
+        STEP_BIND_EPHEMERAL => Some(worker_step_bind(0)),
         STEP_SIGNAL => Some(worker_step_signal()),
         STEP_SIGNAL_SELF => Some(worker_step_signal_self()),
         other => {
@@ -1186,21 +1220,29 @@ fn worker_step_raw_capture() -> i32 {
     errno_verdict("raw capture socket")
 }
 
-/// `bind(2)` of an `AF_INET` stream socket on an ephemeral loopback port:
-/// the network-endpoint acquisition the bind gate's net bit governs. The
-/// socket is setup — a plain stream socket no gate touches — and the
-/// bind is the tested syscall.
-fn worker_step_bind_net() -> i32 {
+/// The loopback port the `bind-net` step claims. Any specific port proves
+/// the gate (the LSM hook runs before the kernel's own port checks, so a
+/// port in use reads `EADDRINUSE` — allowed — and still traces); the
+/// socket never listens, so even a successful bind has no footprint.
+const SELFTEST_BIND_PORT: u16 = 47_811;
+
+/// `bind(2)` of an `AF_INET` stream socket on loopback `port`: the
+/// network-endpoint acquisition the bind gate's net bit governs — a
+/// specific port (`bind-net`, gated unless the posture is `off`) or port
+/// 0 (`bind-ephemeral`, gated only under `all`). The socket is setup — a
+/// plain stream socket no gate touches — and the bind is the tested
+/// syscall.
+fn worker_step_bind(port: u16) -> i32 {
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
-        eprintln!("{NAME} self-test bind-net: could not open a stream socket");
+        eprintln!("{NAME} self-test bind: could not open a stream socket");
         return verdict::SETUP_FAILED;
     }
-    // Loopback, port 0 (the kernel picks an ephemeral): the closest a
-    // bind gets to no footprint at all.
+    // Loopback, and the socket is closed at once: the closest a bind
+    // gets to no footprint at all.
     let address = libc::sockaddr_in {
         sin_family: libc::AF_INET as libc::sa_family_t,
-        sin_port: 0,
+        sin_port: port.to_be(),
         sin_addr: libc::in_addr {
             s_addr: libc::INADDR_LOOPBACK,
         },
@@ -1215,10 +1257,10 @@ fn worker_step_bind_net() -> i32 {
     };
     unsafe { libc::close(fd) };
     if ret >= 0 {
-        eprintln!("{NAME} self-test bind-net: bound a loopback endpoint");
+        eprintln!("{NAME} self-test bind: bound loopback port {port}");
         return verdict::ALLOWED;
     }
-    errno_verdict("bind-net bind()")
+    errno_verdict("bind()")
 }
 
 /// `kill(getppid(), 0)` — a signal *permission probe* at the parent,
@@ -1301,6 +1343,29 @@ fn trust_self(ebpf: &mut aya::Ebpf, cgroup: &Path, cgroup_id: u64) -> Result<()>
     protected
         .insert(path_hash(canonical.as_bytes()), 1, 0)
         .with_context(|| format!("protecting the cgroup path {canonical}"))?;
+    Ok(())
+}
+
+/// Write the network gates' reach (the policy's `network` section, or
+/// the strictest posture without one) into `NET_POSTURE`.
+fn populate_net_posture(ebpf: &mut aya::Ebpf, network: &NetworkConfig) -> Result<()> {
+    use wabbit_common::authorization::{NET_POSTURE_BIND, NET_POSTURE_RAW_CAPTURE};
+
+    let mut posture: Array<_, u32> = ebpf
+        .map_mut("NET_POSTURE")
+        .context("finding NET_POSTURE")?
+        .try_into()
+        .context("opening NET_POSTURE")?;
+    posture
+        .set(NET_POSTURE_BIND, network.bind.map_value(), 0)
+        .context("writing the bind posture")?;
+    posture
+        .set(NET_POSTURE_RAW_CAPTURE, network.raw_capture.map_value(), 0)
+        .context("writing the raw-capture posture")?;
+    info!(
+        "network gates: bind {:?}, raw capture {:?}",
+        network.bind, network.raw_capture
+    );
     Ok(())
 }
 
