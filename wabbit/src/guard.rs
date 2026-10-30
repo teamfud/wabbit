@@ -186,6 +186,7 @@ impl Guard {
         trust_self(&mut ebpf, &cgroup, cgroup_id)?;
         populate_authorizations(&mut ebpf, policy, &cgroup)
             .context("populating the authorization maps")?;
+        populate_default(&mut ebpf, policy).context("populating the default entry")?;
         let network = policy.network.clone().unwrap_or_default();
         populate_net_posture(&mut ebpf, &network).context("populating NET_POSTURE")?;
 
@@ -1557,6 +1558,84 @@ fn populate_authorizations(ebpf: &mut aya::Ebpf, policy: &Policy, own_cgroup: &P
     Ok(())
 }
 
+/// Populate the policy's `default` section: one more `AUTHORIZATIONS`
+/// entry, and its rules, under the reserved [`DEFAULT_CGROUP_ID`] — what
+/// the gates fall back to for a cgroup with no entry of its own.
+///
+/// The default names no cgroup, so there is nothing to resolve and
+/// nothing to wall. The same failure asymmetry as the authorization
+/// section: an invalid default (a generator bug) warns and is skipped,
+/// leaving unlisted cgroups at the floor — no bits, no rules.
+///
+/// [`DEFAULT_CGROUP_ID`]: wabbit_common::authorization::DEFAULT_CGROUP_ID
+fn populate_default(ebpf: &mut aya::Ebpf, policy: &Policy) -> Result<()> {
+    use wabbit_common::authorization::{AUTH_VERSION, Authorization, DEFAULT_CGROUP_ID, PathRuleKey};
+
+    let Some(default) = &policy.default else {
+        debug!("the policy carries no default section: unlisted cgroups stay at the floor");
+        return Ok(());
+    };
+    if let Err(error) = default.validate() {
+        warn!(
+            "the policy's default section is invalid ({error}); \
+             skipping it — an invalid signed section is a generator bug"
+        );
+        return Ok(());
+    }
+
+    {
+        let mut authorizations: HashMap<_, CgroupKey, Authorization> = ebpf
+            .map_mut("AUTHORIZATIONS")
+            .context("finding AUTHORIZATIONS")?
+            .try_into()
+            .context("opening AUTHORIZATIONS")?;
+        // No flags: the default's rules are a deny-list by construction.
+        let value = Authorization {
+            version: AUTH_VERSION,
+            size: size_of::<Authorization>() as u32,
+            generation: 0,
+            action_mask: default.action_mask,
+            namespace_id: 0,
+            flags: 0,
+        };
+        authorizations
+            .insert(
+                CgroupKey {
+                    cgroup_id: DEFAULT_CGROUP_ID,
+                },
+                value,
+                0,
+            )
+            .context("writing the default entry")?;
+    }
+
+    {
+        let mut path_rules: HashMap<_, PathRuleKey, u32> = ebpf
+            .map_mut("PATH_RULES")
+            .context("finding PATH_RULES")?
+            .try_into()
+            .context("opening PATH_RULES")?;
+        for rule in &default.path_rules {
+            let prefix = rule.prefix.to_str().context("the rule prefix is UTF-8")?;
+            let rule_key = PathRuleKey {
+                cgroup_id: DEFAULT_CGROUP_ID,
+                path_hash: path_hash(prefix.as_bytes()),
+            };
+            path_rules
+                .insert(rule_key, rule.verdict_bits(), 0)
+                .with_context(|| format!("writing the default {prefix:?} rule"))?;
+        }
+    }
+
+    info!(
+        "populated the default entry: actions {:#x}, {} path rule{}",
+        default.action_mask,
+        default.path_rules.len(),
+        if default.path_rules.len() == 1 { "" } else { "s" }
+    );
+    Ok(())
+}
+
 /// Whether an entry's cgroup gets the migration wall: every bit-holding
 /// cgroup is walled (the walls around those bits are load-bearing),
 /// [`FLAG_PROTECT`] walls a bitless one, and [`FLAG_UNPROTECTED`] opts
@@ -1841,7 +1920,8 @@ impl Guard {
     /// class's settings — keyed by its fresh kernfs id, so the class's
     /// compiled bits reach the gates for the run's processes and
     /// nothing else's. A classless run writes no authorization at all:
-    /// deny-by-default is the floor.
+    /// it is an unlisted cgroup, so it gets the policy's default entry
+    /// when there is one and the deny-by-default floor otherwise.
     fn prepare_run(
         &mut self,
         class: Option<&wabbit_policy::authorization::AuthorizationEntry>,
@@ -1915,7 +1995,7 @@ impl Guard {
             if class.is_some() {
                 " (classed)"
             } else {
-                " (classless: deny-by-default)"
+                " (classless: the policy default, or deny-by-default)"
             }
         );
         Ok(run)

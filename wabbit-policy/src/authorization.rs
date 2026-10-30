@@ -338,31 +338,40 @@ impl AuthorizationConfig {
                     other.cgroup.display()
                 ));
             }
-            for rule in &entry.path_rules {
-                validate_canonical(&rule.prefix, "path rule prefix")?;
-                let bytes = rule.prefix.to_str().expect("validated UTF-8 above");
-                if bytes.len() > PATH_WALK_CAP {
-                    return Err(format!(
-                        "path rule prefix {bytes:?} exceeds the {}-byte walk cap",
-                        PATH_WALK_CAP
-                    ));
-                }
-                // A rule that decides nothing (every operation
-                // unspecified) is inert: it matches and falls through on
-                // every open, to exactly the decision an absent rule
-                // would have made. An operator who wrote one meant
-                // something — reject it by name.
-                if rule.verdict.decides_nothing() {
-                    return Err(format!(
-                        "the path rule for {} decides nothing: no read, write, or exec \
-                         verdict (use one of them, or drop the rule)",
-                        rule.prefix.display()
-                    ));
-                }
-            }
+            validate_path_rules(&entry.path_rules)?;
         }
         Ok(())
     }
+}
+
+/// The path-rule contracts every rule set shares — an entry's, or the
+/// policy default's.
+pub(crate) fn validate_path_rules(rules: &[PathRule]) -> Result<(), String> {
+    if rules.len() > MAX_PATH_RULES {
+        return Err("too many path rules".into());
+    }
+    for rule in rules {
+        validate_canonical(&rule.prefix, "path rule prefix")?;
+        let bytes = rule.prefix.to_str().expect("validated UTF-8 above");
+        if bytes.len() > PATH_WALK_CAP {
+            return Err(format!(
+                "path rule prefix {bytes:?} exceeds the {}-byte walk cap",
+                PATH_WALK_CAP
+            ));
+        }
+        // A rule that decides nothing (every operation unspecified) is
+        // inert: it matches and falls through on every open, to exactly
+        // the decision an absent rule would have made. An operator who
+        // wrote one meant something — reject it by name.
+        if rule.verdict.decides_nothing() {
+            return Err(format!(
+                "the path rule for {} decides nothing: no read, write, or exec \
+                 verdict (use one of them, or drop the rule)",
+                rule.prefix.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A canonical path: absolute, UTF-8, no trailing `/` (the `path_hash`

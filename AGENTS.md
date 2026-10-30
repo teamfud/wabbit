@@ -597,7 +597,8 @@ in the *active* policy, so a reconfigure rotates classes without a
 reboot. The class's action bits, flags, and path rules are then applied
 to the run cgroup's fresh kernfs id — exactly the class's settings, and
 nothing else. A classless run gets the same ephemeral cgroup with *no*
-authorization at all: deny-by-default, the least-privilege floor. The
+authorization of its own: it is unlisted, so the policy's `[default]`
+entry governs it when there is one, deny-by-default otherwise. The
 class name travels inside the signature (the signer chose the class) and
 is validated at decode — 1–24 bytes of `[a-z0-9-]`, since the runtime
 builds a cgroupfs path from it — before the command id burns, so a
@@ -671,7 +672,7 @@ re-export shim; the types live in the crate.
   path encoding.
 
 The file begins with the four-byte `WSPF` magic, a little-endian version
-(currently 6), the key id and the signature, followed by a byte with one bit
+(currently 7), the key id and the signature, followed by a byte with one bit
 per section and then the sections that bit announces, in bit order. Each
 section appears at most once, so a policy has a single encoding. The decoder
 rejects unknown versions, unknown key ids, section bits it does not know
@@ -707,7 +708,10 @@ shipped-nowhere rule applies the same. v5→v6 adds the `network` section
 (bit 2): two posture bytes, `bind` (`all`/`ports`/`off`) and
 `raw_capture` (`all`/`icmp`/`off`), loaded into the eBPF
 `NET_POSTURE` array; an absent section (or the unpopulated map) is
-`all`/`all`, the pre-v6 behavior.
+`all`/`all`, the pre-v6 behavior. v6→v7 adds the `default` section
+(bit 3): an action mask and a path-rule list (no flags — a deny-list by
+construction), what every cgroup *without* an `authorization` entry
+gets (see the loader semantics below).
 
 **Off-box CLI** (`wabbit-policy <subcommand>`):
 
@@ -845,6 +849,22 @@ cgroup  = "/sys/fs/cgroup/init.scope"
 class   = "systemd-base"                # inherits; union-merges
 actions = ["kmods"]                     # adds to the class
 ```
+
+**The default entry** (`[default]`, `wabbit-policy/src/default.rs`):
+the loader writes it into `AUTHORIZATIONS` and `PATH_RULES` under the
+reserved `DEFAULT_CGROUP_ID` (0 — kernfs ids start at 1), and
+`trust::governing` falls back to it whenever the caller's cgroup has no
+entry: action bits and path rules alike, one extra map lookup on a miss,
+no struct walks. A *listed* cgroup gets exactly its own entry, never the
+default on top. Three things a default cannot say, rejected by name at
+build and at load: the wall-lifting bits (`mount`, `cgroupfs-write`,
+`bpf-attach` — handed to every unlisted cgroup they dissolve the walls),
+`signal` (the `task_kill` gate never consults the default: unlisted
+cgroups keep their default-allow posture, the failure-safety contract),
+and an allow-list (the default reaches every unnamed service; a missing
+allow rule for journald or dbus makes the boot unusable — the wire has no
+flags field). The self-test's sacrificial cgroup is seeded as a listed
+entry, so a default never changes what it proves.
 
 **Loader semantics** (the wabbit side, `Guard::load` →
 `populate_authorizations`):

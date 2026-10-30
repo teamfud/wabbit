@@ -116,9 +116,9 @@ struct RunTaskOwned {
     args: Vec<String>,
     /// The class this run asked for, when it named one: the
     /// authorization profile its ephemeral cgroup receives (`None` =
-    /// the classless floor, deny-by-default). Carried inside the
-    /// signature, so the class a command runs under is exactly the
-    /// class its signer chose.
+    /// the classless floor: the policy default, or deny-by-default).
+    /// Carried inside the signature, so the class a command runs under
+    /// is exactly the class its signer chose.
     class: Option<String>,
     /// The command's anti-replay id — also the run cgroup's name, so
     /// no two runs share a cgroup and no leftover can collide with a
@@ -688,6 +688,7 @@ mod tests {
                 entries: vec![entry],
             }),
             network: None,
+            default: None,
         }
     }
 

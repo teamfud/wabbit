@@ -15,8 +15,9 @@
 //!   without a reboot) — then creates the child under the class's
 //!   cgroup and gives it exactly the class's authorization;
 //! * a **classless** run gets the same child under wabbit's own cgroup
-//!   with *no* authorization at all — deny-by-default, the
-//!   least-privilege floor.
+//!   with *no* authorization of its own — an unlisted cgroup, so the
+//!   policy's `[default]` entry governs it when there is one, and the
+//!   deny-by-default floor when there is not.
 //!
 //! The cgroup dies with the run: its map entries are removed and the
 //! directory deleted, best-effort — a lingering cgroup is over-strict
