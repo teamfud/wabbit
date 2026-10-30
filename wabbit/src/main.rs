@@ -2,7 +2,7 @@ use anyhow::Context;
 use aya::Btf;
 #[rustfmt::skip]
 use log::{debug, info, warn};
-use std::{env, io::Write as _, os::fd::AsRawFd as _};
+use std::{env, io::Write as _, os::fd::AsRawFd as _, sync::Arc};
 
 use tokio::signal;
 use wabbit::{
@@ -131,6 +131,14 @@ fn main() -> anyhow::Result<()> {
     handoff.ready()?;
     handoff::join_root(&fds)?;
 
+    // From here on the guard serves more than one caller: each IPC run
+    // command writes the authorization maps while preparing its
+    // ephemeral cgroup, and commands may arrive concurrently. The
+    // self-test above needed `&mut`; the runtime gets its `&mut` through
+    // a mutex instead. Nothing about enforcement changes — the links
+    // still live exactly as long as the guard object does.
+    let guard = Arc::new(std::sync::Mutex::new(guard));
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -141,7 +149,7 @@ async fn run(
     fds: runtime::RuntimeFds,
     policy: Policy,
     logger: Option<aya_log::EbpfLogger<&'static dyn log::Log>>,
-    guard: guard::Guard,
+    guard: Arc<std::sync::Mutex<guard::Guard>>,
 ) -> anyhow::Result<()> {
     // "keep those for later" (the startup diagram): the descriptors are
     // held for this process's lifetime and inherited by everything it
@@ -177,17 +185,21 @@ async fn run(
     // socket lands in the booted system's root, where its callers are.
     // Every command it will act on is signed and anti-replayed; the
     // server's state anchors both (this boot's id, the burned command
-    // ids, the compiled-in verification keys), so a socket path without
-    // that state is no server at all.
+    // ids, the compiled-in verification keys) and carries the guard's
+    // run authorizer — the half that gives each run its own ephemeral
+    // cgroup — so a socket path without that state is no server at all.
     let socket_path = env::var_os(ipc_socket_var()).map(std::path::PathBuf::from);
     let ipc_task = match socket_path {
-        Some(path) => match ipc::server_state(policy.clone()) {
-            Ok(state) => Some(tokio::spawn(ipc::run_server(path, state))),
-            Err(error) => {
-                warn!("IPC unavailable: {error:#}");
-                None
+        Some(path) => {
+            let authorizer: Arc<dyn wabbit::runs::RunAuthorizer> = Arc::clone(&guard) as _;
+            match ipc::server_state(policy.clone(), authorizer) {
+                Ok(state) => Some(tokio::spawn(ipc::run_server(path, state))),
+                Err(error) => {
+                    warn!("IPC unavailable: {error:#}");
+                    None
+                }
             }
-        },
+        }
         None => None,
     };
 
@@ -195,6 +207,9 @@ async fn run(
     println!("Waiting for Ctrl-C...");
     ctrl_c.await?;
     println!("Exiting...");
+    // Dropping this handle (and the server's clone with it, as the
+    // abort above winds the server down) detaches the guard's links:
+    // enforcement ends with the process that owned it.
     drop(guard);
 
     if let Some(ipc_task) = ipc_task {

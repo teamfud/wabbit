@@ -134,16 +134,16 @@ sequenceDiagram
     kernel-->>red: fuck all the way off
 
     note over blue: blue team sees logs,<br>wants to investigate
-    blue->>wao: signed rpc: spawn /sysroot/bin/sh in rootfs
-    wao->>wao: check signature
-    wao->>kernel: create new child cgroup for process
+    blue->>wao: signed rpc: spawn /sysroot/bin/sh in rootfs<br>under the class "shell"
+    wao->>wao: check signature,<br>resolve the class from the policy
+    wao->>kernel: create ephemeral child cgroup<br>(run-<command id>) for the process
     kernel-->>wao: done!
-    wao->>ebpf: grant this cgroup<br>special permissions
+    wao->>ebpf: grant this cgroup exactly<br>the class's permissions
     ebpf-->>wao: done!
-    wao->>kernel: spawn process
+    wao->>kernel: spawn process (it migrates itself<br>into its cgroup before exec)
     kernel-->>wao: done, here are its fds
     wao-->>blue: forward/attach fd to rpc caller binary to allow shell interaction
-    blue-->>blue: you have a secured shell now!
+    blue-->>blue: you have a secured shell now!<br>(no class = deny-by-default)
     
 
     note over red: try to mess w/ cgroup

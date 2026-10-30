@@ -280,10 +280,16 @@ fn initialize_bnuuy() -> Result<(Ebpf, inject::Gates)> {
                     hook_not_sleepable = true;
                 }
                 // The compact reason is operationally important; the full
-                // verifier dump can be kilobytes, which is fine on a console
-                // but would flood anything pipe-backed.
-                warn!("{SIGN_NAME} program {candidate} does not fit this kernel: {error}");
-                debug!("full verifier output for {candidate}: {error:#}");
+                // verifier dump can be megabytes — aya's error Display
+                // carries the whole kernel log — and on the serial console
+                // (the one channel that stays live while the world is
+                // frozen) that flood costs real seconds of boot window per
+                // expected variant miss. The WARN carries the kernel's
+                // headline only; the full log stays at debug.
+                let error_text = format!("{error}");
+                let headline = error_text.lines().next().unwrap_or(&error_text);
+                warn!("{SIGN_NAME} program {candidate} does not fit this kernel: {headline}");
+                debug!("full verifier output for {candidate}: {error_text}");
                 continue;
             }
             program

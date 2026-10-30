@@ -37,6 +37,11 @@ options:
   --counter PATH    the command counter file (default: ~/.wabbit-ipc-counter)
   --boot-id ID      the target boot's UUID (default: this machine's current
                     boot, from /proc/sys/kernel/random/boot_id)
+  --class NAME      the class the run executes under (run and encode-run
+                    only): the authorization profile this name selects from
+                    the target's policy. A classed run gets its own
+                    ephemeral cgroup with exactly the class's rules; without
+                    it the run is deny-by-default
   -h | --help       this text
 
 verbs:
@@ -46,6 +51,13 @@ verbs:
   encode-run PROGRAM [ARGS...]
                          print the base64 command blob for a run — no key,
                          no counter; feed it to send now or elsewhere
+
+every command is signed (Ed25519) and travels as base64 in the blob
+verbs above — the blob is the reviewable, relayable artifact: mint it
+with encode-run, inspect or carry it anywhere, deliver it with send.
+
+  wabbit-ipc --key policy.key --class ultra-privileged encode-run bash
+  wabbit-ipc --key policy.key send \"$(wabbit-ipc --class ultra-privileged encode-run bash)\"
 ";
 
 fn main() {
@@ -67,6 +79,7 @@ struct CommandLine {
     key: Option<PathBuf>,
     counter: Option<PathBuf>,
     boot_id: Option<String>,
+    class: Option<String>,
     verb: String,
     arguments: Vec<String>,
 }
@@ -77,6 +90,7 @@ fn parse_arguments() -> Result<CommandLine> {
         key: None,
         counter: None,
         boot_id: None,
+        class: None,
         verb: String::new(),
         arguments: Vec::new(),
     };
@@ -95,6 +109,16 @@ fn parse_arguments() -> Result<CommandLine> {
                     );
                 }
                 command.boot_id = Some(boot_id.trim().to_string());
+            }
+            "--class" => {
+                let class = value(&mut arguments, "--class")?;
+                if !wabbit_common::cgroup_types::valid_class_name(class.trim()) {
+                    bail!(
+                        "--class must be 1-{} bytes of [a-z0-9-], no leading or trailing '-'",
+                        wabbit_common::cgroup_types::CLASS_NAME_MAX_BYTES
+                    );
+                }
+                command.class = Some(class.trim().to_string());
             }
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -125,7 +149,11 @@ fn run() -> Result<i32> {
             let Some(program) = command.arguments.first() else {
                 bail!("encode-run needs a program");
             };
-            let blob = wabbit_ipc::encode_run(program, &command.arguments[1..])?;
+            let blob = wabbit_ipc::encode_run_in_class(
+                program,
+                &command.arguments[1..],
+                command.class.as_deref(),
+            )?;
             println!("{}", base64(blob.as_slice()));
             Ok(0)
         }
@@ -133,10 +161,15 @@ fn run() -> Result<i32> {
             let Some(program) = command.arguments.first() else {
                 bail!("run needs a program");
             };
-            let blob = wabbit_ipc::encode_run(program, &command.arguments[1..])?;
+            let blob = wabbit_ipc::encode_run_in_class(
+                program,
+                &command.arguments[1..],
+                command.class.as_deref(),
+            )?;
             deliver(&command, &blob)
         }
         "policy" => {
+            reject_class(&command, "policy")?;
             let Some(path) = command.arguments.first() else {
                 bail!("policy needs a signed policy file");
             };
@@ -146,6 +179,7 @@ fn run() -> Result<i32> {
             deliver(&command, &blob)
         }
         "send" => {
+            reject_class(&command, "send")?;
             let Some(encoded) = command.arguments.first() else {
                 bail!("send needs a base64-encoded command");
             };
@@ -153,6 +187,15 @@ fn run() -> Result<i32> {
         }
         other => bail!("unknown verb {other:?}: run, policy, send, or encode-run"),
     }
+}
+
+/// `--class` selects the authorization profile of a *run*; on any other
+/// verb it is a typo, not a silent no-op.
+fn reject_class(command: &CommandLine, verb: &str) -> Result<()> {
+    if let Some(class) = &command.class {
+        bail!("--class {class:?} does nothing with {verb:?}: it selects a run's class");
+    }
+    Ok(())
 }
 
 /// Send a command blob (kind byte plus fields) and report the outcome

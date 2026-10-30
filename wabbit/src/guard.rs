@@ -28,9 +28,15 @@
 //!
 //! * **reachable steps** — a mount over the protected cgroup paths, a
 //!   netfilter netlink socket, a writable cgroupfs open, a legacy firewall
-//!   `setsockopt` — hooks bnuuy does not wall — run in *both* phases with
-//!   full assertions: observing = allowed + `DECISIONS` trace, enforcing =
-//!   `EPERM`.
+//!   `setsockopt`, the sketch's gates (a raw-capture socket, a network
+//!   bind, a cross-task signal), and the per-operation path-rule steps
+//!   (a seeded rule denies write and exec under one prefix; read stays
+//!   open) — hooks bnuuy does not wall (`PATH_RULES` and the sketch's
+//!   gates are guard's alone) — run in *both* phases with full
+//!   assertions: observing = allowed + `DECISIONS` trace, enforcing =
+//!   `EPERM`. Two steps assert the *default allows* instead, in both
+//!   phases: the rule-prefix read and the self-signal — the flip must
+//!   never cost a process its opens' unruled classes or `raise(3)`.
 //! * **shadowed steps** — `bpf(2)`, `finit_module(2)`, a module-tree
 //!   writable open — run in the *enforcing* phase only, expecting `EPERM`
 //!   from *either* layer, with no `DECISIONS` assertion: under bnuuy the
@@ -61,7 +67,11 @@
 use std::{
     env, fs,
     io::{self, Read, Write},
-    os::{fd::AsRawFd, unix::fs::MetadataExt},
+    mem::size_of,
+    os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -79,8 +89,8 @@ use rustix::{
 };
 use wabbit_common::{
     authorization::{
-        CODE_WOULD_DENY, CgroupKey, ENFORCE, HOOK_FILE_OPEN, HOOK_SB_MOUNT, HOOK_SETSOCKOPT,
-        HOOK_SOCKET_CREATE, decision_key, path_hash,
+        CODE_WOULD_DENY, CgroupKey, ENFORCE, HOOK_BIND, HOOK_FILE_OPEN, HOOK_SB_MOUNT,
+        HOOK_SETSOCKOPT, HOOK_SOCKET_CREATE, HOOK_TASK_KILL, decision_key, path_hash,
     },
     brand::NAME,
 };
@@ -116,6 +126,40 @@ pub struct Guard {
     cgroup_id: u64,
 }
 
+/// What [`Guard::seed_path_rule_steps`] seeded, for
+/// [`Guard::release_path_rule_steps`] to undo: the map entries and their
+/// priors (captured so a policy that named the selftest cgroup keeps its
+/// authorization), and the prefix directory with its targets.
+struct RuleSeed {
+    /// The selftest cgroup's kernfs id — the map keys' cgroup half.
+    cgroup_id: u64,
+    /// The seeded rule's key: the cgroup id and the hashed prefix.
+    rule_key: wabbit_common::authorization::PathRuleKey,
+    /// The `PATH_RULES` value at the key before the seed, if any.
+    prior_rule: Option<u32>,
+    /// The selftest cgroup's `AUTHORIZATIONS` value before the seed, if
+    /// any.
+    prior_authorization: Option<wabbit_common::authorization::Authorization>,
+    /// The data file the read and write steps open.
+    data: PathBuf,
+    /// The exec target the exec step execves: a copy of this binary.
+    exec_target: PathBuf,
+    /// The prefix directory holding both targets.
+    dir: PathBuf,
+}
+
+impl RuleSeed {
+    /// The read/write steps' target, as a worker argument.
+    fn data_arg(&self) -> String {
+        self.data.display().to_string()
+    }
+
+    /// The exec step's target, as a worker argument.
+    fn exec_arg(&self) -> String {
+        self.exec_target.display().to_string()
+    }
+}
+
 impl Guard {
     /// Load the guard object, trust wabbit itself, populate the maps from
     /// `policy`'s authorization section, and attach every gate in
@@ -135,7 +179,8 @@ impl Guard {
         let (cgroup, cgroup_id) =
             self_cgroup().context("finding this process's cgroup in cgroup v2")?;
         trust_self(&mut ebpf, &cgroup, cgroup_id)?;
-        populate_authorizations(&mut ebpf, policy).context("populating the authorization maps")?;
+        populate_authorizations(&mut ebpf, policy, &cgroup)
+            .context("populating the authorization maps")?;
 
         // Every gate attaches observing (`ENFORCING == 0`, its loaded
         // default): the self-test phase of the diagram.
@@ -150,12 +195,15 @@ impl Guard {
         attach_lsm(&mut ebpf, btf, "sb_mount", &["sb_mount"])?;
         attach_lsm(&mut ebpf, btf, "socket_setsockopt", &["firewall_gate"])?;
         attach_lsm(&mut ebpf, btf, "socket_create", &["netfilter_netlink_gate"])?;
+        attach_lsm(&mut ebpf, btf, "socket_create", &["raw_capture_gate"])?;
+        attach_lsm(&mut ebpf, btf, "socket_bind", &["bind_gate"])?;
+        attach_lsm(&mut ebpf, btf, "task_kill", &["signal_gate"])?;
         let tracepoints = attach_tracepoints(&mut ebpf)?;
         if !tracepoints {
             warn!("tracepoints unavailable: fork and module-load self-test assertions are skipped");
         }
         info!(
-            "guard loaded: 6 gates attached (observing), tracepoints {}",
+            "guard loaded: 9 gates attached (observing), tracepoints {}",
             if tracepoints {
                 "attached"
             } else {
@@ -177,6 +225,14 @@ impl Guard {
             .create_selftest_cgroup()
             .context("creating the sacrificial selftest cgroup")?;
 
+        // Seed the selftest cgroup as a *listed* boundary (an entry with
+        // no action bits and one path rule) before any step runs: the
+        // signal gate's posture is default-allow, so a cross-task kill is
+        // denied here exactly because this cgroup is listed without the
+        // `signal` bit — the enforcing `signal` step depends on it, and
+        // the path-rule steps need their seeded rule and targets.
+        let seeded = self.seed_path_rule_steps(&selftest_cgroup)?;
+
         // The observing phase: every reachable step must be *allowed* and
         // have traced its would-deny decision. The workers' forks must be
         // recorded from the kernel side.
@@ -192,10 +248,42 @@ impl Guard {
                 selftest_cgroup.join("cgroup.procs").display().to_string(),
             ),
             (STEP_FIREWALL, String::new()),
+            (STEP_RAW_CAPTURE, String::new()),
+            (STEP_BIND_NET, String::new()),
+            // kill(getppid(), 0): signal 0 performs the whole permission
+            // walk — LSM hook included — without delivering anything, so
+            // the step is side-effect-free even when it passes. Denied
+            // in the enforcing round exactly because the selftest cgroup
+            // is a *listed* boundary without the `signal` bit.
+            (STEP_SIGNAL, String::new()),
         ];
         for (step, arg) in &reachable {
             let pid = self.run_worker(&selftest_cgroup, step, arg.as_str(), false)?;
             self.check_fork_event(pid, step)?;
+        }
+
+        // The signal gate's exemption: `kill(getpid(), 0)` — the one
+        // target every cgroup may always reach. It must stay allowed in
+        // *both* phases (the enforcing round below repeats it), because
+        // the flip must never cost a process `raise(3)`.
+        let pid = self.run_worker(&selftest_cgroup, STEP_SIGNAL_SELF, "", false)?;
+        self.check_fork_event(pid, STEP_SIGNAL_SELF)?;
+
+        // The per-operation path-rule steps: a seeded rule denies write
+        // and exec under one prefix and leaves read to the default, so
+        // the steps prove each operation class independently. bnuuy
+        // hosts no `PATH_RULES`, so every denial here is provably
+        // guard's own — these are reachable steps, assertable in both
+        // phases.
+        if let Some(seeded) = &seeded {
+            for (step, arg) in [
+                (STEP_RULES_READ, seeded.data_arg()),
+                (STEP_RULES_WRITE, seeded.data_arg()),
+                (STEP_RULES_EXEC, seeded.exec_arg()),
+            ] {
+                let pid = self.run_worker(&selftest_cgroup, step, &arg, false)?;
+                self.check_fork_event(pid, step)?;
+            }
         }
         self.check_decisions("observing")?;
 
@@ -227,10 +315,30 @@ impl Guard {
         drop(module_loads);
 
         // The enforcing phase: the reachable steps must now be denied with
-        // `EPERM`, and their forks still recorded.
+        // `EPERM`, and their forks still recorded. The self-signal
+        // exemption is the exception by design: still allowed.
         for (step, arg) in &reachable {
             let pid = self.run_worker(&selftest_cgroup, step, arg.as_str(), true)?;
             self.check_fork_event(pid, step)?;
+        }
+        let pid = self.run_worker(&selftest_cgroup, STEP_SIGNAL_SELF, "", false)?;
+        self.check_fork_event(pid, STEP_SIGNAL_SELF)?;
+
+        // The per-operation rule steps under enforcement: write and exec
+        // under the seeded prefix must now be denied with `EPERM`, and
+        // read must stay allowed — the "individually" in the feature:
+        // blocking two classes under a prefix cannot cost the third its
+        // openings.
+        if let Some(seeded) = &seeded {
+            let pid = self
+                .run_worker(&selftest_cgroup, STEP_RULES_READ, &seeded.data_arg(), false)?;
+            self.check_fork_event(pid, STEP_RULES_READ)?;
+            let pid = self
+                .run_worker(&selftest_cgroup, STEP_RULES_WRITE, &seeded.data_arg(), true)?;
+            self.check_fork_event(pid, STEP_RULES_WRITE)?;
+            let pid = self
+                .run_worker(&selftest_cgroup, STEP_RULES_EXEC, &seeded.exec_arg(), true)?;
+            self.check_fork_event(pid, STEP_RULES_EXEC)?;
         }
 
         // The shadowed steps (see the module docs): denied by *either*
@@ -269,6 +377,9 @@ impl Guard {
             );
         }
 
+        if let Some(seeded) = seeded {
+            self.release_path_rule_steps(&seeded);
+        }
         let _ = fs::remove_dir(&selftest_cgroup);
         info!("guard self-tests passed; enforcing");
         Ok(())
@@ -308,6 +419,213 @@ impl Guard {
 
     fn cgroup_string(&self) -> String {
         self.cgroup.display().to_string()
+    }
+
+    /// Seed the self-test's per-operation path-rule steps: one temp
+    /// prefix holding two targets, one rule on it denying **write and
+    /// exec only** (read left to the default), and an `Authorization`
+    /// entry for the selftest cgroup so its rules are consulted at all —
+    /// action-less and default-allow, exactly what the cgroup already
+    /// behaves like today, where no entry means no rules either.
+    ///
+    /// Priors are captured so the release can restore byte-for-byte what
+    /// was there: a policy that names this cgroup (none does today) must
+    /// not lose its entry to a self-test. `None` (warned, never failed)
+    /// when the environment cannot host the steps — the same skip-shaped
+    /// honesty as `find_module_tree_file`'s absent module tree.
+    fn seed_path_rule_steps(&mut self, selftest_cgroup: &Path) -> Result<Option<RuleSeed>> {
+        use wabbit_common::authorization::{
+            AUTH_VERSION, Authorization, PATH_RULE_EXEC_DENY, PATH_RULE_WRITE_DENY, PATH_WALK_CAP,
+            PathRuleKey,
+        };
+
+        let dir = env::temp_dir().join(format!("{NAME}-selftest-rules"));
+        let Some(prefix) = dir.to_str().map(str::to_owned) else {
+            warn!("the path-rule self-test prefix is not UTF-8: skipping the path-rule steps");
+            return Ok(None);
+        };
+        if prefix.len() > PATH_WALK_CAP {
+            warn!(
+                "the path-rule self-test prefix {prefix:?} exceeds the {PATH_WALK_CAP}-byte walk \
+                 cap: skipping the path-rule steps"
+            );
+            return Ok(None);
+        }
+        let cgroup_id = fs::metadata(selftest_cgroup)
+            .with_context(|| {
+                format!("stat(2) on the selftest cgroup {}", selftest_cgroup.display())
+            })?
+            .ino();
+        if let Err(error) = fs::create_dir_all(&dir) {
+            warn!(
+                "could not create the path-rule self-test prefix {}: {error}; \
+                 skipping the path-rule steps",
+                dir.display()
+            );
+            return Ok(None);
+        }
+        // The data file: one target for the read and write steps, opened
+        // one way per step so the two operation classes prove
+        // independently on the same path.
+        let data = dir.join("data");
+        if let Err(error) = fs::write(&data, b"wabbit self-test path-rule data\n") {
+            warn!(
+                "could not create the path-rule self-test data file {}: {error}; \
+                 skipping the path-rule steps",
+                data.display()
+            );
+            return Ok(None);
+        }
+        // The exec target: a copy of this binary, so an *allowed* exec is
+        // a real, complete execve (not a noexec decoy that would die at
+        // the kernel's own `path_noexec` check before the gate ever saw
+        // it), and the re-exec reports the verdict through the confirm
+        // flag.
+        let exec_target = dir.join("exec-target");
+        let own_image = match fs::read("/proc/self/exe") {
+            Ok(image) => image,
+            Err(error) => {
+                warn!(
+                    "could not read /proc/self/exe for the path-rule self-test: {error}; \
+                     skipping the path-rule steps"
+                );
+                return Ok(None);
+            }
+        };
+        if let Err(error) = fs::write(&exec_target, own_image) {
+            warn!(
+                "could not create the path-rule self-test exec target {}: {error}; \
+                 skipping the path-rule steps",
+                exec_target.display()
+            );
+            return Ok(None);
+        }
+        if let Err(error) =
+            fs::set_permissions(&exec_target, fs::Permissions::from_mode(0o755))
+        {
+            warn!(
+                "could not make the path-rule self-test exec target executable: {error}; \
+                 skipping the path-rule steps"
+            );
+            return Ok(None);
+        }
+
+        let rule_key = PathRuleKey {
+            cgroup_id,
+            path_hash: path_hash(prefix.as_bytes()),
+        };
+        let prior_authorization = {
+            let mut authorizations: HashMap<_, CgroupKey, Authorization> = self
+                .ebpf
+                .map_mut("AUTHORIZATIONS")
+                .context("finding AUTHORIZATIONS")?
+                .try_into()
+                .context("opening AUTHORIZATIONS")?;
+            let prior = authorizations.get(&CgroupKey { cgroup_id }, 0).ok();
+            authorizations
+                .insert(
+                    CgroupKey { cgroup_id },
+                    Authorization {
+                        version: AUTH_VERSION,
+                        size: size_of::<Authorization>() as u32,
+                        generation: 0,
+                        action_mask: 0,
+                        namespace_id: 0,
+                        // flags 0: default-allow, what a cgroup with no
+                        // entry already is — the entry exists only so
+                        // the rule walk consults its rules.
+                        flags: 0,
+                    },
+                    0,
+                )
+                .context("seeding the selftest cgroup's authorization")?;
+            prior
+        };
+        let prior_rule = {
+            let mut path_rules: HashMap<_, PathRuleKey, u32> = self
+                .ebpf
+                .map_mut("PATH_RULES")
+                .context("finding PATH_RULES")?
+                .try_into()
+                .context("opening PATH_RULES")?;
+            let prior = path_rules.get(&rule_key, 0).ok();
+            // Write and exec denied, read unspecified — the default
+            // (allow, per the flags above) decides it: the exact shape
+            // the per-operation verdicts exist to express.
+            path_rules
+                .insert(rule_key, PATH_RULE_WRITE_DENY | PATH_RULE_EXEC_DENY, 0)
+                .context("seeding the selftest path rule")?;
+            prior
+        };
+
+        debug!("seeded the path-rule self-test under {prefix:?}");
+        Ok(Some(RuleSeed {
+            cgroup_id,
+            rule_key,
+            prior_rule,
+            prior_authorization,
+            data,
+            exec_target,
+            dir,
+        }))
+    }
+
+    /// Undo one seed: restore the prior map entries (or remove what the
+    /// seed added) and, best-effort, the prefix directory. Never fails
+    /// the caller — the steps' verdicts are already decided, and a
+    /// leftover entry keyed by the selftest cgroup's id is inert.
+    fn release_path_rule_steps(&mut self, seeded: &RuleSeed) {
+        use wabbit_common::authorization::Authorization;
+
+        let rule_restore = self
+            .ebpf
+            .map_mut("PATH_RULES")
+            .context("finding PATH_RULES")
+            .and_then(|map| {
+                let mut rules: HashMap<_, wabbit_common::authorization::PathRuleKey, u32> = map
+                    .try_into()
+                    .context("opening PATH_RULES")?;
+                Ok(match seeded.prior_rule {
+                    Some(prior) => rules.insert(seeded.rule_key, prior, 0),
+                    None => rules.remove(&seeded.rule_key),
+                })
+            });
+        match rule_restore {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!("releasing the selftest path rule: {error:#}"),
+            Err(error) => warn!("releasing the selftest path rule: {error:#}"),
+        }
+
+        let auth_key = CgroupKey {
+            cgroup_id: seeded.cgroup_id,
+        };
+        let auth_restore = self
+            .ebpf
+            .map_mut("AUTHORIZATIONS")
+            .context("finding AUTHORIZATIONS")
+            .and_then(|map| {
+                let mut authorizations: HashMap<_, CgroupKey, Authorization> = map
+                    .try_into()
+                    .context("opening AUTHORIZATIONS")?;
+                Ok(match seeded.prior_authorization {
+                    Some(prior) => authorizations.insert(auth_key, prior, 0),
+                    None => authorizations.remove(&auth_key),
+                })
+            });
+        match auth_restore {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!("releasing the selftest authorization: {error:#}"),
+            Err(error) => warn!("releasing the selftest authorization: {error:#}"),
+        }
+
+        if let Err(error) = fs::remove_dir_all(&seeded.dir)
+            && seeded.dir.exists()
+        {
+            warn!(
+                "could not remove the path-rule self-test prefix {}: {error}",
+                seeded.dir.display()
+            );
+        }
     }
 
     /// Spawn one worker in the sacrificial cgroup and assert its verdict.
@@ -434,6 +752,8 @@ impl Guard {
             HOOK_SOCKET_CREATE,
             HOOK_FILE_OPEN,
             HOOK_SETSOCKOPT,
+            HOOK_BIND,
+            HOOK_TASK_KILL,
         ] {
             match decisions.get(&decision_key(hook, CODE_WOULD_DENY), 0) {
                 Ok(_) => {}
@@ -470,6 +790,18 @@ const STEP_FIREWALL: &str = "firewall";
 const STEP_BPF: &str = "bpf";
 const STEP_KMOD: &str = "kmod";
 const STEP_MODULES_WRITE: &str = "modules-write";
+const STEP_RULES_READ: &str = "path-rules-read";
+const STEP_RULES_WRITE: &str = "path-rules-write";
+const STEP_RULES_EXEC: &str = "path-rules-exec";
+const STEP_RAW_CAPTURE: &str = "raw-capture";
+const STEP_BIND_NET: &str = "bind-net";
+const STEP_SIGNAL: &str = "signal";
+const STEP_SIGNAL_SELF: &str = "signal-self";
+/// Not a step but a re-exec target: `worker_main` dispatches it before
+/// anything else (it must not read stdin), and only a *successful*
+/// execve of the rules-exec target can reach it — so its exit code is
+/// the observing-phase verdict of the exec step.
+const STEP_RULES_EXEC_CONFIRM: &str = "path-rules-exec-confirm";
 
 fn selftest_flag(step: &str) -> String {
     format!("--{NAME}-selftest-{step}")
@@ -483,6 +815,14 @@ fn selftest_flag(step: &str) -> String {
 pub fn worker_main() -> Option<i32> {
     let mut args = env::args().skip(1);
     let flag = args.next()?;
+    // The exec-confirm re-exec: reached only through a successful
+    // execve of the rules-exec target — the observing-phase verdict of
+    // the exec step. It must not read stdin: the parent's start byte was
+    // consumed by the first image, and the pipe sits at EOF. Its exit is
+    // the verdict: the exec went through.
+    if flag == selftest_flag(STEP_RULES_EXEC_CONFIRM) {
+        return Some(verdict::ALLOWED);
+    }
     let Some(step) = flag.strip_prefix(&format!("--{NAME}-selftest-")) else {
         return None;
     };
@@ -502,6 +842,13 @@ pub fn worker_main() -> Option<i32> {
         STEP_BPF => Some(worker_step_bpf()),
         STEP_KMOD => Some(worker_step_kmod()),
         STEP_MODULES_WRITE => Some(worker_step_modules_write(arg.as_deref())),
+        STEP_RULES_READ => Some(worker_step_rules_read(arg.as_deref())),
+        STEP_RULES_WRITE => Some(worker_step_rules_write(arg.as_deref())),
+        STEP_RULES_EXEC => Some(worker_step_rules_exec(arg.as_deref())),
+        STEP_RAW_CAPTURE => Some(worker_step_raw_capture()),
+        STEP_BIND_NET => Some(worker_step_bind_net()),
+        STEP_SIGNAL => Some(worker_step_signal()),
+        STEP_SIGNAL_SELF => Some(worker_step_signal_self()),
         other => {
             eprintln!("{NAME} self-test worker: unknown step {other}");
             Some(3)
@@ -730,6 +1077,174 @@ fn worker_step_modules_write(path: Option<&str>) -> i32 {
     }
 }
 
+// ------------------------------------------------------- path-rule steps
+
+/// A read-only open under the rules prefix. The seeded rule denies only
+/// write and exec, so this must go through in *both* phases — the
+/// "individually" in the per-operation verdicts: blocking writes and
+/// exec under a prefix while its reads stay open.
+fn worker_step_rules_read(path: Option<&str>) -> i32 {
+    let Some(path) = path else {
+        eprintln!("{NAME} self-test path-rules-read: no path given");
+        return verdict::SETUP_FAILED;
+    };
+    match fs::File::open(path) {
+        Ok(_) => {
+            eprintln!("{NAME} self-test path-rules-read: read open of {path} succeeded");
+            verdict::ALLOWED
+        }
+        Err(error) => match error.raw_os_error() {
+            Some(errno) if errno == EPERM_ERRNO => verdict::BLOCKED,
+            Some(_) => {
+                eprintln!("{NAME} self-test path-rules-read: errno {:?} (not EPERM)", error);
+                verdict::ALLOWED
+            }
+            None => verdict::SETUP_FAILED,
+        },
+    }
+}
+
+/// A writable open under the rules prefix: the seeded rule denies
+/// writes there, so this is the per-operation gate's write verdict.
+fn worker_step_rules_write(path: Option<&str>) -> i32 {
+    let Some(path) = path else {
+        eprintln!("{NAME} self-test path-rules-write: no path given");
+        return verdict::SETUP_FAILED;
+    };
+    match fs::OpenOptions::new().write(true).open(path) {
+        Ok(file) => {
+            drop(file);
+            eprintln!("{NAME} self-test path-rules-write: writable open of {path} succeeded");
+            verdict::ALLOWED
+        }
+        Err(error) => match error.raw_os_error() {
+            Some(errno) if errno == EPERM_ERRNO => verdict::BLOCKED,
+            Some(_) => {
+                eprintln!("{NAME} self-test path-rules-write: errno {:?} (not EPERM)", error);
+                verdict::ALLOWED
+            }
+            None => verdict::SETUP_FAILED,
+        },
+    }
+}
+
+/// `execve(2)` of a copy of this binary under the rules prefix: the
+/// seeded rule denies exec there, so this is the per-operation gate's
+/// exec verdict — the kernel's `__FMODE_EXEC` marker in `f_flags`, not
+/// writability, not readability.
+///
+/// Allowed through (the observing phase), the exec succeeds and the
+/// image re-executes carrying [`STEP_RULES_EXEC_CONFIRM`], whose
+/// dispatch in [`worker_main`] exits the `ALLOWED` verdict without
+/// touching stdin (the parent's start byte was consumed by this image,
+/// and the pipe sits at EOF). Denied (the enforcing phase), the
+/// syscall fails before any image change and the errno is the verdict.
+fn worker_step_rules_exec(path: Option<&str>) -> i32 {
+    let Some(path) = path else {
+        eprintln!("{NAME} self-test path-rules-exec: no path given");
+        return verdict::SETUP_FAILED;
+    };
+    let Ok(target) = std::ffi::CString::new(path) else {
+        eprintln!("{NAME} self-test path-rules-exec: the target contains a NUL");
+        return verdict::SETUP_FAILED;
+    };
+    let argv0 = target.clone();
+    let Ok(confirm) = std::ffi::CString::new(selftest_flag(STEP_RULES_EXEC_CONFIRM)) else {
+        unreachable!("the self-test flag contains no NUL");
+    };
+    // NUL-terminated `argv` (and an empty `envp` — the confirm step
+    // needs nothing), each buffer outliving the call.
+    let argv = [argv0.as_ptr(), confirm.as_ptr(), std::ptr::null()];
+    let envp = [std::ptr::null::<std::ffi::c_char>()];
+    let ret = unsafe { libc::execve(target.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+    // `execve` returns only on failure; on success this image is gone.
+    debug_assert!(ret < 0, "execve returned on success");
+    errno_verdict("path-rules execve")
+}
+
+// ------------------------------------------------- the sketch's action bits
+
+/// `socket(AF_PACKET, SOCK_RAW, ETH_P_ALL)` — tcpdump's own channel, the
+/// capture surface the raw-capture gate denies.
+///
+/// Allowed through (the observing phase), the socket is closed at once —
+/// no promiscuous mode, no ring buffers, no footprint. On a modular
+/// kernel without the module loaded, the kernel's own request_module may
+/// fail the socket with a non-`EPERM` errno instead (the module gates
+/// hold); that is still `ALLOWED` per the verdict protocol — the LSM
+/// verdict, not the socket, is what the phase asserts, and the
+/// observing trace is the proof.
+fn worker_step_raw_capture() -> i32 {
+    // The protocol is `ETH_P_ALL` (0x0003) in network byte order, the
+    // spelling tcpdump itself uses.
+    let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0x0300) };
+    if fd >= 0 {
+        eprintln!("{NAME} self-test raw-capture: packet socket created");
+        unsafe { libc::close(fd) };
+        return verdict::ALLOWED;
+    }
+    errno_verdict("raw capture socket")
+}
+
+/// `bind(2)` of an `AF_INET` stream socket on an ephemeral loopback port:
+/// the network-endpoint acquisition the bind gate's net bit governs. The
+/// socket is setup — a plain stream socket no gate touches — and the
+/// bind is the tested syscall.
+fn worker_step_bind_net() -> i32 {
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        eprintln!("{NAME} self-test bind-net: could not open a stream socket");
+        return verdict::SETUP_FAILED;
+    }
+    // Loopback, port 0 (the kernel picks an ephemeral): the closest a
+    // bind gets to no footprint at all.
+    let address = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: libc::INADDR_LOOPBACK,
+        },
+        sin_zero: [0; 8],
+    };
+    let ret = unsafe {
+        libc::bind(
+            fd,
+            &address as *const _ as *const libc::sockaddr,
+            size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    unsafe { libc::close(fd) };
+    if ret >= 0 {
+        eprintln!("{NAME} self-test bind-net: bound a loopback endpoint");
+        return verdict::ALLOWED;
+    }
+    errno_verdict("bind-net bind()")
+}
+
+/// `kill(getppid(), 0)` — a signal *permission probe* at the parent,
+/// which is wabbit itself. Signal 0 performs the whole permission walk —
+/// the `task_kill` LSM hook included — without delivering anything, so
+/// the step is side-effect-free in both phases: observing passes,
+/// enforcing is denied before anything is sent.
+fn worker_step_signal() -> i32 {
+    let ret = unsafe { libc::kill(libc::getppid(), 0) };
+    if ret >= 0 {
+        eprintln!("{NAME} self-test signal: kill(getppid(), 0) went through");
+        return verdict::ALLOWED;
+    }
+    errno_verdict("signal kill()")
+}
+
+/// `kill(getpid(), 0)` — the signal gate's self-exemption, asserted in
+/// both phases: the flip must never cost a process `raise(3)`.
+fn worker_step_signal_self() -> i32 {
+    let ret = unsafe { libc::kill(libc::getpid(), 0) };
+    if ret >= 0 {
+        return verdict::ALLOWED;
+    }
+    errno_verdict("signal-self kill()")
+}
+
 // -------------------------------------------------------------- helpers
 
 /// wabbit's own cgroup: the v2 entry of `/proc/self/cgroup` under
@@ -799,6 +1314,15 @@ fn trust_self(ebpf: &mut aya::Ebpf, cgroup: &Path, cgroup_id: u64) -> Result<()>
 /// hashed with the shared `path_hash`, the same key convention the eBPF
 /// walk incrementally maintains.
 ///
+/// **Missing authorized cgroups are created, not skipped**: the policy is
+/// signed, kernfs carries no symlinks, and an empty cgroup directory is
+/// inert — and the entry naming a cgroup that does not exist *yet*
+/// (the compiled class directories under wabbit's own subtree, and the
+/// boot-time grants for cgroups systemd has not created when the guard
+/// loads: `init.scope`, unit cgroups) could never resolve otherwise.
+/// systemd reuses existing directories, so the kernfs node — the id the
+/// maps key on — is the very one its processes land in.
+///
 /// **Failure asymmetry** (the documented contract): a missing or
 /// unresolvable entry warns and skips — never aborts the guard load.
 /// The maps' empty state is deny-by-default for every untrusted cgroup,
@@ -806,11 +1330,9 @@ fn trust_self(ebpf: &mut aya::Ebpf, cgroup: &Path, cgroup_id: u64) -> Result<()>
 /// the-policy-file-missed-an-entry would not be. A section that fails
 /// validation is a broken generator (the CLI validates at build), so it
 /// warns and skips whole.
-fn populate_authorizations(ebpf: &mut aya::Ebpf, policy: &Policy) -> Result<()> {
-    use wabbit_common::authorization::{
-        AUTH_VERSION, Authorization, PATH_RULE_ALLOW, PATH_RULE_DENY, PathRuleKey,
-    };
-    use wabbit_policy::authorization::{AuthorizationEntry, PathRuleVerdict};
+fn populate_authorizations(ebpf: &mut aya::Ebpf, policy: &Policy, own_cgroup: &Path) -> Result<()> {
+    use wabbit_common::authorization::{AUTH_VERSION, Authorization, PATH_WALK_CAP, PathRuleKey};
+    use wabbit_policy::authorization::AuthorizationEntry;
 
     let Some(config) = &policy.authorization else {
         debug!("the policy carries no authorization section");
@@ -824,21 +1346,20 @@ fn populate_authorizations(ebpf: &mut aya::Ebpf, policy: &Policy) -> Result<()> 
         return Ok(());
     }
 
-    let mut authorizations: HashMap<_, CgroupKey, Authorization> = ebpf
-        .map_mut("AUTHORIZATIONS")
-        .context("finding AUTHORIZATIONS")?
-        .try_into()
-        .context("opening AUTHORIZATIONS")?;
-    let mut path_rules: HashMap<_, PathRuleKey, u32> = ebpf
-        .map_mut("PATH_RULES")
-        .context("finding PATH_RULES")?
-        .try_into()
-        .context("opening PATH_RULES")?;
-    let mut protected: HashMap<_, u64, u32> = ebpf
-        .map_mut("PROTECTED_PATHS")
-        .context("finding PROTECTED_PATHS")?
-        .try_into()
-        .context("opening PROTECTED_PATHS")?;
+    // The migration wall keys on the path's hash, and the eBPF prefix
+    // walk only hashes the first PATH_WALK_CAP bytes — a deeper own
+    // cgroup could never be walled, so the whole subtree model degrades
+    // and the operator must hear it now, not discover it in an audit.
+    if own_cgroup
+        .to_str()
+        .is_some_and(|path| path.len() > PATH_WALK_CAP)
+    {
+        warn!(
+            "wabbit's own cgroup {} is deeper than the {PATH_WALK_CAP}-byte eBPF walk cap; \
+             the migration wall cannot cover paths this deep",
+            own_cgroup.display()
+        );
+    }
 
     // Resolve first, map by map (aya's map handles each mutably borrow the
     // `Ebpf` object, so no two can be held at once): every cgroup path →
@@ -847,19 +1368,32 @@ fn populate_authorizations(ebpf: &mut aya::Ebpf, policy: &Policy) -> Result<()> 
     let mut resolved: Vec<(&AuthorizationEntry, u64)> = Vec::new();
     for entry in &config.entries {
         // Resolve the canonical cgroup path to the kernfs id the maps key
-        // on. A path that does not resolve is a policy/target mismatch:
-        // warn and skip the entry, never the boot.
+        // on. A path that does not resolve is a policy/target mismatch —
+        // unless wabbit simply creates it: the policy is signed, kernfs
+        // has no symlinks (the directories cannot escape), and an empty
+        // cgroup directory is inert. This is load-bearing for entries
+        // naming cgroups that do not exist *yet*: the guard loads in the
+        // initramfs phase, before systemd creates init.scope or any unit
+        // cgroup, and a boot-time grant (the `kmods` class that lets PID
+        // 1 mount /boot/efi, the systemd-modules-load cgroup) must
+        // resolve now anyway — systemd reuses existing directories, so
+        // the kernfs node (and the id the maps key on) is the very one
+        // its processes will land in.
         let cgroup = entry.cgroup.to_str().context("the cgroup path is UTF-8")?;
-        let ino = match fs::metadata(cgroup) {
-            Ok(metadata) => metadata.ino(),
-            Err(error) => {
+        if let Err(error) = fs::metadata(cgroup) {
+            if let Err(error) = fs::create_dir_all(&entry.cgroup) {
                 warn!(
-                    "the authorized cgroup {cgroup} does not exist here ({error}); \
-                     skipping its entry — deny-by-default applies to it"
+                    "creating the authorized cgroup {} failed ({error}); \
+                     skipping its entry — deny-by-default applies to it",
+                    entry.cgroup.display()
                 );
                 continue;
             }
-        };
+            info!("created the authorized cgroup {}", entry.cgroup.display());
+        }
+        let ino = fs::metadata(cgroup)
+            .with_context(|| format!("stat(2) on the authorized cgroup {cgroup}"))?
+            .ino();
         resolved.push((entry, ino));
     }
 
@@ -892,12 +1426,33 @@ fn populate_authorizations(ebpf: &mut aya::Ebpf, policy: &Policy) -> Result<()> 
             .context("finding PROTECTED_PATHS")?
             .try_into()
             .context("opening PROTECTED_PATHS")?;
-        for (entry, ino) in &resolved {
-            // The authorized cgroup's path is protected: everything below
-            // it (cgroup.procs, cgroup.freeze, cgroup.kill) is walled for
-            // everyone outside it — the migration wall the class model
-            // leans on.
+        for (entry, _) in &resolved {
+            // The migration wall: every cgroup holding an action bit is
+            // protected (the walls around those bits are load-bearing),
+            // `FLAG_PROTECT` extends the same wall to cgroups that hold
+            // none, and `FLAG_UNPROTECTED` opts a cgroup out of the
+            // implicit wall — the `init.scope` bootstrap, where PID 1
+            // migrates itself in from outside every wall before any
+            // authorization can apply to it. Everything below a walled
+            // path — `cgroup.procs`, `cgroup.freeze`, `cgroup.kill` — is
+            // denied to every cgroup outside it, so nothing can move a
+            // process into a protected cgroup or kill it through the
+            // cgroupfs.
             let cgroup = entry.cgroup.to_str().expect("validated UTF-8");
+            if cgroup == wabbit_common::cgroup_types::CGROUPFS_ROOT {
+                // Never the root: it is a prefix of every cgroupfs path,
+                // so walling it would deny every `cgroup.procs` write on
+                // the machine. The generator rejects a `protect` flag on
+                // it; an entry there (the kernel's module autoloads run
+                // in the root cgroup) carries bits but no wall.
+                info!(
+                    "the authorized cgroupfs root carries no wall: every cgroupfs path is under it"
+                );
+                continue;
+            }
+            if !entry_is_protected(entry.action_mask, entry.flags) {
+                continue;
+            }
             protected
                 .insert(path_hash(cgroup.as_bytes()), 1, 0)
                 .with_context(|| format!("protecting the cgroup path {cgroup}"))?;
@@ -913,19 +1468,16 @@ fn populate_authorizations(ebpf: &mut aya::Ebpf, policy: &Policy) -> Result<()> 
         for (entry, ino) in &resolved {
             for rule in &entry.path_rules {
                 // The generator validates the prefix (canonical, UTF-8,
-                // within the walk cap); hashing it here is total.
+                // within the walk cap) and the verdict (it decides
+                // something); hashing the prefix and translating the
+                // verdict here are total.
                 let prefix = rule.prefix.to_str().context("the rule prefix is UTF-8")?;
-                let verdict = if rule.verdict == PathRuleVerdict::new(true) {
-                    PATH_RULE_DENY
-                } else {
-                    PATH_RULE_ALLOW
-                };
                 let rule_key = PathRuleKey {
                     cgroup_id: *ino,
                     path_hash: path_hash(prefix.as_bytes()),
                 };
                 path_rules
-                    .insert(rule_key, verdict, 0)
+                    .insert(rule_key, rule.verdict_bits(), 0)
                     .with_context(|| format!("writing the {prefix:?} rule"))?;
             }
         }
@@ -938,6 +1490,20 @@ fn populate_authorizations(ebpf: &mut aya::Ebpf, policy: &Policy) -> Result<()> 
         if populated == 1 { "" } else { "s" }
     );
     Ok(())
+}
+
+/// Whether an entry's cgroup gets the migration wall: every bit-holding
+/// cgroup is walled (the walls around those bits are load-bearing),
+/// [`FLAG_PROTECT`] walls a bitless one, and [`FLAG_UNPROTECTED`] opts
+/// out of the implicit wall — the signed policy's one accepted
+/// exception, for the cgroup PID 1 must migrate itself into before
+/// anything can authorize it.
+fn entry_is_protected(action_mask: u64, flags: u64) -> bool {
+    use wabbit_common::authorization::{FLAG_PROTECT, FLAG_UNPROTECTED};
+    if flags & FLAG_PROTECT != 0 {
+        return true;
+    }
+    action_mask != 0 && flags & FLAG_UNPROTECTED == 0
 }
 
 /// Attach one LSM gate, trying the candidate programs in order: the first
@@ -954,8 +1520,17 @@ fn attach_lsm(ebpf: &mut aya::Ebpf, btf: &Btf, hook: &str, candidates: &[&str]) 
         match program.load(hook, btf) {
             Ok(()) => {}
             Err(error) => {
-                warn!("{candidate} does not fit this kernel: {error}");
-                debug!("full verifier output for {candidate}: {error:#}");
+                // Aya's error Display carries the kernel's whole verifier
+                // log — megabytes for a complex program — and the console
+                // is the one channel live while the world is frozen: the
+                // WARN carries the headline reason only (the variant
+                // mechanism makes the miss *expected* — one candidate is
+                // designed to lose on every kernel), the full dump stays
+                // at debug.
+                let error_text = format!("{error}");
+                let headline = error_text.lines().next().unwrap_or(&error_text);
+                warn!("{candidate} does not fit this kernel: {headline}");
+                debug!("full verifier output for {candidate}: {error_text}");
                 continue;
             }
         }
@@ -1134,6 +1709,24 @@ format:
     }
 
     #[test]
+    fn the_migration_wall_rule() {
+        use wabbit_common::authorization::{FLAG_PROTECT, FLAG_UNPROTECTED};
+        // Bit-holders are walled by default — the walls around the bits
+        // are load-bearing.
+        assert!(entry_is_protected(1, 0));
+        // A bitless cgroup is not, unless the policy says so.
+        assert!(!entry_is_protected(0, 0));
+        assert!(entry_is_protected(0, FLAG_PROTECT));
+        // The bootstrap opt-out: bits, unwalled — the signed policy's
+        // one accepted exception (PID 1's self-migration into
+        // init.scope).
+        assert!(!entry_is_protected(1, FLAG_UNPROTECTED));
+        // And the explicit wall beats the opt-out (the generator rejects
+        // the pair, but the rule is deterministic regardless).
+        assert!(entry_is_protected(1, FLAG_PROTECT | FLAG_UNPROTECTED));
+    }
+
+    #[test]
     fn module_trees_walk_depth_two() {
         // The trees on the targets are `<root>/<kversion>/<file>`; the
         // search must not return the kversion directory itself.
@@ -1141,6 +1734,190 @@ format:
             assert!(
                 Path::new(&path).is_file(),
                 "find_module_tree_file returned a non-file"
+            );
+        }
+    }
+}
+
+// ------------------------------------------------------------------- the runs
+
+/// The [`crate::runs::RunAuthorizer`] for the loaded guard: how the
+/// IPC server's run commands get their ephemeral cgroups (see
+/// `crate::runs` for the model). Implemented on the `Mutex` wrapper
+/// the server holds, because concurrent commands each prepare a run
+/// and the map writes need the guard's `&mut`.
+impl crate::runs::RunAuthorizer for std::sync::Mutex<Guard> {
+    fn own_cgroup(&self) -> String {
+        self.lock()
+            .expect("the guard lock is not poisoned")
+            .cgroup_string()
+    }
+
+    fn prepare_run(
+        &self,
+        class: Option<&wabbit_policy::authorization::AuthorizationEntry>,
+        command_id: u64,
+    ) -> Result<crate::runs::PreparedRun> {
+        self.lock()
+            .expect("the guard lock is not poisoned")
+            .prepare_run(class, command_id)
+    }
+
+    fn release_run(&self, run: &crate::runs::PreparedRun) {
+        self.lock()
+            .expect("the guard lock is not poisoned")
+            .release_run(run)
+    }
+}
+
+impl Guard {
+    /// Create the ephemeral run cgroup (`crate::runs::create_run_cgroup`
+    /// does the filesystem half) and authorize it with exactly the
+    /// class's settings — keyed by its fresh kernfs id, so the class's
+    /// compiled bits reach the gates for the run's processes and
+    /// nothing else's. A classless run writes no authorization at all:
+    /// deny-by-default is the floor.
+    fn prepare_run(
+        &mut self,
+        class: Option<&wabbit_policy::authorization::AuthorizationEntry>,
+        command_id: u64,
+    ) -> Result<crate::runs::PreparedRun> {
+        use wabbit_common::authorization::{AUTH_VERSION, Authorization, PathRuleKey};
+
+        let parent = match class {
+            // The class's own cgroup — the convention entry the server
+            // resolved from the active policy.
+            Some(entry) => entry.cgroup.clone(),
+            None => self.cgroup.clone(),
+        };
+        let (cgroup, cgroup_id) = crate::runs::create_run_cgroup(&parent, command_id)?;
+        let mut run = crate::runs::PreparedRun {
+            cgroup,
+            cgroup_id,
+            rule_prefix_hashes: Vec::new(),
+        };
+
+        if let Some(entry) = class {
+            {
+                let mut authorizations: HashMap<_, CgroupKey, Authorization> = self
+                    .ebpf
+                    .map_mut("AUTHORIZATIONS")
+                    .context("finding AUTHORIZATIONS")?
+                    .try_into()
+                    .context("opening AUTHORIZATIONS")?;
+                let value = Authorization {
+                    version: AUTH_VERSION,
+                    size: size_of::<Authorization>() as u32,
+                    generation: 0,
+                    action_mask: entry.action_mask,
+                    namespace_id: 0,
+                    flags: entry.flags,
+                };
+                authorizations
+                    .insert(CgroupKey { cgroup_id }, value, 0)
+                    .context("authorizing the run cgroup")?;
+            }
+            {
+                let mut path_rules: HashMap<_, PathRuleKey, u32> = self
+                    .ebpf
+                    .map_mut("PATH_RULES")
+                    .context("finding PATH_RULES")?
+                    .try_into()
+                    .context("opening PATH_RULES")?;
+                for rule in &entry.path_rules {
+                    let prefix = rule.prefix.to_str().context("the rule prefix is UTF-8")?;
+                    let key = PathRuleKey {
+                        cgroup_id,
+                        path_hash: path_hash(prefix.as_bytes()),
+                    };
+                    run.rule_prefix_hashes.push(key.path_hash);
+                    path_rules
+                        .insert(key, rule.verdict_bits(), 0)
+                        .with_context(|| format!("writing the run's {prefix:?} rule"))?;
+                }
+            }
+        }
+
+        // The migration wall needs no write of its own: the run cgroup
+        // sits under wabbit's own cgroup and the class's entry, both of
+        // whose hashes are already in PROTECTED_PATHS, and the eBPF
+        // prefix walk covers everything below a protected path — so
+        // nothing outside can move a process into the run, or freeze
+        // or kill it through the cgroupfs.
+        info!(
+            "prepared the run cgroup {}{}",
+            run.cgroup.display(),
+            if class.is_some() {
+                " (classed)"
+            } else {
+                " (classless: deny-by-default)"
+            }
+        );
+        Ok(run)
+    }
+
+    /// Undo one run: remove its authorization from the maps and, best
+    /// effort, the directory. Never fails — the command's outcome is
+    /// already decided, and a leftover cgroup is over-strict (its walls
+    /// stay up), never a hole.
+    fn release_run(&mut self, run: &crate::runs::PreparedRun) {
+        use wabbit_common::authorization::{Authorization, PathRuleKey};
+
+        {
+            let mut authorizations: HashMap<_, CgroupKey, Authorization> = match self
+                .ebpf
+                .map_mut("AUTHORIZATIONS")
+                .context("finding AUTHORIZATIONS")
+                .and_then(|map| map.try_into().context("opening AUTHORIZATIONS"))
+            {
+                Ok(map) => map,
+                Err(error) => {
+                    warn!("releasing the run's authorization: {error:#}");
+                    return;
+                }
+            };
+            // A classless run wrote no entry, so this is often just a
+            // no-op (and a missing key deletes as ENOENT — debug, not a
+            // warning, for exactly that reason).
+            if let Err(error) = authorizations.remove(&CgroupKey {
+                cgroup_id: run.cgroup_id,
+            }) {
+                debug!("removing the run's authorization: {error}");
+            }
+        }
+        {
+            let mut path_rules: HashMap<_, PathRuleKey, u32> = match self
+                .ebpf
+                .map_mut("PATH_RULES")
+                .context("finding PATH_RULES")
+                .and_then(|map| map.try_into().context("opening PATH_RULES"))
+            {
+                Ok(map) => map,
+                Err(error) => {
+                    warn!("releasing the run's path rules: {error:#}");
+                    return;
+                }
+            };
+            for hash in &run.rule_prefix_hashes {
+                if let Err(error) = path_rules.remove(&PathRuleKey {
+                    cgroup_id: run.cgroup_id,
+                    path_hash: *hash,
+                }) {
+                    debug!("removing the run's path rule: {error}");
+                }
+            }
+        }
+
+        // The directory: a run's own descendants may still be alive
+        // inside, and then rmdir fails with EBUSY — the cgroup stays,
+        // walls and all. Over-strict, never a hole; the operator hears
+        // it once instead of finding it in an audit.
+        if let Err(error) = fs::remove_dir(&run.cgroup)
+            && run.cgroup.exists()
+        {
+            warn!(
+                "could not remove the run cgroup {} ({error}); its walls stay up",
+                run.cgroup.display()
             );
         }
     }

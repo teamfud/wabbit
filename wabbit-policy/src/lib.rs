@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! magic       "WSPF"
-//! version     u16, currently 4
+//! version     u16, currently 5
 //! key_id      u8, an index into POLICY_PUBLIC_KEYS naming the signing key
 //! signature   [u8; 64], Ed25519 over (magic || version || key_id || sections)
 //! sections    u8, one bit per section that follows; unknown bits must be 0
@@ -61,7 +61,7 @@ pub mod authorization;
 pub mod rootfs;
 mod wire;
 
-use authorization::AuthorizationConfig;
+use authorization::{AuthorizationConfig, AuthorizationEntry};
 use rootfs::RootFSConfig;
 
 /// WSPF / "Wabbit Signed Policy File"
@@ -69,7 +69,7 @@ pub const MAGIC: &[u8; 4] = b"WSPF";
 /// Every trusted policy-signing public key, as `(id, key)` pairs: the
 /// header names the signing key, verification looks it up here.
 pub const POLICY_PUBLIC_KEYS: &[(u8, &str)] = wabbit_common::keys::POLICY_PUBLIC_KEYS;
-const VERSION: u16 = 4;
+const VERSION: u16 = 5;
 const SIGNATURE_SIZE: usize = 64;
 /// Size of an Ed25519 private key: the 32-byte secret seed.
 pub const PRIVATE_KEY_SIZE: usize = 32;
@@ -101,7 +101,7 @@ impl Sections {
 /// Everything a policy file can configure. A section is `None` if the file doesn't contain it.
 #[binrw]
 #[brw(little)]
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Policy {
     #[br(temp, try_map = Sections::from_byte)]
     #[bw(calc = Sections::new(rootfs.is_some(), authorization.is_some()), map = Sections::to_byte)]
@@ -112,6 +112,36 @@ pub struct Policy {
     /// Per-cgroup authorization classes for the steady-state gates.
     #[br(if(sections.authorization()))]
     pub authorization: Option<AuthorizationConfig>,
+}
+
+impl Default for Policy {
+    /// The floor — and one grant the boot's own rescue depends on.
+    ///
+    /// No rootfs remounts, and one authorization entry: the cgroupfs
+    /// root may signal. The failure-safety contract is served primarily
+    /// by the `task_kill` gate itself (SIGCONT exempt outright — the
+    /// thaw channel every rescue broadcasts — and a default-allow
+    /// posture for unlisted cgroups, so the boot's units never lose
+    /// `kill(2)`); this grant is the belt-and-braces half, covering the
+    /// root cgroup's transients (kernel usermode helpers, the
+    /// initramfs's processes) as a *listed* cgroup with the bit, so the
+    /// rescue stays covered even if the gate's posture is ever
+    /// tightened. Post-boot nothing but kernel threads and transient
+    /// helpers live in the root cgroup, so the grant's reach is exactly
+    /// that machinery.
+    fn default() -> Self {
+        Self {
+            rootfs: None,
+            authorization: Some(AuthorizationConfig {
+                entries: vec![AuthorizationEntry {
+                    cgroup: wabbit_common::cgroup_types::CGROUPFS_ROOT.into(),
+                    action_mask: wabbit_common::authorization::ACTION_SIGNAL_OTHERS,
+                    flags: 0,
+                    path_rules: Vec::new(),
+                }],
+            }),
+        }
+    }
 }
 
 impl Policy {
@@ -336,7 +366,7 @@ mod tests {
         };
         let expected = [
             b"WSPF".as_slice(),
-            &4u16.to_le_bytes(),
+            &5u16.to_le_bytes(),
             // key id
             &[TEST_KEY_ID],
             &[7; SIGNATURE_SIZE],
@@ -352,17 +382,45 @@ mod tests {
             expected
         );
 
-        let empty = [
+        // A sectionless policy is still expressible — it is just not the
+        // default anymore: the default carries the boot-rescue grant
+        // (see `Policy::default`), proven by the section byte below.
+        let sectionless = [
             b"WSPF".as_slice(),
-            &4u16.to_le_bytes(),
+            &5u16.to_le_bytes(),
             &[TEST_KEY_ID],
             &[7; SIGNATURE_SIZE],
             &[0b0],
         ]
         .concat();
         assert_eq!(
-            to_signed_bytes(&Policy::default(), TEST_KEY_ID, &[7; SIGNATURE_SIZE]).unwrap(),
-            empty
+            to_signed_bytes(
+                &Policy {
+                    rootfs: None,
+                    authorization: None,
+                },
+                TEST_KEY_ID,
+                &[7; SIGNATURE_SIZE],
+            )
+            .unwrap(),
+            sectionless
+        );
+
+        // The default itself encodes its one grant: the cgroupfs root
+        // may signal (the boot's failure paths thaw from there).
+        let default = [
+            b"WSPF".as_slice(),
+            &5u16.to_le_bytes(),
+            &[TEST_KEY_ID],
+            &[7; SIGNATURE_SIZE],
+            &[0b10], // sections: authorization
+        ]
+        .concat();
+        let encoded =
+            to_signed_bytes(&Policy::default(), TEST_KEY_ID, &[7; SIGNATURE_SIZE]).unwrap();
+        assert!(
+            encoded.starts_with(&default),
+            "the default policy encodes its authorization section: {encoded:?}"
         );
     }
 
@@ -461,7 +519,11 @@ mod tests {
     fn merge_replaces_only_provided_sections() {
         let mut current = sample();
 
-        current.merge(Policy::default());
+        // A sectionless replacement touches nothing.
+        current.merge(Policy {
+            rootfs: None,
+            authorization: None,
+        });
         assert_eq!(current, sample());
 
         let replacement = Policy {
@@ -472,5 +534,20 @@ mod tests {
         assert_eq!(current.rootfs, replacement.rootfs);
         // The omitted authorization section survives the merge.
         assert_eq!(current.authorization, sample().authorization);
+
+        // The default is *not* sectionless — its authorization section
+        // carries the boot-rescue grant (the root cgroup's signal bit;
+        // see `Policy::default`) — so merging it replaces a provided
+        // authorization with exactly that floor.
+        let mut current = Policy {
+            rootfs: None,
+            authorization: None,
+        };
+        current.merge(Policy::default());
+        assert_eq!(current, Policy::default());
+        assert_eq!(
+            current.authorization.as_ref().unwrap().entries[0].cgroup,
+            Path::new(wabbit_common::cgroup_types::CGROUPFS_ROOT)
+        );
     }
 }

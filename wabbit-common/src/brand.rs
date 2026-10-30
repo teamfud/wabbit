@@ -18,7 +18,9 @@
 //! instead of producing a half-branded binary.
 //!
 //! These constants are read at the point of use, so a branded build
-//! needs only the environment variables: no source changes. The crate
+//! needs only the environment variables: no source changes.
+//! `vm/generate-deployment.sh --brand-name` (and the other `--brand-*`
+//! flags) exports them for a whole deployment build. The crate
 //! names themselves stay (the `log` crate bakes `module_path!()` into
 //! every call site, and a crate name cannot be parameterized by an
 //! environment variable), so a `strings` audit of a branded binary still

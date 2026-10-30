@@ -35,7 +35,8 @@ use aya_ebpf::{
     helpers::{bpf_d_path, bpf_probe_read_kernel},
 };
 use wabbit_common::authorization::{
-    FLAG_PATH_RULES_DEFAULT_DENY, PATH_RULE_ALLOW, PATH_RULE_DENY, PathRuleKey,
+    FLAG_PATH_RULES_DEFAULT_DENY, PATH_RULE_EXEC_ALLOW, PATH_RULE_EXEC_DENY, PATH_RULE_READ_ALLOW,
+    PATH_RULE_READ_DENY, PATH_RULE_WRITE_ALLOW, PATH_RULE_WRITE_DENY, PathRuleKey,
 };
 
 use crate::{
@@ -79,15 +80,19 @@ pub const CGROUPFS_ROOT: &[u8] = b"/sys/fs/cgroup";
 ///
 /// ```text
 /// legacy (v5.14–6.1): f_u(16) f_path@16 f_inode f_op f_lock f_write_hint
-///                     f_count f_flags f_mode@68 ...
+///                     f_count f_flags@64 f_mode@68 ...
+///                     (v6.1 dropped f_write_hint; f_count lands 8-aligned
+///                     at 56 either way, so the offsets agree)
 /// modern (v6.8):      f_u(16) f_lock@16 f_mode@20 f_count f_pos_lock(32)
-///                     f_pos f_flags f_owner(32) f_cred f_ra(32) f_path@152 ...
+///                     f_pos f_flags@72 f_owner(32) f_cred f_ra(32) f_path@152 ...
 /// ```
 pub mod file_layout {
     pub const LEGACY_PATH: usize = 16;
     pub const LEGACY_MODE: usize = 68;
+    pub const LEGACY_FLAGS: usize = 64;
     pub const MODERN_PATH: usize = 152;
     pub const MODERN_MODE: usize = 20;
+    pub const MODERN_FLAGS: usize = 72;
 }
 
 /// Resolve `path` with `bpf_d_path` into `buffer`, returning the resolved
@@ -270,21 +275,55 @@ pub fn is_cgroupfs_root(resolved: &[u8]) -> bool {
     names_or_contains(resolved, CGROUPFS_ROOT) && resolved.len() == CGROUPFS_ROOT.len()
 }
 
-/// Does the current cgroup's path rules deny opening `resolved`?
+/// The operation class of an open, for the per-operation path rules:
+/// which of the rule verdicts the walk resolves for this open. The
+/// `file_open` gate picks the class from what the kernel handed it —
+/// exec (`f_flags & __FMODE_EXEC`, the kernel's own marker), write
+/// (`f_mode & FMODE_WRITE`), or read (any other open) — and asks one
+/// question per open.
+#[derive(Clone, Copy)]
+pub enum PathOp {
+    /// Any open of the path at all.
+    Read,
+    /// A writable open (`f_mode & FMODE_WRITE`).
+    Write,
+    /// An execve open (`f_flags & __FMODE_EXEC`).
+    Exec,
+}
+
+impl PathOp {
+    /// This operation's verdict bits in a [`PATH_RULES`] value:
+    /// (allow bit, deny bit).
+    #[inline(always)]
+    const fn bits(self) -> (u32, u32) {
+        match self {
+            Self::Read => (PATH_RULE_READ_ALLOW, PATH_RULE_READ_DENY),
+            Self::Write => (PATH_RULE_WRITE_ALLOW, PATH_RULE_WRITE_DENY),
+            Self::Exec => (PATH_RULE_EXEC_ALLOW, PATH_RULE_EXEC_DENY),
+        }
+    }
+}
+
+/// Do the current cgroup's path rules deny *one operation class* of
+/// opening `resolved`? The gate picks the class (`PathOp`) from the open
+/// itself; this resolves only that class's verdict.
 ///
 /// The rules (see [`PATH_RULES`] and
-/// `wabbit_common::authorization::FLAG_PATH_RULES_DEFAULT_DENY`) resolve
-/// **longest-prefix-wins**: of every prefix carrying a rule, the longest
-/// one decides. This is one forward pass — the same incremental FNV-1a
-/// walk as [`under_protected_cgroup`], with the running hash equal to
+/// `wabbit_common::authorization::FLAG_PATH_RULES_DEFAULT_DENY`)
+/// resolve **longest-deciding-prefix-wins, per operation**: one forward
+/// pass — the same incremental FNV-1a walk as
+/// [`under_protected_cgroup`], with the running hash equal to
 /// `path_hash` of the prefix consumed so far at every `/` boundary, and
 /// the whole path at the end — that remembers the verdict of the deepest
-/// rule seen: walking shortest to longest and keeping the last match is
-/// the same decision as checking the longest first. No rule matched, and
-/// the cgroup's default decides: allow, unless its `Authorization` carries
-/// the default-deny flag, in which case only a prefix explicitly carrying
-/// [`PATH_RULE_ALLOW`] opens. A cgroup with no `Authorization` entry has no
-/// rules and is default-allow.
+/// *rule that decides this operation* seen: walking shallow to deep and
+/// overwriting whenever a rule speaks is the same decision as checking
+/// the deepest decider first. A rule that matches but leaves this
+/// operation unspecified (`0b00`, neither verdict bit) does not speak:
+/// the shallower verdicts survive it. No rule decided, and the cgroup's
+/// default decides: allow, unless its `Authorization` carries the
+/// default-deny flag, in which case only a rule carrying this
+/// operation's `*_ALLOW` bit opens. A cgroup with no `Authorization`
+/// entry has no rules and is default-allow.
 ///
 /// The per-prefix re-hash this replaces cost a full nested hash loop per
 /// boundary, which detonated the verifier's complexity limit on the first
@@ -293,15 +332,16 @@ pub fn is_cgroupfs_root(resolved: &[u8]) -> bool {
 /// over-allow on that path, never a widening of someone else's rules.
 /// Trusted callers never reach this: `file_open` short-circuits them.
 #[inline(always)]
-pub fn path_rule_denies(resolved: &[u8]) -> bool {
+pub fn path_rule_denies(resolved: &[u8], op: PathOp) -> bool {
     let cgroup = trust::current_cgroup();
     // The cgroup's default: allow, unless its Authorization says otherwise.
     let Some(authorization) = (unsafe { AUTHORIZATIONS.get(&cgroup) }) else {
         return false;
     };
     let default_deny = authorization.flags & FLAG_PATH_RULES_DEFAULT_DENY != 0;
+    let (allow_bit, deny_bit) = op.bits();
 
-    // One forward pass, remembering the deepest matching rule's verdict.
+    // One forward pass, remembering the deepest deciding rule's verdict.
     // The cap is a constant, so the verifier sees a bounded loop (see
     // [`PATH_WALK_CAP`]); every byte read goes through `read_indexed`
     // (see it — a direct `resolved.get(index)` is a variable-offset stack
@@ -316,31 +356,33 @@ pub fn path_rule_denies(resolved: &[u8]) -> bool {
         };
         if byte == b'/' && index > 0 {
             // The running hash is `path_hash(&resolved[..index])`.
-            deepest = rule_verdict(cgroup.cgroup_id, hash, default_deny).or(deepest);
+            deepest = op_verdict(cgroup.cgroup_id, hash, allow_bit, deny_bit).or(deepest);
         }
         hash = fnv_step(hash, byte);
         index += 1;
     }
     // The whole path — the final and deepest boundary.
-    deepest = rule_verdict(cgroup.cgroup_id, hash, default_deny).or(deepest);
+    deepest = op_verdict(cgroup.cgroup_id, hash, allow_bit, deny_bit).or(deepest);
 
     deepest.unwrap_or(default_deny)
 }
 
-/// One prefix's rule verdict, if it carries one: `false` is "opens", `true`
-/// is "denied". In a default-deny profile only an explicit
-/// [`PATH_RULE_ALLOW`] opens; in a default-allow profile a
-/// [`PATH_RULE_DENY`] denies.
+/// One prefix's verdict for one operation class, if a rule there decides
+/// it: `false` is "opens", `true` is "denied", `None` is "this rule does
+/// not speak for the operation — keep the verdict of a shallower rule
+/// that does". A rule value with neither of the operation's bits set
+/// decides nothing for it; one with the allow bit opens it; one with the
+/// deny bit denies it (both bits cannot be set — the loader writes one
+/// bit per decided operation, verbatim from the wire).
 #[inline(always)]
-fn rule_verdict(cgroup_id: u64, prefix_hash: u64, default_deny: bool) -> Option<bool> {
+fn op_verdict(cgroup_id: u64, prefix_hash: u64, allow_bit: u32, deny_bit: u32) -> Option<bool> {
     let key = PathRuleKey {
         cgroup_id,
         path_hash: prefix_hash,
     };
-    let rule = unsafe { PATH_RULES.get(&key) }?;
-    Some(if default_deny {
-        rule & PATH_RULE_ALLOW == 0
-    } else {
-        rule & PATH_RULE_DENY != 0
-    })
+    let value = unsafe { PATH_RULES.get(&key) }?;
+    if value & (allow_bit | deny_bit) == 0 {
+        return None;
+    }
+    Some(value & deny_bit != 0)
 }

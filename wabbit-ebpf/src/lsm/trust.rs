@@ -24,8 +24,9 @@
 use aya_ebpf::helpers::{bpf_get_current_cgroup_id, bpf_get_current_pid_tgid};
 #[rustfmt::skip]
 pub use wabbit_common::authorization::{
-    CODE_ALLOWED, CODE_WOULD_DENY, CgroupKey, ENFORCE, HOOK_BPF, HOOK_FILE_OPEN, HOOK_KMOD,
-    HOOK_SB_MOUNT, HOOK_SETSOCKOPT, HOOK_SOCKET_CREATE, OBSERVE, decision_key,
+    CODE_ALLOWED, CODE_WOULD_DENY, CgroupKey, ENFORCE, HOOK_BPF, HOOK_BIND, HOOK_FILE_OPEN,
+    HOOK_KMOD, HOOK_SB_MOUNT, HOOK_SETSOCKOPT, HOOK_SOCKET_CREATE, HOOK_TASK_KILL, OBSERVE,
+    decision_key,
 };
 
 use crate::maps::{
@@ -101,6 +102,21 @@ pub fn authorized(cgroup: &CgroupKey, action: u64) -> bool {
 #[inline(always)]
 pub fn current_authorized(action: u64) -> bool {
     authorized(&current_cgroup(), action)
+}
+
+/// Does the current cgroup hold `action`, or have no `Authorization`
+/// entry at all? The signals gate's **default-allow** posture: an
+/// unlisted cgroup may signal (the whole unlisted world of a boot —
+/// initramfs units, session scopes — must never lose `kill(2)` to a
+/// boundary nobody drew), while a *listed* cgroup gets exactly its
+/// bits — the operator names the cgroup, the operator chose its
+/// actions.
+#[inline(always)]
+pub fn current_authorized_or_unlisted(action: u64) -> bool {
+    match unsafe { AUTHORIZATIONS.get(&current_cgroup()) } {
+        Some(authorization) => authorization.action_mask & action != 0,
+        None => true,
+    }
 }
 
 /// Is `path` (already hashed by the caller, with

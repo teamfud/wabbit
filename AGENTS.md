@@ -207,9 +207,11 @@ The intended startup path begins in the initrd:
    view of the root, and polls `/run/systemd/private` for systemd's
    readiness (`wabbit/src/handoff.rs`). A `wabbit` started outside an
    initramfs (the lab's `test` flow, a standalone run) skips the crossing:
-   the root is not rootfs, so there is nothing to cross into. Signed IPC
-   requests can then create an authorized child cgroup, grant that cgroup
-   permissions through the eBPF maps, and spawn an interactive process.
+   the root is not rootfs, so there is nothing to cross into. A signed IPC
+   run command then gets its own **ephemeral cgroup** — `run-<command id>`
+   under the class it names, or under wabbit's own cgroup when it names
+   none — authorized with exactly that class's rules through the eBPF
+   maps, and dissolved when the run ends (see the IPC section).
 
 The eBPF protections cover kernel-module loading, BPF map and syscall access,
 cgroup operations, firewall changes, and other actions selected by the
@@ -400,8 +402,10 @@ placement through each flavor's own extension points —
 init-premount/init-bottom hooks for initramfs-tools, pre-mount/pre-pivot
 hooks via a 90wabbit dracut module — plus the `lsm=bpf` kernel command
 line (skipped where the BPF LSM is already active) and the initramfs
-rebuild, with `--dry-run`, `--remove`, and `--no-switch-wait` (omit the
-pre-switch_root wait) available. The dracut module's hooks are installed
+rebuild, with `--dry-run`, `--remove`, `--no-switch-wait` (omit the
+pre-switch_root wait), and `--ipc-socket PATH` (export
+`<prefix>_IPC_SOCKET` through the launch hook, so wabbit serves signed
+IPC commands) available. The dracut module's hooks are installed
 through dracut's own `inst_hook`: a module's `install()` hook must never
 invoke `install(1)` by bare name — bash resolves it to the `install()`
 function the module itself defines, recursing until the C stack dies,
@@ -500,7 +504,12 @@ the full error chain of any failure, panics (through a panic hook that still
 runs the default hook), and the watchdog's own record when it fires. A clean
 boot removes the sign; every other exit — a propagated error, a panic, a
 `SIGKILL` the watchdog cleaned up after, or a nonzero wabbit exit — leaves
-it behind explaining why. The sign is best-effort end to end: a sign that
+it behind explaining why. The rescues themselves run in the root cgroup
+while guard is already enforcing, and the `task_kill` gate is built so it
+can never stand between a failed boot and its thaw: SIGCONT is exempt
+outright (the thaw channel), and the gate's posture is default-allow for
+unlisted cgroups — the starter policy and `Policy::default()` carry the
+root `signal` grant as belt-and-braces. The sign is best-effort end to end: a sign that
 cannot be written never fails the boot. It makes no mounts; it uses `/run`
 as the initrd provides it (tmpfs when the initrd mounted it, the initramfs
 ramfs otherwise), so it is never persistent. `WABBIT_SIGN_DIR` overrides
@@ -552,10 +561,11 @@ Unsigned requests are refused by name (the error tells the caller to use
 ownership and permissions for the operator class; the signature decides what
 a connected client can make wabbit do.
 
-Two commands exist, both in the envelope: **run** — execute a program in the
-namespace, capturing output — and **reconfigure** — apply a complete *signed
-policy file*, which the server verifies *again*, against the same keys,
-before applying anything. A reconfigure is double-signed by construction.
+Two commands exist, both in the envelope: **run** — execute a program in
+the namespace, capturing output, in its own ephemeral cgroup — and
+**reconfigure** — apply a complete *signed policy file*, which the server
+verifies *again*, against the same keys, before applying anything. A
+reconfigure is double-signed by construction.
 The server applies each section the policy contains (today, the rootfs
 section with `inner = true`) while holding a mutex, and merges the new
 policy into its stored policy only after that succeeds; omitted sections
@@ -563,12 +573,51 @@ are left unchanged, and a policy that fails verification or application
 touches no mounts and burns its command id (a failed command cannot come
 back — the signer mints a fresh one).
 
+### Runs, classes, and ephemeral cgroups
+
+A run never executes in wabbit's own cgroup — that cgroup is *trusted*,
+its processes exempt from every gate, so a program there would outrank
+the whole model. Each run gets a fresh child cgroup instead
+(`wabbit/src/runs.rs`): `run-<command id>`, where the anti-replay id
+doubles as the cgroup name — unique per boot, strictly increasing, so no
+two runs share a cgroup and no leftover can collide with a fresh one.
+The process is spawned with a held stdin (the same rendezvous the
+self-test workers use) and migrated before its first syscall, so nothing
+runs under anyone's trust in the fork window. The cgroup dies with the
+run: its map entries are removed and the directory deleted, best-effort
+— a leftover cgroup is over-strict (its walls stay up), never a hole.
+
+The run's authorization comes from the **class** it names. Classes are
+pure policy-crate authoring sugar (see the `wabbit-policy` section):
+`wabbit-policy build` compiles a `[[class]]` block into an ordinary
+authorization entry at `<wabbit-cgroup>/class/<name>`, and the runtime's
+whole understanding of classes is one path lookup — the server computes
+that convention path against its own cgroup and finds the compiled entry
+in the *active* policy, so a reconfigure rotates classes without a
+reboot. The class's action bits, flags, and path rules are then applied
+to the run cgroup's fresh kernfs id — exactly the class's settings, and
+nothing else. A classless run gets the same ephemeral cgroup with *no*
+authorization at all: deny-by-default, the least-privilege floor. The
+class name travels inside the signature (the signer chose the class) and
+is validated at decode — 1–24 bytes of `[a-z0-9-]`, since the runtime
+builds a cgroupfs path from it — before the command id burns, so a
+typo'd or hostile name costs nothing to fix.
+
+Everything a run cgroup holds sits under wabbit's own cgroup, whose
+hash is in `PROTECTED_PATHS`: the eBPF prefix walk covers the whole
+subtree, so the migration wall (`cgroup.procs`/`cgroup.freeze`/
+`cgroup.kill`) protects every run cgroup by construction — nothing
+outside can move a process into a run, and a compromised "ultra-
+privileged" run cannot pull outside processes in to inherit its bits.
+
 `wabbit-ipc` is the client crate: the library
 (`wabbit_ipc::CommandClient`) manages the counter file, the boot id, the
 envelope, and the signature, and the binary is the human entry point —
 
 ```sh
 wabbit-ipc --key policy.key run sh -c 'uptime'    # run in the namespace
+wabbit-ipc --key policy.key --class shell run bash  # classed: the shell
+                                                    # class's rules apply
 wabbit-ipc --key policy.key policy policy.wspf    # apply a signed policy
 wabbit-ipc --key policy.key send "$(wabbit-ipc encode-run sh -c uptime)"
 ```
@@ -599,6 +648,10 @@ compiled-in key list both sides share with the policy format.
 
 ## Binary policy files
 
+The operator-facing reference for the TOML source format — every
+section, action name, class rule, and the boot-time grants — is
+`docs/POLICY.md`; this section is the architecture-side contract.
+
 The `wabbit-policy` crate defines a versioned binary policy file, declared
 with `binrw` with boolean flags packed into `bilge` bitfields. A `Policy` is
 a set of optional sections, one per kind of configuration; the filesystem
@@ -618,7 +671,7 @@ re-export shim; the types live in the crate.
   path encoding.
 
 The file begins with the four-byte `WSPF` magic, a little-endian version
-(currently 4), the key id and the signature, followed by a byte with one bit
+(currently 5), the key id and the signature, followed by a byte with one bit
 per section and then the sections that bit announces, in bit order. Each
 section appears at most once, so a policy has a single encoding. The decoder
 rejects unknown versions, unknown key ids, section bits it does not know
@@ -648,6 +701,9 @@ signature. `keys.rs` carries `POLICY_PUBLIC_KEYS: &[(id, key)]`; the
 compile-time `WABBIT_POLICY_PUBLIC_KEY` env override (the white-label
 pattern) replaces id 0, and `gen-key` prints the exact line to paste.
 v3→v4 is one version bump; the v3 single-key format has shipped nowhere.
+v4→v5 widens the path-rule verdict from one open-wide allow/deny bit to
+per-operation bits (read/write/exec, each allow/deny/unspecified); the
+shipped-nowhere rule applies the same.
 
 **Off-box CLI** (`wabbit-policy <subcommand>`):
 
@@ -685,13 +741,28 @@ precedence (`configured_policy`): the env-var file
 (`<prefix>_FILESYSTEM_CONFIGURATION_FILE` — the installer's
 `--policy`, which installs to `/etc/<name>/policy.wspf`, copies into the
 image, and exports the env var from the launch hook; also the IPC rotation
-path) overrides the baked policy, which overrides `Policy::default()`.
+path) overrides the baked policy, which overrides `Policy::default()` —
+whose authorization section carries exactly one grant, the cgroupfs root
+may signal: every boot-failure rescue (the `FrozenWorld` drop backstop,
+the watchdog) thaws from the root cgroup while guard is enforcing, so a
+default without the grant would freeze out its own failure paths.
 The runtime re-verifies the embedded bytes, so a tampered binary cannot
 smuggle a policy; the build-time check is for the builder's own mistakes.
 
 **The deployment generator** (`vm/generate-deployment.sh`, gum for progress
 output only — no prompts): `--source`/`--bake`/`--key` flags in, one
-deployment directory out. Builds the CLI, generates or reuses the signing
+deployment directory out. The `--brand-name`/`--brand-env-prefix`/
+`--brand-sign-name`/`--brand-sign-magic` flags export `wabbit-common`'s
+white-label knobs (`brand.rs`) for the whole chain — every nested build
+inherits them, so the CLI, the artifact, the installer's bundles, and the
+client all come out branded together, and the starter policy's wabbit cgroup
+follows the brand name (the generator warns when a reused operator policy
+still names the stock one, since its class grants would not resolve). The
+`--name-policy`/`--name-initrd`/`--name-install`/`--name-ipc` flags rename
+the deployment directory's four binaries — cargo bin names stay fixed
+(`target/release/` keeps them), nothing keys off the copy's name, and every
+box-side path comes from the brand. Builds
+the CLI, generates or reuses the signing
 keypair, signs the TOML source (`<out>/policy.toml`) into
 `<out>/policy.wspf`, verifies the round trip with `wabbit-policy inspect
 --public-key`, builds the musl chain with `WABBIT_POLICY_PUBLIC_KEY`
@@ -709,17 +780,66 @@ is `option_env!` — compile-time only — so verifying a deployed keypair's
 policy needs the explicit flag; the CLI's default verifies against the
 compiled-in keys.
 
-**TOML source** (the `authorization` section, v4, alongside `rootfs`):
+**TOML source** (the `authorization` section, v5, alongside `rootfs`):
 
 ```toml
 [[authorization]]
 cgroup       = "/sys/fs/cgroup/wabbit"   # resolved to a kernfs id at load
 actions      = ["mount", "bpf-attach", "kmods", "firewall"]
 default_deny = false                      # FLAG_PATH_RULES_DEFAULT_DENY
+protect      = false                      # FLAG_PROTECT: the migration wall
 
 [[authorization.path_rules]]
 prefix  = "/etc/ssh"
-verdict = "allow"                         # or "deny"
+verdict = "allow"                         # or "deny": all three classes
+
+[[authorization.path_rules]]
+prefix  = "/var/www"                      # per-operation: read/write/exec,
+read    = "allow"                         # each "allow" or "deny", optional —
+write   = "deny"                          # an unset class falls through to
+exec    = "deny"                          # the next deciding rule, then the
+                                          # cgroup default
+```
+
+**Classes** are authoring sugar the build compiles away — the signed
+format carries no class concept, and wabbit never sees one. A class
+with a `cgroup` (a *concrete* class) compiles to its own entry at
+`<cgroup>/class/<name>` — the one convention path a class-naming IPC
+run resolves at runtime — and any `[[authorization]]` entry can name a
+class with `class = "..."` to inherit its settings, merged by *union*:
+actions join, flags OR, path rules append, so an entry may add to its
+class but never subtract. A class without a `cgroup` (*abstract*)
+compiles to nothing of its own — reusable settings, nothing a run could
+name. The shared rules (name charset, the `/class/` segment, the
+walk-cap bound) live in `wabbit-common/src/cgroup_types.rs`, which also
+carries the reference mapping from the original sketch (`supv`,
+`priv_ns`, `GlobalPerm`, `PathProfile`) to the implemented vocabulary —
+including the deliberate exclusions (a `supv` bit, and the gates the
+eBPF set does not host: ptrace/power/systemd), which stay *out*
+of the vocabulary rather than present-but-unenforced — while the
+sketch's raw-capture and signaling bits are implemented
+(`raw-capture`, `bind-net`, `signal` — `signal` narrowed honestly to
+cross-*task* gating, since the target's cgroup is unreadable without
+the `task_struct` walks this design forbids, with self-signals and
+`SIGCONT` always exempt; the sketch's local-bind half is deliberately
+**ungated**: `AF_UNIX` is every daemon's connective tissue and no
+`bind-local` exists in the vocabulary at all):
+
+```toml
+[[class]]
+name         = "shell"
+cgroup       = "/sys/fs/cgroup/wabbit"  # compiles to <cgroup>/class/shell
+default_deny = true                      # allow-list: unruled opens deny
+protect      = true                      # the migration wall applies
+
+[[class.path_rules]]
+prefix  = "/usr"
+verdict = "allow"
+
+[[authorization]]
+cgroup  = "/sys/fs/cgroup/init.scope"
+class   = "systemd-base"                # inherits; union-merges
+actions = ["kmods"]                     # adds to the class
 ```
 
 **Loader semantics** (the wabbit side, `Guard::load` →
@@ -730,7 +850,29 @@ verdict = "allow"                         # or "deny"
   `cgroup` path with `stat(2)` (`st_ino` is the same id
   `bpf_get_current_cgroup_id` reports) and hashes path-rule prefixes with
   the shared `path_hash`. This is why `CgroupKey` was designed to agree
-  with `stat(2)`.
+  with `stat(2)`. Cgroup paths are bounded by the same walk cap as rule
+  prefixes (a loader contract the generator enforces): `PROTECTED_PATHS`
+  keys on the full path's hash and the eBPF prefix walk only hashes the
+  first `PATH_WALK_CAP` bytes, so a deeper path could never be walled.
+* **Missing authorized cgroups are created, not skipped.** The policy is
+  signed, kernfs carries no symlinks, and an empty cgroup directory is
+  inert — so an entry naming a cgroup that does not exist *yet* is
+  created rather than skipped. That is load-bearing twice over: compiled
+  class directories under wabbit's own subtree, and the boot-time grants
+  for cgroups systemd has not created when the guard loads (the initramfs
+  phase) — `init.scope` and unit cgroups, whose `kmods` class is what
+  lets PID 1 mount `/boot/efi` (the vfat NLS module autoloads in PID 1's
+  context; without the grant the mount fails and the boot degrades).
+  systemd reuses existing directories, so the kernfs node — the id the
+  maps key on — is the very one its processes land in.
+* **Protection is conditional on holding something.** Every cgroup holding
+  an action bit is protected automatically (the walls around those bits
+  are load-bearing), and `FLAG_PROTECT` extends the migration wall to
+  cgroups that hold no bits — the policy's way to say "migration-proof
+  this one for its own sake". The wall is the `PROTECTED_PATHS` prefix
+  walk: for every cgroup outside the protected path, writable opens of
+  `cgroup.procs`/`cgroup.freeze`/`cgroup.kill` under it and mounts over
+  it are denied.
 * **Timing.** Load runs in `Guard::load`, between `trust_self` (bootstrap
   trust) and the first program attach, under winit's frozen world —
   population is race-free. A missing/unreadable cgroup path warns and
@@ -771,10 +913,13 @@ enforce-flip steps are the next implementation phase:
 | --- | --- | --- |
 | `bpf_gate` | `bpf` | the classed `bpf(2)` gate: full trust keeps everything; `ACTION_BPF_ATTACH` (the systemd class) gets map creates + element ops + cgroup-family program loads/attaches/links + BTF loads; fd-by-ID lookups and LSM/tracing program types never relax below full trust |
 | `kmod_gate` | `kernel_read_file` | module loads (`READING_MODULE`) denied outside full trust and `ACTION_KMODS`; identity-keyed (no `bpf_d_path`), so it loads on every target kernel including vanilla 5.15 where the hook is not sleepable |
-| `file_open_modern`/`_legacy` | `file_open` | untrusted opens of bpffs (reads included — with the fd-by-ID gate, wabbit's maps become unreachable); opens under a denied path rule (the per-cgroup allow/deny profiles in `PATH_RULES`, longest-prefix-wins, default-deny via the `Authorization` flag); writable opens under the module trees (`ACTION_KMODS` lifts); writable opens under protected cgroupfs paths — the `cgroup.procs`/`cgroup.freeze`/`cgroup.kill` migration wall (`ACTION_CGROUPFS_WRITE` lifts) |
+| `file_open_modern`/`_legacy` | `file_open` | untrusted opens of bpffs (reads included — with the fd-by-ID gate, wabbit's maps become unreachable); opens the cgroup's path rules deny for the open's operation class — read, write (`f_mode & FMODE_WRITE`), or exec (`f_flags & __FMODE_EXEC` 0x20, the kernel's execve marker: `OPEN_FMODE` never copies it into `f_mode` and `VALID_OPEN_FLAGS` keeps userspace from counterfeiting it) — per-cgroup, per-operation profiles in `PATH_RULES`, longest-deciding-prefix-wins, default-deny via the `Authorization` flag; writable opens under the module trees (`ACTION_KMODS` lifts); writable opens under protected cgroupfs paths — the `cgroup.procs`/`cgroup.freeze`/`cgroup.kill` migration wall (`ACTION_CGROUPFS_WRITE` lifts) |
 | `sb_mount` | `sb_mount` | mounts over module trees/bpffs (never lifted); mounts over the cgroupfs root and protected cgroup paths (`ACTION_MOUNT` lifts) |
 | `firewall_gate` | `socket_setsockopt` | iptables-legacy rule changes (`IPT_SO_SET_REPLACE`/`ADD_COUNTERS` at `SOL_IP`/`SOL_IPV6`) denied outside full trust and `ACTION_FIREWALL` |
 | `netfilter_netlink_gate` | `socket_create` | creating a `NETLINK_NETFILTER` netlink socket — the nftables path: `nft`, `iptables-nft`/`ip6tables-nft`/`ebtables-nft`/`arptables-nft` (the distro defaults), firewalld, ipset, conntrack-tools — denied outside full trust and `ACTION_FIREWALL`; kernel-internal creation (`kern == 1`) exempt |
+| `raw_capture_gate` | `socket_create` | creating raw-capture sockets — `AF_PACKET` (tcpdump's channel) and `SOCK_RAW` at the IP families — denied outside full trust and `ACTION_RAW_CAPTURE`; kernel-internal creation exempt |
+| `bind_gate` | `socket_bind` | network `bind(2)`: `AF_INET`/`AF_INET6` needs `ACTION_BIND_NET` (deny-by-default — the default policy blocks network sockets and nothing else); the sockaddr's `sa_family` (uapi-stable, probe-read) narrows first, so local `AF_UNIX` IPC and netlink binds pass untouched, trusted or not |
+| `signal_gate` | `task_kill` | `kill(2)`/`tgkill(2)`/`pidfd_send_signal(2)` beyond the caller's own task denied outside full trust and `ACTION_SIGNAL_OTHERS` **on cgroups the policy lists** (default-allow: unlisted cgroups may signal — the boot's own units never lose `kill(2)` to a boundary nobody drew); self-signals and SIGCONT always exempt — the identity is the raw ctx-slot bits against `bpf_get_current_task()` (an integer helper), both scalars, because the verifier prohibits pointer comparisons and the target's cgroup would need the `task_struct` walks this design forbids; SIGCONT is the thaw channel every rescue path broadcasts, and the failure-safety contract outranks signaling containment |
 | `fork_watcher_vanilla`/`_preempt_lazy`, `module_load_logger` | tracepoints | `sched_process_fork` (both record layouts; the loader picks by format file) into `FORK_EVENTS`, `module_load` into `MODULE_LOADS` |
 
 Every gate short-circuits trusted callers (wabbit's PID and cgroup), then
@@ -789,10 +934,17 @@ trailing `/`), and `CgroupKey` keys on the kernfs id that
 `PathProfile`, deliberately simplified (the full `PathAction` set —
 `Enoent`, `Sigkill`, `Sigill`, `Sigsegv` — needs retval rewriting an LSM
 program cannot do): one map entry per (cgroup, path prefix), hashed with
-the same shared `path_hash`, resolution longest-prefix-wins over a single
-forward walk, and the cgroup's `Authorization` flag
-`FLAG_PATH_RULES_DEFAULT_DENY` flips its list from deny-list (default
-allow) to allow-list (default deny). Both prefix walks (`PROTECTED_PATHS`
+the same shared `path_hash`, holding one allow and one deny bit for each
+of the three operation classes (read/write/exec — the wire encoding in
+`wabbit-policy` maps onto the map bits one to one). Resolution is per
+class, longest-deciding-prefix-wins over a single forward walk: a rule
+that leaves the open's class unspecified falls through to the next
+shallower rule that decides it, and a class no rule decides follows the
+cgroup's `Authorization` flag `FLAG_PATH_RULES_DEFAULT_DENY` — deny-list
+(default allow) or allow-list (default deny). So a rule can block writes
+and execution under a prefix while its reads stay open, and the self-test
+proves each class independently per boot (`path-rules-read`/`-write`/
+`-exec`, seeded rules under a temp prefix). Both prefix walks (`PROTECTED_PATHS`
 and `PATH_RULES`) are capped at `PATH_WALK_CAP` = 64 bytes — a constant
 bound the eBPF verifier can afford (a runtime-length walk is quadratic in
 the verifier's state space; the first lab run measured 51k states and the
@@ -808,11 +960,18 @@ the guard stays in exactly that call class.
 
 Residuals, documented in the module docs: `move_mount`/`umount2` (not
 sleepable anywhere in the matrix — mount shuffling past `sb_mount`), writes
-through fds opened before wabbit started, inherited firewall/bpf sockets
-(an fd handed across a cgroup boundary before the gate armed keeps its
-access), direct `kill(2)` signals to wabbit's processes (the target task's
-cgroup is unreadable without the deep `task_struct` walks this design
-forbids; the cgroupfs walls cover the cgroup-level kill paths). The
+through fds opened before wabbit started, inherited firewall/bpf/bind
+sockets (an fd handed across a cgroup boundary before the gate armed keeps
+its access), and the `signal` posture (default-allow: the `task_kill`
+gate binds only cgroups the policy lists — unlisted cgroups may signal,
+so the boot's own units never lose `kill(2)` to a boundary nobody drew;
+within a listed cgroup every cross-task signal needs the bit, and the
+target's *cgroup* is unreadable without the deep `task_struct` walks this
+design forbids, so the bit cannot distinguish same- from cross-cgroup
+targets; the cgroupfs walls still cover the
+cgroup-level kill paths. SIGCONT is exempt outright: the thaw channel —
+every rescue path broadcasts it, from whatever cgroup the rescue lands
+in — and a frozen world must never outlive a failed boot). The
 firewall gates close both rule paths on every target kernel: the legacy
 xtables `setsockopt` and the nftables nfnetlink socket
 (`netfilter_netlink_gate` on `socket_create`, exempting kernel-internal

@@ -131,8 +131,29 @@ impl CommandClient {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        self.run_in_class(program, args, None)
+    }
+
+    /// [`Self::run`], naming the **class** the run executes under: the
+    /// authorization profile the target's policy defines for that
+    /// class. The server resolves the name against the *active* policy
+    /// (a reconfigure rotates classes without a reboot), gives the run
+    /// its own ephemeral cgroup, and applies exactly that class's
+    /// rules to it — least privilege by construction: a classless run
+    /// gets deny-by-default, and a classed run gets its class and
+    /// nothing more.
+    pub fn run_in_class<I, S>(
+        &self,
+        program: &str,
+        args: I,
+        class: Option<&str>,
+    ) -> Result<CommandOutcome>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         let args: Vec<String> = args.into_iter().map(Into::into).collect();
-        let command = encode_run(program, &args)?;
+        let command = encode_run_in_class(program, &args, class)?;
         self.send_encoded(&command)
     }
 
@@ -218,12 +239,39 @@ pub enum ServerResponse {
 }
 
 /// Encode a `run` command blob: program and its arguments.
+///
+/// Same as [`encode_run_in_class`] with no class — the least-privilege
+/// floor: the run gets its own ephemeral cgroup with no authorization
+/// at all.
 pub fn encode_run(program: &str, args: &[String]) -> Result<Vec<u8>> {
+    encode_run_in_class(program, args, None)
+}
+
+/// Encode a `run` command blob, optionally naming the **class** the
+/// run executes under. The class must be defined in the target's
+/// policy (`wabbit-policy build` compiles `[[class]]` blocks into the
+/// cgroup rules a run resolves); the name travels inside the
+/// signature, so the class a command runs with is exactly the class
+/// its signer chose.
+pub fn encode_run_in_class(program: &str, args: &[String], class: Option<&str>) -> Result<Vec<u8>> {
     let mut output = vec![KIND_RUN];
     put_string(&mut output, program)?;
     put_u32(&mut output, args.len())?;
     for arg in args {
         put_string(&mut output, arg)?;
+    }
+    // The optional trailing class field: absent for the older blob
+    // shape, present — and validated before it is ever signed — when
+    // the run names a class.
+    if let Some(class) = class {
+        if !wabbit_common::cgroup_types::valid_class_name(class) {
+            bail!(
+                "the class name {class:?} is not valid: 1-{} bytes of [a-z0-9-], \
+                 no leading or trailing '-'",
+                wabbit_common::cgroup_types::CLASS_NAME_MAX_BYTES
+            );
+        }
+        put_string(&mut output, class)?;
     }
     Ok(output)
 }
@@ -389,6 +437,30 @@ mod tests {
         assert_eq!(blob[0], KIND_RECONFIGURE);
         assert_eq!(&blob[1..5], &12u32.to_le_bytes());
         assert_eq!(&blob[5..], b"policy-bytes");
+    }
+
+    #[test]
+    fn classed_blobs_carry_the_class_last() {
+        let args = vec!["-c".to_string(), "uptime".to_string()];
+        let blob = encode_run_in_class("bash", &args, Some("ultra-privileged")).unwrap();
+        // program, argc, args, then the class as the trailing string —
+        // the shape the server decodes (and rejects hostile names in).
+        let expected = {
+            let mut blob = vec![KIND_RUN];
+            put_string(&mut blob, "bash").unwrap();
+            put_u32(&mut blob, 2).unwrap();
+            put_string(&mut blob, "-c").unwrap();
+            put_string(&mut blob, "uptime").unwrap();
+            put_string(&mut blob, "ultra-privileged").unwrap();
+            blob
+        };
+        assert_eq!(blob, expected);
+
+        // And a name that could reinterpret as a path never gets
+        // signed in the first place.
+        assert!(encode_run_in_class("bash", &args, Some("../escape")).is_err());
+        assert!(encode_run_in_class("bash", &args, Some("sh/ell")).is_err());
+        assert!(encode_run_in_class("bash", &args, Some("")).is_err());
     }
 
     #[test]

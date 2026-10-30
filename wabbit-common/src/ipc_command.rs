@@ -40,7 +40,15 @@
 //! always used:
 //!
 //! * **run**: `program` (string), argument count (`u32`), then each
-//!   argument (string);
+//!   argument (string), then — optionally, and only when the command
+//!   names one — `class` (string): the authorization profile the run
+//!   executes under. The class must be defined in the target's policy
+//!   (the policy crate compiles `[[class]]` blocks into cgroup rules);
+//!   the server resolves the name, gives the run its own ephemeral
+//!   cgroup, and applies exactly that class's rules to it. A run with
+//!   no class gets the same ephemeral cgroup with *no* rules —
+//!   deny-by-default, the least-privilege floor. The field's absence
+//!   is the older blob shape and decodes as "no class";
 //! * **reconfigure**: the bytes of a complete signed policy file (the
 //!   `WSPF` blob), which the server verifies *again* against the
 //!   policy keys before applying — a reconfigure is double-signed by

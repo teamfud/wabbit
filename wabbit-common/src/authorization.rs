@@ -98,6 +98,51 @@ pub const ACTION_CGROUPFS_WRITE: u64 = 1 << 8;
 /// access; that residual is documented with the gate.
 pub const ACTION_FIREWALL: u64 = 1 << 9;
 
+/// Allow raw packet capture: creating an `AF_PACKET` socket (tcpdump's
+/// own channel — every packet on the wire, including other processes'
+/// traffic) or a raw IP socket (`socket(AF_INET|AF_INET6, SOCK_RAW, …)`,
+/// hand-crafted IP packets and sniffing). Gated at `socket_create` by the
+/// `raw_capture_gate` eBPF program, which keys on the family and the
+/// `SOCK_RAW` type — plain scalar arguments, so the gate loads on every
+/// target kernel. Kernel-internal creation (`kern == 1`) is exempt.
+pub const ACTION_RAW_CAPTURE: u64 = 1 << 10;
+
+/// Allow `bind(2)` on network sockets (`AF_INET`/`AF_INET6`): acquiring a
+/// listening or connected local endpoint. Gated at `socket_bind` by the
+/// `bind_gate` eBPF program, which reads the sockaddr's family through
+/// `bpf_probe_read_kernel` (the first member of `struct sockaddr`, a
+/// stable uapi layout) and consults this bit. Every other family —
+/// netlink binds (udev's uevents, rtnl), netfilter's own netlink, and
+/// `AF_UNIX` above all — passes untouched: local IPC is the machine's
+/// connective tissue and is deliberately ungated.
+pub const ACTION_BIND_NET: u64 = 1 << 11;
+
+/// Allow signaling any task other than the caller's own: `kill(2)`,
+/// `tgkill(2)`, `tkill(2)`, `pidfd_send_signal(2)` — gated at
+/// `task_kill` by the `signal_gate` eBPF program.
+///
+/// **Self-signals are always exempt** (`raise(3)`, `kill(getpid())`,
+/// a thread's own exits): the one identity check the design can afford
+/// is target-`task_struct` == current, compared as raw scalar bits (the
+/// verifier prohibits pointer comparisons, and the target's *cgroup*
+/// would need the deep `task_struct` walks this design forbids — which
+/// also means the bit cannot distinguish same-cgroup from cross-cgroup
+/// targets). **`SIGCONT` is always exempt too**: it is the thaw channel
+/// every rescue path broadcasts (the handoff resume, the drop backstop,
+/// the watchdog), from whatever cgroup the rescue runs in, and the
+/// failure-safety contract — a frozen world never outlives a failed
+/// boot — outranks signaling containment. A cgroup without the bit can
+/// still raise itself. **The posture is default-allow for unlisted
+/// cgroups**: a cgroup with no `Authorization` entry may signal any
+/// task (the unlisted world of a boot — initramfs units, session
+/// scopes — never loses `kill(2)` to a boundary nobody drew), while a
+/// listed cgroup gets exactly its bits — the operator who names a
+/// cgroup chooses whether it may signal. Grant it where a listed
+/// cgroup does process management legitimately (PID 1's unit
+/// management, udev's worker pool, a shell's job control); omit it
+/// where cross-task signaling is the thing to contain.
+pub const ACTION_SIGNAL_OTHERS: u64 = 1 << 13;
+
 /// How deep the eBPF prefix walks may go: 64 bytes.
 ///
 /// A walk over a runtime-known length makes the verifier explore the whole
@@ -131,25 +176,78 @@ pub struct PathRuleKey {
     pub path_hash: u64,
 }
 
-/// A [`PATH_RULES`] value: a path rule's verdict bits. The simplified
-/// path-rule model — the reference `PathAction` set (`Enoent`, `Sigkill`,
-/// `Sigill`, `Sigseggv`) needs retval rewriting an LSM program cannot do,
-/// so a rule is allow or deny and nothing else.
-pub const PATH_RULE_ALLOW: u32 = 1 << 0;
-pub const PATH_RULE_DENY: u32 = 1 << 1;
+/// A [`PATH_RULES`] value: a path rule's verdict, per operation class.
+///
+/// The simplified path-rule model — the reference `PathAction` set
+/// (`Enoent`, `Sigkill`, `Sigill`, `Sigseggv`) needs retval rewriting an
+/// LSM program cannot do — so a rule's verdict is per-operation allow or
+/// deny and nothing else. The three operation classes an open can carry
+/// at `file_open`:
+///
+/// * **read** — any open of the path at all;
+/// * **write** — a writable open (`f_mode & FMODE_WRITE`);
+/// * **exec** — an execve open (`f_flags & __FMODE_EXEC`, 0x20, which
+///   `do_open_execat` sets in the open flags; `OPEN_FMODE` never copies
+///   it into `f_mode`, and `VALID_OPEN_FLAGS` excludes it, so a
+///   userspace `open(2)` cannot counterfeit the marker).
+///
+/// One allow and one deny bit per class. A value with neither bit of a
+/// class set does not decide that class: resolution falls through to the
+/// next rule that does, and past every rule to the cgroup default
+/// ([`FLAG_PATH_RULES_DEFAULT_DENY`]). The wire encoding
+/// (`wabbit-policy`'s `PathRuleVerdict`, six bits of a `u8`) maps onto
+/// these bits one to one, so the loader translates a rule verbatim.
+pub const PATH_RULE_READ_ALLOW: u32 = 1 << 0;
+pub const PATH_RULE_READ_DENY: u32 = 1 << 1;
+pub const PATH_RULE_WRITE_ALLOW: u32 = 1 << 2;
+pub const PATH_RULE_WRITE_DENY: u32 = 1 << 3;
+pub const PATH_RULE_EXEC_ALLOW: u32 = 1 << 4;
+pub const PATH_RULE_EXEC_DENY: u32 = 1 << 5;
 
 /// An [`Authorization`] flag: the cgroup's path rules are an *allow-list* —
-/// every open under a path with no matching rule is denied, and only the
-/// prefixes carrying [`PATH_RULE_ALLOW`] open. Without it the rules are a
-/// *deny-list*: nothing is denied except the prefixes carrying
-/// [`PATH_RULE_DENY`].
+/// for every operation class, an open under a path no matching rule
+/// *decides* is denied, and only a rule carrying that class's `*_ALLOW`
+/// bit opens. Without it the rules are a *deny-list*: nothing is denied
+/// except what a rule carrying a `*_DENY` bit denies.
 ///
-/// Resolution is longest-prefix-wins: the rule on the longest matching
-/// path prefix decides, and a path matching no rule follows the default.
-/// (In a deny-list profile an `ALLOW` bit is redundant; in an allow-list
-/// profile a `DENY` bit is — the bit that would matter is the one the
-/// default already supplies.)
+/// Resolution is per operation class, longest-deciding-prefix-wins: the
+/// deepest rule that *speaks for* the open's class (read, write, or exec)
+/// decides it, a rule that leaves the class unspecified falls through to
+/// the next shallower rule, and a class no rule decides follows this
+/// default. (In a deny-list profile an `ALLOW` bit is redundant; in an
+/// allow-list profile a `DENY` bit is — the bit that would matter is the
+/// one the default already supplies.)
 pub const FLAG_PATH_RULES_DEFAULT_DENY: u64 = 1 << 0;
+
+/// An [`Authorization`] flag: this cgroup is **protected** — the
+/// migration wall applies to it.
+///
+/// The loader adds the cgroup's canonical path to `PROTECTED_PATHS`,
+/// which the `file_open` and `sb_mount` gates consult: for every cgroup
+/// *outside* the protected path, writable opens of files under it
+/// (`cgroup.procs`, `cgroup.freeze`, `cgroup.kill` — the migration and
+/// kill paths) and mounts over it are denied, so nothing can move a
+/// process into a protected cgroup, freeze it, or kill it through the
+/// cgroupfs. Every cgroup holding an action bit is protected
+/// automatically — the walls around those bits are load-bearing — so
+/// this flag's purpose is to extend the same wall to cgroups that hold
+/// no bits at all (the sketch's `protect`: a cgroup the blue team wants
+/// migration-proofed for its own sake).
+pub const FLAG_PROTECT: u64 = 1 << 1;
+
+/// An [`Authorization`] flag: **opt this cgroup out of the migration
+/// wall** its action bits would otherwise give it.
+///
+/// Bit-holding cgroups are walled automatically — but the wall has one
+/// legitimate exception, and it is signed-policy business: **PID 1
+/// bootstraps into `init.scope` from outside every wall** (it starts in
+/// the root cgroup and migrates itself before anything is authorized),
+/// so an `init.scope` carrying boot-time grants could never receive
+/// them walled. The signer who sets this flag accepts the trade: a
+/// process able to write `cgroup.procs` from outside may join this
+/// cgroup. It is contradictory with [`FLAG_PROTECT`] and rejected
+/// together with it.
+pub const FLAG_UNPROTECTED: u64 = 1 << 2;
 
 /// Decision-trace hook ids: the high half of a `DECISIONS` map key. Shared
 /// by the eBPF gates (the writers) and the userspace self-test (the
@@ -161,6 +259,8 @@ pub const HOOK_FILE_OPEN: u32 = 3;
 pub const HOOK_SB_MOUNT: u32 = 4;
 pub const HOOK_SETSOCKOPT: u32 = 5;
 pub const HOOK_SOCKET_CREATE: u32 = 6;
+pub const HOOK_BIND: u32 = 7;
+pub const HOOK_TASK_KILL: u32 = 8;
 
 /// Decision codes: the low half of a `DECISIONS` key. Every gate traces
 /// what its rules decided — allow or would-deny — regardless of mode, so

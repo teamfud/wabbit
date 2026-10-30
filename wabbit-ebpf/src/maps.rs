@@ -59,12 +59,15 @@ pub static TRUSTED_PIDS: HashMap<u32, u32, 1024> = HashMap::new();
 #[btf_map]
 pub static PROTECTED_PATHS: HashMap<u64, u32, 1024> = HashMap::new();
 
-/// Per-cgroup path rules: the allow/deny path profiles
-/// (`wabbit-common/src/cgroup_types.rs`'s `PathProfile`, simplified — see
-/// [`wabbit_common::authorization::PATH_RULE_ALLOW`]). Keyed by
+/// Per-cgroup path rules: the per-operation allow/deny path profiles
+/// (`wabbit-common/src/cgroup_types.rs`'s `PathProfile`, simplified —
+/// see [`wabbit_common::authorization::PATH_RULE_READ_ALLOW`] and its
+/// siblings: one allow and one deny bit for each of read, write, and
+/// exec). Keyed by
 /// [`PathRuleKey`] (the cgroup and the hashed canonical path prefix), the
 /// rule covers the prefix itself and everything below it, resolution is
-/// longest-prefix-wins (see [`crate::lsm::paths::path_rule_denies`]), and
+/// longest-deciding-prefix-wins per operation class (see
+/// [`crate::lsm::paths::path_rule_denies`]), and
 /// a cgroup with no [`Authorization`] entry has no rules at all (the
 /// default allow). A cgroup's *default* — deny-list or allow-list — is the
 /// [`wabbit_common::authorization::FLAG_PATH_RULES_DEFAULT_DENY`] flag on

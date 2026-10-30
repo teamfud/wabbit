@@ -7,10 +7,12 @@
 //!    live under `/sys/fs/bpf`; with the fd-by-ID lookups never granted
 //!    below full trust (the `bpf(2)` gate), closing the pins is what
 //!    makes wabbit's maps — including the trust maps — unreachable.
-//! 2. **opens under a denied path rule** — the cgroup's own per-cgroup
-//!    allow/deny path profile (see [`paths::path_rule_denies`]): a
-//!    policy-defined path, denied for reads and writes alike, with
-//!    longest-prefix-wins resolution.
+//! 2. **opens the cgroup's path rules deny for the open's operation
+//!    class** — the per-cgroup, per-operation (read/write/exec) profile
+//!    (see [`paths::path_rule_denies`] and [`paths::PathOp`]): a rule
+//!    can block writes and exec under a prefix while reads stay open,
+//!    resolution is longest-deciding-prefix-wins per class, and an
+//!    operation no rule decides follows the cgroup default.
 //! 3. **writable opens under the module trees** — the plant-a-`.ko`
 //!    gate, parity with bnuuy's boot gate, lifted by [`ACTION_KMODS`].
 //! 4. **writable opens under protected cgroupfs paths** — the
@@ -23,13 +25,19 @@
 //!
 //! `security_file_open(struct file *file)` runs after `f_mode` is set, so
 //! a writable open is visible through it — a denied `open(2)` instead of a
-//! deferred failure at first `write(2)`. Reading `f_mode` and `f_path`
-//! means reaching into `struct file`, which was reordered mid-series (`see
-//! [`paths::file_layout`]`), so the gate exists as `_modern` and `_legacy`
-//! program variants and the (later) loader tries them in order: the
-//! verifier validates `bpf_d_path`'s argument against the running kernel's
-//! BTF, so the variant with the wrong offsets fails to load loudly and the
-//! kernel itself picks the right one.
+//! deferred failure at first `write(2)`. The same holds for the execve
+//! marker: `do_open_execat` hands `do_filp_open` the open flags
+//! `O_RDONLY | O_LARGEFILE | __FMODE_EXEC` (0x20), which `alloc_empty_file`
+//! → `init_file` copies into `f_flags` before the hook runs — while
+//! `OPEN_FMODE` (which fills `f_mode`) maps only `O_ACCMODE`, and
+//! `VALID_OPEN_FLAGS` excludes 0x20, so `f_flags & 0x20` is a marker no
+//! userspace `open(2)` can counterfeit. Reading `f_mode`, `f_flags`, and
+//! `f_path` means reaching into `struct file`, which was reordered
+//! mid-series (`see [`paths::file_layout`]`), so the gate exists as
+//! `_modern` and `_legacy` program variants and the (later) loader tries
+//! them in order: the verifier validates `bpf_d_path`'s argument against
+//! the running kernel's BTF, so the variant with the wrong offsets fails
+//! to load loudly and the kernel itself picks the right one.
 //!
 //! `file_open` is sleepable on every kernel in the target matrix — the
 //! one path-resolving hook that needs no variant of *loadability*.
@@ -45,11 +53,24 @@ use crate::lsm::{
 /// `FMODE_WRITE`, the `f_mode` bit of a writable open.
 const FMODE_WRITE: u32 = 1 << 1;
 
+/// `__FMODE_EXEC` (0x20), the execve marker `do_open_execat` carries in
+/// the open flags — `f_flags`, never `f_mode` (`OPEN_FMODE` cannot put
+/// it there) and never a userspace-settable bit (`VALID_OPEN_FLAGS`
+/// excludes it). An `f_flags` read that fails cannot tell exec from
+/// read; the open falls to the read class — fail-open, the house rule
+/// for a protection whose failure mode must never be a wedged system.
+const FMODE_EXEC: u32 = 0x20;
+
 /// The gate body, parameterized by the `struct file` layout (see the
 /// module docs). Every decision is closed by [`trust::verdict`], which
 /// applies the observing/enforcing mode.
 #[inline(always)]
-fn file_open_body(ctx: &LsmContext, path_offset: usize, mode_offset: usize) -> i32 {
+fn file_open_body(
+    ctx: &LsmContext,
+    path_offset: usize,
+    mode_offset: usize,
+    flags_offset: usize,
+) -> i32 {
     // LSM_HOOK(int, 0, file_open, struct file *file)
     // The phony retval (index 1) is read exactly once, first — see
     // kmod.rs for the verifier bug that motivates the shape.
@@ -64,6 +85,9 @@ fn file_open_body(ctx: &LsmContext, path_offset: usize, mode_offset: usize) -> i
     let file = ctx.arg::<*mut bindings::file>(0);
     let mode = unsafe {
         bpf_probe_read_kernel((file as *const u8).wrapping_add(mode_offset) as *const u32)
+    };
+    let flags = unsafe {
+        bpf_probe_read_kernel((file as *const u8).wrapping_add(flags_offset) as *const u32)
     };
     // One buffer shared by every path check in this hook (see `paths`).
     let mut buffer = [0u8; paths::PATH_BUFFER_SIZE];
@@ -82,11 +106,21 @@ fn file_open_body(ctx: &LsmContext, path_offset: usize, mode_offset: usize) -> i
         return trust::verdict(trust::HOOK_FILE_OPEN, EPERM);
     }
 
-    // The cgroup's own path rules (per-cgroup allow/deny profiles; see
-    // `paths::path_rule_denies`). Before the writability early-returns:
-    // a path rule denies *opens*, so a denied path is denied for reads
-    // and writes alike.
-    if paths::path_rule_denies(resolved) {
+    // The cgroup's path rules (per-cgroup, per-operation profiles; see
+    // `paths::path_rule_denies`). The open's operation class — exec
+    // first (the kernel's own marker), then writability, then read —
+    // picks the verdict: a rule can deny writes and exec under a
+    // prefix while reads of it stay open. An unreadable `f_mode` or
+    // `f_flags` cannot tell the classes apart, and the open falls to
+    // read — the same fail-open as an unresolvable path.
+    let op = if flags.map_or(false, |flags| flags & FMODE_EXEC != 0) {
+        paths::PathOp::Exec
+    } else if mode.map_or(false, |mode| mode & FMODE_WRITE != 0) {
+        paths::PathOp::Write
+    } else {
+        paths::PathOp::Read
+    };
+    if paths::path_rule_denies(resolved, op) {
         return trust::verdict(trust::HOOK_FILE_OPEN, EPERM);
     }
 
@@ -115,23 +149,27 @@ fn file_open_body(ctx: &LsmContext, path_offset: usize, mode_offset: usize) -> i
 }
 
 /// The cgroupfs gate, for kernels with the modern `struct file` layout
-/// (6.8: `f_mode@20`, `f_path@152`). Tried first by the loader.
+/// (6.8: `f_mode@20`, `f_flags@72`, `f_path@152`). Tried first by the
+/// loader.
 #[lsm(hook = "file_open", sleepable)]
 pub fn file_open_modern(ctx: LsmContext) -> i32 {
     file_open_body(
         &ctx,
         paths::file_layout::MODERN_PATH,
         paths::file_layout::MODERN_MODE,
+        paths::file_layout::MODERN_FLAGS,
     )
 }
 
 /// The cgroupfs gate, for kernels with the legacy `struct file` layout
-/// (5.14–6.1: `f_mode@68`, `f_path@16`). Tried second by the loader.
+/// (5.14–6.1: `f_mode@68`, `f_flags@64`, `f_path@16`). Tried second by
+/// the loader.
 #[lsm(hook = "file_open", sleepable)]
 pub fn file_open_legacy(ctx: LsmContext) -> i32 {
     file_open_body(
         &ctx,
         paths::file_layout::LEGACY_PATH,
         paths::file_layout::LEGACY_MODE,
+        paths::file_layout::LEGACY_FLAGS,
     )
 }

@@ -137,6 +137,15 @@ fn policy_env_line() -> String {
     )
 }
 
+/// The environment line the launch hook exports so wabbit serves IPC
+/// commands on a socket: `<prefix>_IPC_SOCKET=<path>`. Without it
+/// wabbit never listens — the socket is opt-in, and this flag is the
+/// supported way to opt in on a deployed box (the hook is the one
+/// place wabbit's environment comes from).
+fn ipc_env_line(socket: &str) -> String {
+    format!("{}_IPC_SOCKET={}", brand::ENV_PREFIX, socket)
+}
+
 /// The wabbit-initrd artifact, compiled into this installer by its build
 /// script (static musl, complete with its embedded bnuuy object and
 /// wabbit blob) — the installer carries its artifact and needs no
@@ -216,7 +225,7 @@ esac
 /// inherited environment and verifies the file's Ed25519 signature against
 /// the key compiled into the wabbit binary. No policy installed → no env
 /// var → wabbit boots on `Policy::default()` (deny-by-default maps).
-fn launch_hook(policy_installed: bool) -> String {
+fn launch_hook(policy_installed: bool, ipc_socket: Option<&str>) -> String {
     let name = brand::NAME;
     let binary = image_binary();
     let (pidfile_run, pidfile_dev) = pidfiles();
@@ -227,6 +236,10 @@ fn launch_hook(policy_installed: bool) -> String {
     } else {
         String::new()
     };
+    let ipc_env = match ipc_socket {
+        Some(socket) => format!("{} ", ipc_env_line(socket)),
+        None => String::new(),
+    };
     format!(
         r#"#!/bin/sh
 # {name}: launch the initrd protector. This slot runs after /proc, /sys,
@@ -235,9 +248,9 @@ fn launch_hook(policy_installed: bool) -> String {
 # matters: env_logger defaults to error-only.
 {PREREQS_PREAMBLE}
 if command -v setsid >/dev/null 2>&1; then
-    {policy_env}RUST_LOG=info setsid {binary} </dev/null >/dev/console 2>&1 &
+    {policy_env}{ipc_env}RUST_LOG=info setsid {binary} </dev/null >/dev/console 2>&1 &
 else
-    {policy_env}RUST_LOG=info {binary} </dev/null >/dev/console 2>&1 &
+    {policy_env}{ipc_env}RUST_LOG=info {binary} </dev/null >/dev/console 2>&1 &
 fi
 protector_pid=$!
 pidfile={pidfile_run}
@@ -431,6 +444,11 @@ struct Options {
     /// wabbit through the launch hook. `None` → wabbit boots on
     /// `Policy::default()`.
     policy: Option<String>,
+    /// Have the launch hook export `<prefix>_IPC_SOCKET=<path>` so
+    /// wabbit serves signed IPC commands on a socket. `None` → wabbit
+    /// never listens (the socket is opt-in, and the hook is the one
+    /// place wabbit's environment comes from).
+    ipc_socket: Option<String>,
     flavor: Option<Flavor>,
     switch_wait: bool,
     do_lsm: bool,
@@ -456,6 +474,11 @@ usage: {name}-install [options]
                     copy it into the initramfs, and export
                     <prefix>_FILESYSTEM_CONFIGURATION_FILE to wabbit
                     through the launch hook
+  --ipc-socket PATH have wabbit serve signed IPC commands on this Unix
+                    socket (the launch hook exports
+                    <prefix>_IPC_SOCKET=PATH; without it wabbit never
+                    listens). The client lands in /usr/local/bin either
+                    way — {name}-ipc run/policy/send need the socket.
   --flavor NAME     dracut | initramfs-tools (default: autodetect)
   --no-switch-wait  do not install the pre-switch_root wait hook
   --no-lsm          do not add lsm=bpf to the kernel command line
@@ -472,6 +495,7 @@ fn parse_args() -> Options {
         artifact: None,
         client: None,
         policy: None,
+        ipc_socket: None,
         flavor: None,
         switch_wait: true,
         do_lsm: true,
@@ -501,6 +525,17 @@ fn parse_args() -> Options {
                         .next()
                         .unwrap_or_else(|| die("--policy needs a path")),
                 )
+            }
+            "--ipc-socket" => {
+                let socket = arguments
+                    .next()
+                    .unwrap_or_else(|| die("--ipc-socket needs a path"));
+                if !socket.starts_with('/') {
+                    die(
+                        "--ipc-socket needs an absolute path (wabbit runs before / is relative to anything)",
+                    );
+                }
+                options.ipc_socket = Some(socket);
             }
             "--flavor" => {
                 let flavor = arguments
@@ -852,7 +887,7 @@ fn install(options: &Options, flavor: Flavor) {
                 options.dry_run,
                 0o755,
                 &format!("/etc/initramfs-tools/scripts/init-premount/{name}"),
-                &launch_hook(options.policy.is_some()),
+                &launch_hook(options.policy.is_some(), options.ipc_socket.as_deref()),
             );
             if options.switch_wait {
                 write_file(
@@ -870,7 +905,7 @@ fn install(options: &Options, flavor: Flavor) {
                 options.dry_run,
                 0o755,
                 &format!("{module}/launch.sh"),
-                &launch_hook(options.policy.is_some()),
+                &launch_hook(options.policy.is_some(), options.ipc_socket.as_deref()),
             );
             if options.switch_wait {
                 write_file(
@@ -926,6 +961,10 @@ fn install(options: &Options, flavor: Flavor) {
     } else {
         "NOT INSTALLED (no --policy; wabbit boots on Policy::default())".to_string()
     };
+    let ipc_summary = match &options.ipc_socket {
+        Some(socket) => format!("{socket} — {name}-ipc on /usr/local/bin talks to it"),
+        None => "NOT LISTENING (no --ipc-socket; wabbit takes no commands)".to_string(),
+    };
     print!(
         "
 installed via {flavor}:
@@ -936,6 +975,7 @@ installed via {flavor}:
   before
   switch_root:   {switch_summary}
   policy:       {policy_summary}
+  ipc:           {ipc_summary}
 
 takes effect on the next boot. any {name}-initrd failure leaves the {sign_name}
 sign at /run/{sign_name}.bin explaining why — the boot itself continues
@@ -1089,11 +1129,31 @@ mod tests {
     #[test]
     fn the_launch_hook_is_the_documented_recipe() {
         let name = brand::NAME;
-        let hook = launch_hook(false);
+        let hook = launch_hook(false, None);
         assert!(hook.contains(&format!(
             "RUST_LOG=info setsid /{name}-initrd </dev/null >/dev/console 2>&1 &"
         )));
         assert!(hook.contains("/sys/fs/bpf/boot/bpf"));
+    }
+
+    /// `--ipc-socket` reaches wabbit the only way anything can: the
+    /// launch hook's environment, prefixing the same launch line the
+    /// policy env prefixes.
+    #[test]
+    fn the_ipc_socket_is_exported_through_the_hook() {
+        let hook = launch_hook(false, Some("/run/wabbit/wabbit.sock"));
+        assert!(hook.contains(&format!(
+            "{}_IPC_SOCKET=/run/wabbit/wabbit.sock ",
+            brand::ENV_PREFIX
+        )));
+        // …on the launch line itself, before RUST_LOG, so wabbit is
+        // born with it.
+        assert!(hook.contains(&format!(
+            "{}_IPC_SOCKET=/run/wabbit/wabbit.sock RUST_LOG=info",
+            brand::ENV_PREFIX
+        )));
+        // And without the flag, nothing socket-shaped leaks in.
+        assert!(!launch_hook(false, None).contains("IPC_SOCKET"));
     }
 
     /// With a policy installed, the launch hook exports the env var wabbit
@@ -1102,13 +1162,13 @@ mod tests {
     /// the boot step instead.
     #[test]
     fn the_launch_hook_exports_the_policy_only_when_installed() {
-        let with_policy = launch_hook(true);
+        let with_policy = launch_hook(true, None);
         assert!(
             with_policy.contains(&policy_env_line()),
             "the installed hook must export {}",
             policy_env_line()
         );
-        let without_policy = launch_hook(false);
+        let without_policy = launch_hook(false, None);
         assert!(
             !without_policy.contains("FILESYSTEM_CONFIGURATION_FILE"),
             "a policy-less install must not export the policy env var"
@@ -1143,7 +1203,7 @@ mod tests {
     /// pin wait — an unprotected boot beats a frozen one.
     #[test]
     fn the_launch_hook_fails_open() {
-        let hook = launch_hook(false);
+        let hook = launch_hook(false, None);
         assert!(
             hook.contains("if command -v setsid >/dev/null 2>&1; then"),
             "the launch must fall back to a plain background launch"
@@ -1193,7 +1253,7 @@ mod tests {
     #[test]
     fn the_hooks_carry_the_brand() {
         let name = brand::NAME;
-        assert!(launch_hook(false).contains(&format!("/{name}-initrd")));
+        assert!(launch_hook(false, None).contains(&format!("/{name}-initrd")));
         assert!(initramfs_tools_build_hook().contains(&system_binary()));
         assert!(dracut_module_dir().contains(&format!("90{name}")));
         assert!(system_binary().contains(&format!("/usr/lib/{name}/{name}")));
@@ -1210,7 +1270,7 @@ mod tests {
     #[test]
     fn the_hooks_answer_the_prereqs_invocation() {
         for (hook, body) in [
-            (launch_hook(false), "RUST_LOG=info setsid"),
+            (launch_hook(false, None), "RUST_LOG=info setsid"),
             (switch_wait_hook(), "for pidfile in"),
         ] {
             let guard = hook
@@ -1302,6 +1362,7 @@ mod tests {
             artifact: None,
             client: None,
             policy: None,
+            ipc_socket: None,
             flavor: Some(Flavor::InitramfsTools),
             switch_wait: true,
             do_lsm: false,

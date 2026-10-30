@@ -150,17 +150,30 @@ impl FrozenWorld {
     /// not stop them, so starting them again is not our call.
     pub fn resume(&mut self) -> Result<()> {
         info!("resuming the world: {} processes", self.stopped.len());
-        self.resume_stopped()?;
+        self.resume_stopped();
         self.resumed = true;
         Ok(())
     }
 
-    fn resume_stopped(&self) -> Result<()> {
+    /// Send `SIGCONT` to every stopped process, **best-effort per pid**:
+    /// a single unthawable pid — a task exiting as the sweep reaches it
+    /// (the kernel's dying-task session rule denies it), anything an
+    /// LSM declines, a pid that died mid-sweep — must not fail the boot
+    /// for every other process (measured: rocky 9 denied one pid of
+    /// twenty-four with `EPERM`, and the strict sweep turned a thawed
+    /// boot into a failed one). The watchdog already sweeps exactly this
+    /// way; the resume owes every *other* process its thaw.
+    fn resume_stopped(&self) {
         for pid in &self.stopped {
             debug!("sending SIGCONT to pid {pid}");
-            send(*pid, Signal::CONT)?;
+            match kill_process(*pid, Signal::CONT) {
+                // Already gone: stopped for good, no SIGCONT needed.
+                Ok(()) | Err(Errno::SRCH) => {}
+                Err(error) => {
+                    warn!("cannot SIGCONT pid {pid}: {error}; continuing the sweep");
+                }
+            }
         }
-        Ok(())
     }
 
     /// How many processes this world holds, for the sign's records.
@@ -226,9 +239,7 @@ impl Drop for FrozenWorld {
              resuming {} processes",
             self.stopped.len()
         );
-        if let Err(error) = self.resume_stopped() {
-            warn!("resuming the dropped world failed: {error:#}");
-        }
+        self.resume_stopped();
     }
 }
 

@@ -14,6 +14,8 @@
 //! | [`cgroupfs`] | `file_open` | yes — in every matrix kernel's sleepable set | `struct file` was reordered: `_modern`/`_legacy` variants, kernel BTF picks |
 //! | [`mount`] | `sb_mount` | yes — in every matrix kernel's sleepable set | `path` is arg 1, retval arg 5, stable through 6.8 |
 //! | [`firewall`] | `socket_setsockopt`, `socket_create` | needs no sleepable set (no `d_path`) | both hooks stable 5.14→6.8; legacy xtables `setsockopt` and the nftables nfnetlink socket — the two rule paths |
+//! | [`net`] | `socket_create`, `socket_bind` | needs no sleepable set (no `d_path`) | both hooks stable 5.14→6.8; `socket_create`'s scalar arguments key raw capture (`AF_PACKET`, `SOCK_RAW`), `socket_bind` reads only the sockaddr's uapi `sa_family` |
+//! | [`signals`] | `task_kill` | needs no sleepable set (no `d_path`) | arg 0's *identity* alone: raw ctx-slot bits vs `bpf_get_current_task()` (an integer helper), both scalars — the verifier prohibits pointer comparisons, and the target's cgroup would need the `task_struct` walks this design forbids. Self-signals and `SIGCONT` (the thaw channel every rescue broadcasts) always exempt |
 //!
 //! The distinction matters: a path-resolving gate (`bpf_d_path`) can only
 //! load where its hook is in the kernel's `sleepable_lsm_hooks` set, and
@@ -54,11 +56,17 @@
 //!   walks this design forbids), so the userspace writes a rule per
 //!   cgroup; it knows the tree because it creates the authorized
 //!   children.
-//! * **signals (`kill(2)`) to wabbit's processes** — the target task's
-//!   cgroup cannot be read without deep `task_struct` walks (the exact
-//!   class of unstable offsets this crate refuses); the cgroupfs walls
-//!   (`cgroup.procs`, `cgroup.freeze`, `cgroup.kill`) cover the
-//!   cgroup-level kill path, direct PID signals are residual.
+//! * **signals (`kill(2)`) toward wabbit's processes** — the
+//!   [`signals`] gate denies every cross-task signal without
+//!   [`crate::maps::AUTHORIZATIONS`]' `signal` bit (self-signals
+//!   exempt), so wabbit is killable only by cgroups the policy granted
+//!   the bit — the same signer-owned trade every bit here carries. The
+//!   *cgroup* distinction the sketch wanted (same- vs cross-cgroup
+//!   targets) remains out of reach: the target's cgroup cannot be read
+//!   without deep `task_struct` walks (the exact class of unstable
+//!   offsets this crate refuses); the cgroupfs walls
+//!   (`cgroup.procs`, `cgroup.freeze`, `cgroup.kill`) still cover the
+//!   cgroup-level kill path.
 //! * **`file_permission`** — not sleepable anywhere in the matrix; a
 //!   write-by-write gate cannot resolve a path, and the open-time
 //!   `f_mode` gate covers the writable-open case.
@@ -68,5 +76,7 @@ pub mod cgroupfs;
 pub mod firewall;
 pub mod kmod;
 pub mod mount;
+pub mod net;
 pub mod paths;
+pub mod signals;
 pub mod trust;

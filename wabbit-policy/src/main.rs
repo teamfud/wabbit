@@ -11,6 +11,7 @@
 //! rejected with names, before anything enforces it.
 
 use std::{
+    collections::BTreeMap,
     fs,
     io::Write as _,
     path::{Path, PathBuf},
@@ -22,7 +23,8 @@ use ed25519_dalek::SigningKey;
 use wabbit_policy::{
     PRIVATE_KEY_SIZE, Policy,
     authorization::{
-        AuthorizationConfig, AuthorizationEntry, MAX_PATH_RULES, PathRule, PathRuleVerdict,
+        AuthorizationConfig, AuthorizationEntry, MAX_PATH_RULES, OpVerdict, PathRule,
+        PathRuleVerdict,
     },
     rootfs::{PathFlags, PathOverride, RootFSConfig, RootFlags},
     sign,
@@ -53,6 +55,12 @@ enum ActionName {
     CgroupfsWrite,
     #[value(name = "firewall")]
     Firewall,
+    #[value(name = "raw-capture")]
+    RawCapture,
+    #[value(name = "bind-net")]
+    BindNet,
+    #[value(name = "signal")]
+    Signal,
 }
 
 impl ActionName {
@@ -70,6 +78,9 @@ impl ActionName {
             Self::Kmods => auth::ACTION_KMODS,
             Self::CgroupfsWrite => auth::ACTION_CGROUPFS_WRITE,
             Self::Firewall => auth::ACTION_FIREWALL,
+            Self::RawCapture => auth::ACTION_RAW_CAPTURE,
+            Self::BindNet => auth::ACTION_BIND_NET,
+            Self::Signal => auth::ACTION_SIGNAL_OTHERS,
         }
     }
 
@@ -87,6 +98,9 @@ impl ActionName {
             auth::ACTION_KMODS => Self::Kmods,
             auth::ACTION_CGROUPFS_WRITE => Self::CgroupfsWrite,
             auth::ACTION_FIREWALL => Self::Firewall,
+            auth::ACTION_RAW_CAPTURE => Self::RawCapture,
+            auth::ACTION_BIND_NET => Self::BindNet,
+            auth::ACTION_SIGNAL_OTHERS => Self::Signal,
             _ => return None,
         })
     }
@@ -108,6 +122,9 @@ impl ActionName {
             Self::Kmods => "kmods",
             Self::CgroupfsWrite => "cgroupfs-write",
             Self::Firewall => "firewall",
+            Self::RawCapture => "raw-capture",
+            Self::BindNet => "bind-net",
+            Self::Signal => "signal",
         }
     }
 }
@@ -120,6 +137,11 @@ impl ActionName {
 #[serde(deny_unknown_fields)]
 struct PolicyToml {
     rootfs: Option<RootFSToml>,
+    /// Class definitions: named, reusable authorization settings.
+    /// **Authoring sugar only** — the compile step below folds them
+    /// away, and the signed format carries no class concept (see
+    /// [`ClassToml`]).
+    class: Option<Vec<ClassToml>>,
     authorization: Option<Vec<AuthorizationToml>>,
 }
 
@@ -154,11 +176,89 @@ struct OverrideToml {
     inner_path: Option<PathBuf>,
 }
 
+/// A **class**: named, reusable authorization settings, defined once
+/// and inherited by any number of cgroup entries — and, when it names a
+/// cgroup, compiled into an entry of its own that a signed run command
+/// can execute under.
+///
+/// This is the policy crate's whole understanding of classes, and it
+/// ends at `wabbit-policy build`: the compile step ([`compile_classes`])
+/// folds every class into ordinary cgroup rules, and the signed WSPF
+/// format — and wabbit itself — never sees one. What survives the
+/// compile is a **convention**: a concrete class `shell` on a wabbit
+/// whose cgroup is `/sys/fs/cgroup/wabbit` becomes the entry
+/// `/sys/fs/cgroup/wabbit/class/shell`, because that is the path a
+/// class-naming run command resolves at runtime
+/// (`wabbit_common::cgroup_types` documents the convention both sides
+/// share).
+///
+/// ```toml
+/// # a concrete class: runs may name it, so it compiles to an entry
+/// [[class]]
+/// name = "shell"
+/// cgroup = "/sys/fs/cgroup/wabbit"   # the class entry lands at
+///                                    # <cgroup>/class/<name>
+/// actions = ["exec", "credentials"]
+/// default_deny = true                # allow-list: unruled opens deny
+/// protect = true                     # the migration wall applies
+/// [[class.path_rules]]
+/// prefix = "/usr"
+/// verdict = "allow"
+///
+/// # an abstract class: settings other entries inherit, no entry of
+/// # its own — nothing a run could name
+/// [[class]]
+/// name = "systemd-base"
+/// actions = ["bpf-attach"]
+///
+/// # an entry inheriting the class: settings merge by union — an entry
+/// # adds to its class, never subtracts
+/// [[authorization]]
+/// cgroup = "/sys/fs/cgroup/init.scope"
+/// class = "systemd-base"
+/// ```
+#[derive(serde::Deserialize, serde::Serialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct ClassToml {
+    /// The class's name — what a signed run command will ask for. The
+    /// charset is a security boundary (the runtime builds a cgroupfs
+    /// path from it): `[a-z0-9-]`, no leading or trailing `-`.
+    name: String,
+    /// The wabbit cgroup whose subtree the class compiles into; the
+    /// class's own entry lands at `<cgroup>/class/<name>` — the
+    /// convention a class-naming run resolves. Omitted for an
+    /// **abstract** class: reusable settings, no entry, nothing a run
+    /// could name.
+    #[serde(default)]
+    cgroup: Option<PathBuf>,
+    /// Action names, as [`ActionName`] spells them.
+    #[serde(default)]
+    actions: Vec<ActionName>,
+    /// Whether unruled paths are denied (allow-list) or allowed
+    /// (deny-list) — same meaning as on an authorization entry.
+    #[serde(default)]
+    default_deny: bool,
+    /// The migration wall, as on an authorization entry: `true` walls
+    /// this cgroup even bitless, `false` **opts out** of the wall its
+    /// bits would give it (the `init.scope` bootstrap), absent = the
+    /// default (bit-holding cgroups are walled). Same union rule as
+    /// every class setting: an entry may add, never subtract.
+    #[serde(default)]
+    protect: Option<bool>,
+    #[serde(default)]
+    path_rules: Vec<PathRuleToml>,
+}
+
 #[derive(serde::Deserialize, serde::Serialize, Debug)]
 #[serde(deny_unknown_fields)]
 struct AuthorizationToml {
     /// The canonical cgroupfs path of the cgroup this entry authorizes.
     cgroup: PathBuf,
+    /// The class this entry inherits: settings merge by **union** —
+    /// actions join, flags OR, path rules append — so an entry may add
+    /// to its class but never subtract from it.
+    #[serde(default)]
+    class: Option<String>,
     /// Action names, as [`ActionName`] spells them.
     #[serde(default)]
     actions: Vec<ActionName>,
@@ -166,16 +266,53 @@ struct AuthorizationToml {
     /// (deny-list) for this cgroup.
     #[serde(default)]
     default_deny: bool,
+    /// The migration wall (`cgroup.procs`/`freeze`/`kill`): `true`
+    /// walls this cgroup even if it holds no action bits; `false`
+    /// **opts out** of the wall bit-holding cgroups get automatically —
+    /// for the one cgroup that must accept migration from outside:
+    /// PID 1 bootstraps into `init.scope` before any authorization can
+    /// apply, so a walled `init.scope` would refuse its own PID 1 and
+    /// kill the boot. Absent = the default (bit-holders are walled).
+    #[serde(default)]
+    protect: Option<bool>,
     #[serde(default)]
     path_rules: Vec<PathRuleToml>,
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Debug)]
+/// A path rule as authored: `prefix` plus per-operation verdicts. The
+/// operations are the three classes `file_open` can see on an open —
+/// read (any open), write (a writable open), exec (an execve open) —
+/// each `allow` or `deny`, each optional:
+///
+/// ```toml
+/// [[authorization.path_rules]]
+/// prefix  = "/var/www"
+/// verdict = "allow"        # the shorthand: all three at once
+/// write   = "deny"         # overrides the shorthand's write
+/// exec    = "deny"         # …and its exec — reads alone stay open
+/// ```
+///
+/// The shorthand `verdict` and the per-operation keys union (a
+/// per-operation key wins for its operation), and an operation no rule
+/// decides falls through: to the next shallower rule that decides it,
+/// and past every rule to the cgroup default (`default_deny`).
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct PathRuleToml {
     prefix: PathBuf,
-    /// `allow` or `deny`.
-    verdict: VerdictName,
+    /// The all-operations shorthand: `allow` or `deny` for read, write,
+    /// and exec at once.
+    #[serde(default)]
+    verdict: Option<VerdictName>,
+    /// `allow` or `deny` for any open of this prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    read: Option<VerdictName>,
+    /// `allow` or `deny` for writable opens under this prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    write: Option<VerdictName>,
+    /// `allow` or `deny` for execve opens under this prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exec: Option<VerdictName>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum, serde::Deserialize, serde::Serialize)]
@@ -187,16 +324,71 @@ enum VerdictName {
     Deny,
 }
 
+impl VerdictName {
+    /// The wire verdict of this name.
+    const fn op(self) -> OpVerdict {
+        match self {
+            Self::Allow => OpVerdict::Allow,
+            Self::Deny => OpVerdict::Deny,
+        }
+    }
+
+    /// The name of this operation verdict, if it has one (an unspecified
+    /// operation serializes as an omitted key).
+    const fn of_op(op: OpVerdict) -> Option<Self> {
+        match op {
+            OpVerdict::Allow => Some(Self::Allow),
+            OpVerdict::Deny => Some(Self::Deny),
+            OpVerdict::Unspecified => None,
+        }
+    }
+}
+
+/// One authored rule's verdict: the shorthand, then whichever
+/// per-operation keys override it.
+fn toml_rule_verdict(rule: &PathRuleToml) -> PathRuleVerdict {
+    let mut verdict = PathRuleVerdict::default();
+    if let Some(shorthand) = rule.verdict {
+        verdict.read = shorthand.op();
+        verdict.write = shorthand.op();
+        verdict.exec = shorthand.op();
+    }
+    let merge = |slot: &mut OpVerdict, name: Option<VerdictName>| {
+        if let Some(name) = name {
+            *slot = name.op();
+        }
+    };
+    merge(&mut verdict.read, rule.read);
+    merge(&mut verdict.write, rule.write);
+    merge(&mut verdict.exec, rule.exec);
+    verdict
+}
+
+/// One wire verdict back to its authored spelling: three agreeing
+/// operations are the shorthand and nothing else; anything else is
+/// spelled per operation.
+fn rule_toml(prefix: PathBuf, verdict: PathRuleVerdict) -> PathRuleToml {
+    if verdict.read == verdict.write && verdict.write == verdict.exec {
+        return PathRuleToml {
+            prefix,
+            verdict: VerdictName::of_op(verdict.read),
+            read: None,
+            write: None,
+            exec: None,
+        };
+    }
+    PathRuleToml {
+        prefix,
+        verdict: None,
+        read: VerdictName::of_op(verdict.read),
+        write: VerdictName::of_op(verdict.write),
+        exec: VerdictName::of_op(verdict.exec),
+    }
+}
+
 impl From<&PathRule> for PathRuleToml {
     fn from(rule: &PathRule) -> Self {
-        Self {
-            prefix: rule.prefix.clone(),
-            verdict: if rule.verdict.deny() {
-                VerdictName::Deny
-            } else {
-                VerdictName::Allow
-            },
-        }
+        rule_toml(rule.prefix.clone(), rule.verdict)
     }
 }
 
@@ -215,9 +407,17 @@ impl TryFrom<&AuthorizationEntry> for AuthorizationToml {
         }
         Ok(Self {
             cgroup: entry.cgroup.clone(),
+            class: None,
             actions,
             default_deny: entry.flags & wabbit_common::authorization::FLAG_PATH_RULES_DEFAULT_DENY
                 != 0,
+            protect: if entry.flags & wabbit_common::authorization::FLAG_PROTECT != 0 {
+                Some(true)
+            } else if entry.flags & wabbit_common::authorization::FLAG_UNPROTECTED != 0 {
+                Some(false)
+            } else {
+                None
+            },
             path_rules: entry.path_rules.iter().map(PathRuleToml::from).collect(),
         })
     }
@@ -225,10 +425,212 @@ impl TryFrom<&AuthorizationEntry> for AuthorizationToml {
 
 // ------------------------------------------------------------ conversions
 
+/// One class after authoring validation: the settings referencing
+/// entries inherit, plus (for a concrete class) the cgroup its own
+/// compiled entry lands at.
+#[derive(Debug)]
+struct CompiledClass {
+    actions: Vec<ActionName>,
+    default_deny: bool,
+    protect: Option<bool>,
+    path_rules: Vec<PathRuleToml>,
+    /// `Some(path)` for a concrete class: the entry a class-naming run
+    /// command resolves at runtime (`<cgroup>/class/<name>`). `None`
+    /// for an abstract class.
+    entry_cgroup: Option<PathBuf>,
+}
+
+/// Validate every class definition and pre-compute its compiled shape.
+/// The one place the class feature exists — everything downstream sees
+/// only cgroup rules.
+fn compile_classes(sources: &[ClassToml]) -> Result<BTreeMap<String, CompiledClass>, String> {
+    use wabbit_common::cgroup_types::{CLASS_NAME_MAX_BYTES, CLASS_SEGMENT, valid_class_name};
+
+    let mut classes = BTreeMap::new();
+    for source in sources {
+        if !valid_class_name(&source.name) {
+            return Err(format!(
+                "class name {:?} is not valid: 1-{CLASS_NAME_MAX_BYTES} bytes of [a-z0-9-], \
+                 no leading or trailing '-'",
+                source.name
+            ));
+        }
+        // The class's own entry, when it has one: `<cgroup>/class/<name>`
+        // — the convention the runtime resolves, spelled here so the
+        // generator can hold it to the same walk-cap contract every
+        // protected path must fit.
+        let entry_cgroup = match &source.cgroup {
+            None => None,
+            Some(base) => {
+                let base = base
+                    .to_str()
+                    .ok_or_else(|| format!("class {:?}: the cgroup is not UTF-8", source.name))?;
+                let path = format!("{base}/{CLASS_SEGMENT}/{}", source.name);
+                let cap = wabbit_common::authorization::PATH_WALK_CAP;
+                if path.len() > cap {
+                    return Err(format!(
+                        "class {:?} compiles to {path:?}, past the {cap}-byte eBPF walk cap — \
+                         a protection prefix walk could never reach it, so it could never be \
+                         walled",
+                        source.name
+                    ));
+                }
+                Some(PathBuf::from(path))
+            }
+        };
+        if classes
+            .insert(
+                source.name.clone(),
+                CompiledClass {
+                    actions: source.actions.clone(),
+                    default_deny: source.default_deny,
+                    protect: source.protect,
+                    path_rules: source.path_rules.clone(),
+                    entry_cgroup,
+                },
+            )
+            .is_some()
+        {
+            return Err(format!("class {:?} is defined twice", source.name));
+        }
+    }
+    Ok(classes)
+}
+
+/// Fold an entry's class reference into the entry: union semantics —
+/// actions join, flags OR, path rules append — so an entry may **add**
+/// to its class but never subtract (a class is the floor its entries
+/// stand on, and the merge is the one place that has to stay obvious).
+fn expand_class(
+    entry: AuthorizationToml,
+    classes: &BTreeMap<String, CompiledClass>,
+) -> Result<AuthorizationToml, String> {
+    let Some(class_name) = entry.class.clone() else {
+        return Ok(entry);
+    };
+    let class = classes.get(&class_name).ok_or_else(|| {
+        format!(
+            "entry {:?} references unknown class {class_name:?}",
+            entry.cgroup
+        )
+    })?;
+    let mut actions = class.actions.clone();
+    for action in entry.actions {
+        if !actions.contains(&action) {
+            actions.push(action);
+        }
+    }
+    let mut path_rules = class.path_rules.clone();
+    for rule in entry.path_rules {
+        // A class rule and an entry rule for one prefix merge by union,
+        // per operation: an entry may add to its class's rule (an
+        // operation the class left unspecified) but never change one
+        // the class decided — the same never-subtract rule as every
+        // other class setting.
+        let Some(existing) = path_rules
+            .iter_mut()
+            .find(|other| other.prefix == rule.prefix)
+        else {
+            path_rules.push(rule);
+            continue;
+        };
+        let class_verdict = toml_rule_verdict(existing);
+        let entry_verdict = toml_rule_verdict(&rule);
+        for (class_op, entry_op) in [
+            (class_verdict.read, entry_verdict.read),
+            (class_verdict.write, entry_verdict.write),
+            (class_verdict.exec, entry_verdict.exec),
+        ] {
+            // A disagreement is two *decided* operations that decided
+            // differently; an unspecified side adds or changes nothing.
+            if class_op != OpVerdict::Unspecified
+                && entry_op != OpVerdict::Unspecified
+                && class_op != entry_op
+            {
+                return Err(format!(
+                    "entry {:?} disagrees with class {class_name:?} about the rule for {}",
+                    entry.cgroup,
+                    rule.prefix.display()
+                ));
+            }
+        }
+        let pick = |class_op, entry_op| {
+            if entry_op == OpVerdict::Unspecified {
+                class_op
+            } else {
+                entry_op
+            }
+        };
+        *existing = rule_toml(
+            rule.prefix,
+            PathRuleVerdict {
+                read: pick(class_verdict.read, entry_verdict.read),
+                write: pick(class_verdict.write, entry_verdict.write),
+                exec: pick(class_verdict.exec, entry_verdict.exec),
+            },
+        );
+    }
+    Ok(AuthorizationToml {
+        cgroup: entry.cgroup,
+        class: None,
+        actions,
+        default_deny: entry.default_deny || class.default_deny,
+        // The union of the walls — and never subtract: an entry may
+        // raise its class's wall, not lower it. `Some(true)` from
+        // either wins; short of that, an explicit `Some(false)`
+        // (the opt-out) carries; absent stays absent.
+        protect: match (entry.protect, class.protect) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            (None, None) => None,
+        },
+        path_rules,
+    })
+}
+
+/// One TOML authorization entry to its wire shape.
+fn entry_to_wire(entry: AuthorizationToml) -> AuthorizationEntry {
+    let mut flags = 0;
+    if entry.default_deny {
+        flags |= wabbit_common::authorization::FLAG_PATH_RULES_DEFAULT_DENY;
+    }
+    match entry.protect {
+        Some(true) => flags |= wabbit_common::authorization::FLAG_PROTECT,
+        Some(false) => flags |= wabbit_common::authorization::FLAG_UNPROTECTED,
+        None => {}
+    }
+    AuthorizationEntry {
+        cgroup: entry.cgroup,
+        action_mask: entry
+            .actions
+            .iter()
+            .map(|name| name.bit())
+            .fold(0, |mask, bit| mask | bit),
+        flags,
+        path_rules: entry
+            .path_rules
+            .into_iter()
+            .map(|rule| {
+                let verdict = toml_rule_verdict(&rule);
+                PathRule {
+                    prefix: rule.prefix,
+                    verdict,
+                }
+            })
+            .collect(),
+    }
+}
+
 impl TryFrom<PolicyToml> for Policy {
     type Error = String;
 
     fn try_from(source: PolicyToml) -> Result<Self, Self::Error> {
+        // Classes first: every authoring reference resolves here, and
+        // the compile is the one place the feature exists. After it,
+        // only cgroup rules remain — the signed format and the loader
+        // never see a class.
+        let classes = compile_classes(source.class.as_deref().unwrap_or(&[]))?;
+
         let rootfs = source.rootfs.map(|rootfs| RootFSConfig {
             flags: RootFlags::new(rootfs.executable, rootfs.writable),
             overrides: rootfs
@@ -249,35 +651,39 @@ impl TryFrom<PolicyToml> for Policy {
                 })
                 .collect(),
         });
-        let authorization = source.authorization.map(|entries| AuthorizationConfig {
-            entries: entries
-                .into_iter()
-                .map(|entry| AuthorizationEntry {
-                    cgroup: entry.cgroup,
-                    action_mask: entry
-                        .actions
-                        .iter()
-                        .map(|name| name.bit())
-                        .fold(0, |mask, bit| mask | bit),
-                    flags: if entry.default_deny {
-                        wabbit_common::authorization::FLAG_PATH_RULES_DEFAULT_DENY
-                    } else {
-                        0
-                    },
-                    path_rules: entry
-                        .path_rules
-                        .into_iter()
-                        .map(|rule| PathRule {
-                            prefix: rule.prefix,
-                            verdict: PathRuleVerdict::new(matches!(
-                                rule.verdict,
-                                VerdictName::Deny
-                            )),
-                        })
-                        .collect(),
+        let authorization = {
+            // Plain entries first, their class references resolved; then
+            // each concrete class compiles to its own entry — the cgroup
+            // a class-naming run resolves at runtime. A policy may carry
+            // classes and no plain entries at all, so the class entries
+            // append to (possibly) nothing.
+            let mut entries: Vec<AuthorizationToml> = match source.authorization {
+                None => Vec::new(),
+                Some(plain) => plain
+                    .into_iter()
+                    .map(|entry| expand_class(entry, &classes))
+                    .collect::<Result<Vec<_>, _>>()?,
+            };
+            for class in classes.values() {
+                if let Some(cgroup) = &class.entry_cgroup {
+                    entries.push(AuthorizationToml {
+                        cgroup: cgroup.clone(),
+                        class: None,
+                        actions: class.actions.clone(),
+                        default_deny: class.default_deny,
+                        protect: class.protect,
+                        path_rules: class.path_rules.clone(),
+                    });
+                }
+            }
+            if entries.is_empty() {
+                None
+            } else {
+                Some(AuthorizationConfig {
+                    entries: entries.into_iter().map(entry_to_wire).collect(),
                 })
-                .collect(),
-        });
+            }
+        };
         let policy = Self {
             rootfs,
             authorization,
@@ -323,8 +729,11 @@ impl TryFrom<&Policy> for PolicyToml {
                     .collect::<Result<Vec<_>, _>>()?,
             ),
         };
+        // Classes do not survive the compile: the decoded policy holds
+        // only the cgroup rules they became.
         Ok(Self {
             rootfs,
+            class: None,
             authorization,
         })
     }
@@ -452,6 +861,9 @@ fn build(source_path: &Path, output: &Path, key: &Path, key_id: u8) -> Result<()
         .with_context(|| format!("reading {}", source_path.display()))?;
     let source: PolicyToml =
         toml::from_str(&text).with_context(|| format!("parsing {}", source_path.display()))?;
+    // For the build report: classes exist only here, so count them
+    // before the compile folds them away.
+    let source_class_count = source.class.as_ref().map(|classes| classes.len());
     let policy = Policy::try_from(source)
         .map_err(|error| anyhow::anyhow!("{}: {error}", source_path.display()))?;
     if let Some(authorization) = &policy.authorization {
@@ -473,11 +885,24 @@ fn build(source_path: &Path, output: &Path, key: &Path, key_id: u8) -> Result<()
     let mut file =
         fs::File::create_new(output).with_context(|| format!("creating {}", output.display()))?;
     file.write_all(&bytes)?;
+    let classes = source_class_count.unwrap_or(0);
     println!(
         "built {} ({} bytes, key id {key_id})",
         output.display(),
         bytes.len()
     );
+    if classes > 0 {
+        let entries = policy
+            .authorization
+            .as_ref()
+            .map(|config| config.entries.len())
+            .unwrap_or(0);
+        println!(
+            "compiled {classes} class{} away into {entries} cgroup rule{}",
+            if classes == 1 { "" } else { "es" },
+            if entries == 1 { "" } else { "s" },
+        );
+    }
     Ok(())
 }
 
@@ -517,6 +942,9 @@ mod tests {
             (ACTION_KMODS, "kmods"),
             (ACTION_CGROUPFS_WRITE, "cgroupfs-write"),
             (ACTION_FIREWALL, "firewall"),
+            (ACTION_RAW_CAPTURE, "raw-capture"),
+            (ACTION_BIND_NET, "bind-net"),
+            (ACTION_SIGNAL_OTHERS, "signal"),
         ] {
             let parsed = ActionName::from_bit(bit).expect("known action bit");
             assert_eq!(parsed.bit(), bit, "the {name} bit");
@@ -530,13 +958,19 @@ mod tests {
         let source = PolicyToml {
             authorization: Some(vec![AuthorizationToml {
                 cgroup: "/sys/fs/cgroup/wabbit".into(),
+                class: None,
                 actions: vec![ActionName::Mount, ActionName::Kmods],
                 default_deny: true,
+                protect: None,
                 path_rules: vec![PathRuleToml {
                     prefix: "/etc/ssh".into(),
-                    verdict: VerdictName::Allow,
+                    verdict: Some(VerdictName::Allow),
+                    read: None,
+                    write: None,
+                    exec: None,
                 }],
             }]),
+            class: None,
             rootfs: None,
         };
         let policy = Policy::try_from(
@@ -548,5 +982,447 @@ mod tests {
             toml::to_string_pretty(&source).unwrap(),
             toml::to_string_pretty(&back).unwrap()
         );
+    }
+
+    /// The authored shape of a classed policy, as TOML text, for the
+    /// compile tests below.
+    fn classed_source_toml() -> String {
+        r#"
+[[class]]
+name = "shell"
+cgroup = "/sys/fs/cgroup/wabbit"
+actions = ["exec", "credentials"]
+default_deny = true
+protect = true
+
+[[class.path_rules]]
+prefix = "/usr"
+verdict = "allow"
+
+[[class]]
+name = "ultra-privileged"
+cgroup = "/sys/fs/cgroup/wabbit"
+actions = ["mount", "kmods", "bpf-attach", "cgroupfs-write", "firewall"]
+
+[[class]]
+name = "systemd-base"
+actions = ["bpf-attach"]
+
+[[authorization]]
+cgroup = "/sys/fs/cgroup/init.scope"
+class = "systemd-base"
+actions = ["kmods"]
+
+[[authorization]]
+cgroup = "/sys/fs/cgroup/wabbit"
+actions = ["mount"]
+default_deny = false
+"#
+        .to_string()
+    }
+
+    fn parse(text: &str) -> Result<Policy, String> {
+        let source: PolicyToml = toml::from_str(text).unwrap();
+        Policy::try_from(source)
+    }
+
+    /// The core promise: after the compile, only cgroup rules remain —
+    /// a concrete class is an entry at the runtime convention path, and
+    /// a classed entry carries the union of its class and itself.
+    #[test]
+    fn classes_compile_away_into_cgroup_rules() {
+        let policy = parse(&classed_source_toml()).unwrap();
+        let config = policy.authorization.as_ref().unwrap();
+
+        // The concrete classes became entries at the convention path
+        // `<wabbit-cgroup>/class/<name>` — the path a class-naming run
+        // resolves at runtime.
+        let shell = config
+            .entries
+            .iter()
+            .find(|entry| entry.cgroup == Path::new("/sys/fs/cgroup/wabbit/class/shell"))
+            .expect("the shell class compiled to an entry");
+        use wabbit_common::authorization as auth;
+        assert_eq!(
+            shell.action_mask,
+            auth::ACTION_EXEC | auth::ACTION_CREDENTIALS
+        );
+        assert_eq!(
+            shell.flags,
+            auth::FLAG_PATH_RULES_DEFAULT_DENY | auth::FLAG_PROTECT
+        );
+        assert_eq!(shell.path_rules.len(), 1);
+        assert_eq!(shell.path_rules[0].prefix, Path::new("/usr"));
+
+        let ultra = config
+            .entries
+            .iter()
+            .find(|entry| entry.cgroup == Path::new("/sys/fs/cgroup/wabbit/class/ultra-privileged"))
+            .expect("the ultra-privileged class compiled to an entry");
+        assert_eq!(
+            ultra.action_mask,
+            auth::ACTION_MOUNT
+                | auth::ACTION_KMODS
+                | auth::ACTION_BPF_ATTACH
+                | auth::ACTION_CGROUPFS_WRITE
+                | auth::ACTION_FIREWALL
+        );
+
+        // The abstract class compiled to nothing of its own…
+        assert!(
+            !config.entries.iter().any(|entry| entry
+                .cgroup
+                .to_str()
+                .unwrap()
+                .contains("systemd-base"))
+        );
+
+        // …and the classed entry carries the union: the class's
+        // bpf-attach plus its own kmods — added, never subtracted.
+        let init_scope = config
+            .entries
+            .iter()
+            .find(|entry| entry.cgroup == Path::new("/sys/fs/cgroup/init.scope"))
+            .expect("the classed entry survived");
+        assert_eq!(
+            init_scope.action_mask,
+            auth::ACTION_BPF_ATTACH | auth::ACTION_KMODS
+        );
+
+        // The whole section still validates, and inspect decodes it as
+        // plain entries — no class concept survives the compile.
+        config.validate().unwrap();
+        let inspected = PolicyToml::try_from(&policy).unwrap();
+        assert!(inspected.class.is_none());
+        assert!(
+            inspected
+                .authorization
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|entry| entry.class.is_none())
+        );
+    }
+
+    #[test]
+    fn class_inheritance_is_union_so_entries_only_add() {
+        let policy = parse(
+            r#"
+[[class]]
+name = "base"
+default_deny = true
+protect = true
+
+[[authorization]]
+cgroup = "/sys/fs/cgroup/wabbit"
+class = "base"
+default_deny = false
+protect = false
+"#,
+        )
+        .unwrap();
+        let entry = &policy.authorization.unwrap().entries[0];
+        use wabbit_common::authorization as auth;
+        // The entry may add to its class but never subtract: both flags
+        // stay on, whatever the entry says.
+        assert_eq!(
+            entry.flags,
+            auth::FLAG_PATH_RULES_DEFAULT_DENY | auth::FLAG_PROTECT
+        );
+    }
+
+    #[test]
+    fn class_rules_append_and_disagreements_are_rejected() {
+        let agreeing = parse(
+            r#"
+[[class]]
+name = "base"
+
+[[class.path_rules]]
+prefix = "/etc"
+verdict = "deny"
+
+[[authorization]]
+cgroup = "/sys/fs/cgroup/wabbit"
+class = "base"
+
+[[authorization.path_rules]]
+prefix = "/etc"
+verdict = "deny"
+
+[[authorization.path_rules]]
+prefix = "/var"
+verdict = "allow"
+"#,
+        )
+        .unwrap();
+        let entry = &agreeing.authorization.unwrap().entries[0];
+        // Appended, and the agreeing duplicate folded to one rule.
+        assert_eq!(entry.path_rules.len(), 2);
+
+        let disagreeing = parse(
+            r#"
+[[class]]
+name = "base"
+
+[[class.path_rules]]
+prefix = "/etc"
+verdict = "deny"
+
+[[authorization]]
+cgroup = "/sys/fs/cgroup/wabbit"
+class = "base"
+
+[[authorization.path_rules]]
+prefix = "/etc"
+verdict = "allow"
+"#,
+        );
+        let error = disagreeing.unwrap_err();
+        assert!(error.contains("disagrees"), "{error}");
+    }
+
+    /// The per-operation verdicts: the shorthand `verdict` unions with
+    /// the per-operation keys, compiles to the wire verdicts, and
+    /// inspects back to its per-operation spelling.
+    #[test]
+    fn per_operation_verdicts_compile_and_inspect() {
+        use wabbit_common::authorization as auth;
+        let policy = parse(
+            r#"
+[[authorization]]
+cgroup = "/sys/fs/cgroup/wabbit"
+default_deny = false
+
+[[authorization.path_rules]]
+prefix  = "/var/www"
+verdict = "allow"
+write   = "deny"
+exec    = "deny"
+"#,
+        )
+        .unwrap();
+        let rule = &policy.authorization.as_ref().unwrap().entries[0].path_rules[0];
+        // The shorthand set all three; the per-operation keys overrode
+        // write and exec; read alone stayed open.
+        assert_eq!(rule.verdict.read, OpVerdict::Allow);
+        assert_eq!(rule.verdict.write, OpVerdict::Deny);
+        assert_eq!(rule.verdict.exec, OpVerdict::Deny);
+        assert_eq!(
+            rule.verdict_bits(),
+            auth::PATH_RULE_READ_ALLOW
+                | auth::PATH_RULE_WRITE_DENY
+                | auth::PATH_RULE_EXEC_DENY
+        );
+
+        // Inspect spells mixed operations per operation, never as the
+        // shorthand.
+        let inspected = PolicyToml::try_from(&policy).unwrap();
+        let rule = &inspected.authorization.as_ref().unwrap()[0].path_rules[0];
+        assert_eq!(rule.verdict, None);
+        assert_eq!(rule.read, Some(VerdictName::Allow));
+        assert_eq!(rule.write, Some(VerdictName::Deny));
+        assert_eq!(rule.exec, Some(VerdictName::Deny));
+
+        // A partial rule (exec alone) survives its own round trip.
+        let policy = parse(
+            r#"
+[[authorization]]
+cgroup = "/sys/fs/cgroup/wabbit"
+
+[[authorization.path_rules]]
+prefix = "/var/www"
+exec   = "deny"
+"#,
+        )
+        .unwrap();
+        let rule = &policy.authorization.as_ref().unwrap().entries[0].path_rules[0];
+        assert_eq!(rule.verdict.read, OpVerdict::Unspecified);
+        assert_eq!(rule.verdict.exec, OpVerdict::Deny);
+    }
+
+    /// Class rules and entry rules for one prefix union per operation:
+    /// the entry may fill an operation the class left unspecified, and
+    /// may never change one the class decided.
+    #[test]
+    fn class_rules_union_per_operation() {
+        let policy = parse(
+            r#"
+[[class]]
+name = "web"
+
+[[class.path_rules]]
+prefix = "/var/www"
+read   = "allow"
+
+[[authorization]]
+cgroup = "/sys/fs/cgroup/wabbit"
+class  = "web"
+
+[[authorization.path_rules]]
+prefix = "/var/www"
+write  = "deny"
+exec   = "deny"
+"#,
+        )
+        .unwrap();
+        let rule = &policy.authorization.as_ref().unwrap().entries[0].path_rules[0];
+        assert_eq!(rule.verdict.read, OpVerdict::Allow);
+        assert_eq!(rule.verdict.write, OpVerdict::Deny);
+        assert_eq!(rule.verdict.exec, OpVerdict::Deny);
+
+        // …but a decision the class made is not the entry's to change.
+        let error = parse(
+            r#"
+[[class]]
+name = "web"
+
+[[class.path_rules]]
+prefix = "/var/www"
+read = "deny"
+
+[[authorization]]
+cgroup = "/sys/fs/cgroup/wabbit"
+class  = "web"
+
+[[authorization.path_rules]]
+prefix = "/var/www"
+read = "allow"
+"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("disagrees"), "{error}");
+    }
+
+    #[test]
+    fn unknown_class_references_and_bad_names_are_rejected() {
+        let error = parse(
+            r#"
+[[authorization]]
+cgroup = "/sys/fs/cgroup/wabbit"
+class = "no-such-class"
+"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("unknown class"), "{error}");
+
+        let error = parse(
+            r#"
+[[class]]
+name = "../escape"
+cgroup = "/sys/fs/cgroup/wabbit"
+
+[[authorization]]
+cgroup = "/sys/fs/cgroup/wabbit"
+"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("class name"), "{error}");
+
+        // A concrete class whose compiled path would blow the eBPF
+        // walk cap can never be walled, so the generator refuses it.
+        let error = parse(&format!(
+            r#"
+[[class]]
+name = "{}"
+cgroup = "/sys/fs/cgroup/{}"
+
+[[authorization]]
+cgroup = "/sys/fs/cgroup/wabbit"
+"#,
+            "c".repeat(24),
+            "d".repeat(40)
+        ))
+        .unwrap_err();
+        assert!(error.contains("walk cap"), "{error}");
+
+        let twice = parse(
+            r#"
+[[class]]
+name = "dup"
+cgroup = "/sys/fs/cgroup/wabbit"
+
+[[class]]
+name = "dup"
+cgroup = "/sys/fs/cgroup/wabbit"
+"#,
+        )
+        .unwrap_err();
+        assert!(twice.contains("twice"), "{twice}");
+    }
+
+    /// A class and an entry naming the same compiled cgroup: the
+    /// one-cgroup-one-entry rule catches the collision by name.
+    #[test]
+    fn a_class_cannot_shadow_an_entry() {
+        let error = parse(
+            r#"
+[[class]]
+name = "shell"
+cgroup = "/sys/fs/cgroup/wabbit"
+
+[[authorization]]
+cgroup = "/sys/fs/cgroup/wabbit/class/shell"
+"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("two authorization entries"), "{error}");
+    }
+
+    /// A policy may carry classes and no plain entries at all — the
+    /// concrete classes still compile to their entries (the regression:
+    /// the class entries used to append only to a non-empty section and
+    /// silently vanished).
+    #[test]
+    fn classes_compile_even_without_plain_entries() {
+        let policy = parse(
+            r#"
+[[class]]
+name = "shell"
+cgroup = "/sys/fs/cgroup/wabbit"
+actions = ["exec"]
+"#,
+        )
+        .unwrap();
+        let config = policy.authorization.expect("the class compiled");
+        assert_eq!(config.entries.len(), 1);
+        assert_eq!(
+            config.entries[0].cgroup,
+            std::path::Path::new("/sys/fs/cgroup/wabbit/class/shell")
+        );
+    }
+
+    /// The bootstrap shape, exactly as a bootable deployment needs it:
+    /// `init.scope` carries bits (its PID 1 loads boot modules and
+    /// spawns into walled unit cgroups) yet opts out of the wall — PID 1
+    /// bootstraps into it from outside every wall, and a walled
+    /// init.scope would refuse its own PID 1 and kill the boot.
+    #[test]
+    fn the_bootstrap_opt_out_compiles() {
+        let policy = parse(
+            r#"
+[[class]]
+name = "boot-hardware"
+actions = ["kmods"]
+
+[[authorization]]
+cgroup = "/sys/fs/cgroup/init.scope"
+class = "boot-hardware"
+actions = ["cgroupfs-write"]
+protect = false
+"#,
+        )
+        .unwrap();
+        let config = policy.authorization.unwrap();
+        assert_eq!(config.entries.len(), 1);
+        let entry = &config.entries[0];
+        use wabbit_common::authorization as auth;
+        assert_eq!(
+            entry.action_mask,
+            auth::ACTION_KMODS | auth::ACTION_CGROUPFS_WRITE
+        );
+        // Opted out, not walled: the UNPROTECTED bit, and no PROTECT.
+        assert_eq!(entry.flags, auth::FLAG_UNPROTECTED);
+        config.validate().unwrap();
     }
 }
