@@ -20,12 +20,13 @@ wabbit-policy inspect policy.wspf            # verify + decode, anywhere
 
 ## How the file is structured
 
-Four sections exist today, all optional — an empty policy is a valid
+Five sections exist today, all optional — an empty policy is a valid
 (posture: it grants nothing, and deny-by-default does the rest):
 
 ```toml
 [rootfs]           # mount-time policy: what is writable, what is executable
 [network]          # how far the bind and raw-capture gates reach
+[default]          # what every cgroup no [[authorization]] entry names gets
 [[class]]          # reusable, named privilege profiles
 [[authorization]]  # per-cgroup grants: the actual rules
 ```
@@ -268,6 +269,46 @@ exception accepts.
 
 The section is read at boot; a reconfigure carrying it replaces the
 stored section but does not re-arm the gates until the next boot.
+
+## `[default]` — what unlisted cgroups get
+
+Rules apply to the exact cgroup they name — children never inherit, so
+an entry for `/sys/fs/cgroup` covers only the processes sitting
+directly in the root cgroup (kernel helpers), not the machine. To set
+rules for *every process no entry names* — user sessions, services you
+did not list, classless IPC runs — use `[default]`. It is an
+`[[authorization]]` entry without a `cgroup`:
+
+```toml
+[default]
+actions = ["bind-net"]          # optional
+
+[[default.path_rules]]
+prefix  = "/etc/shadow"
+verdict = "deny"
+
+[[default.path_rules]]
+prefix  = "/root"
+write   = "deny"
+exec    = "deny"
+```
+
+- **Listed cgroups are unaffected.** A cgroup with its own entry gets
+  exactly that entry — never the default's actions or rules on top. To
+  give a listed cgroup the same rules, put them in an abstract
+  `[[class]]` and have both inherit it.
+- **Deny-list only.** There is no `default_deny`: the default reaches
+  every service you did not name (journald, dbus, logind, getty, …),
+  and an allow-list that forgot one of their paths makes the boot
+  unusable. Path rules here can only block.
+- **Allowed actions:** `kmods`, `firewall`, `raw-capture`, `bind-net`.
+  `mount`, `cgroupfs-write`, and `bpf-attach` are refused — granted to
+  every unlisted cgroup they would hand the whole machine the keys to
+  the walls. `signal` is refused because it would mean nothing:
+  unlisted cgroups may already signal, and the signal gate never reads
+  the default.
+- Like every section, it is read at boot; a reconfigure stores it but
+  re-arms nothing until the next boot.
 
 ## `[rootfs]` — mount-time policy
 

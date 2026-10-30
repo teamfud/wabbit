@@ -26,6 +26,7 @@ use wabbit_policy::{
         AuthorizationConfig, AuthorizationEntry, MAX_PATH_RULES, OpVerdict, PathRule,
         PathRuleVerdict,
     },
+    default::DefaultConfig,
     network::{BindPosture, NetworkConfig, RawCapturePosture},
     rootfs::{PathFlags, PathOverride, RootFSConfig, RootFlags},
     sign,
@@ -145,6 +146,71 @@ struct PolicyToml {
     class: Option<Vec<ClassToml>>,
     authorization: Option<Vec<AuthorizationToml>>,
     network: Option<NetworkToml>,
+    default: Option<DefaultToml>,
+}
+
+/// The `[default]` table: what every cgroup *no* `[[authorization]]`
+/// entry names gets — an entry without a `cgroup`. A listed cgroup gets
+/// exactly its own entry, never this on top.
+///
+/// ```toml
+/// [default]
+/// actions = ["bind-net"]       # kmods, firewall, raw-capture, bind-net only
+///
+/// [[default.path_rules]]       # a deny-list: there is no default_deny
+/// prefix = "/etc/shadow"
+/// verdict = "deny"
+/// ```
+#[derive(serde::Deserialize, serde::Serialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+struct DefaultToml {
+    #[serde(default)]
+    actions: Vec<ActionName>,
+    #[serde(default)]
+    path_rules: Vec<PathRuleToml>,
+}
+
+impl From<DefaultToml> for DefaultConfig {
+    fn from(default: DefaultToml) -> Self {
+        Self {
+            action_mask: default
+                .actions
+                .iter()
+                .map(|name| name.bit())
+                .fold(0, |mask, bit| mask | bit),
+            path_rules: default
+                .path_rules
+                .into_iter()
+                .map(|rule| {
+                    let verdict = toml_rule_verdict(&rule);
+                    PathRule {
+                        prefix: rule.prefix,
+                        verdict,
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<&DefaultConfig> for DefaultToml {
+    type Error = String;
+
+    fn try_from(default: &DefaultConfig) -> Result<Self, Self::Error> {
+        let mut actions = Vec::new();
+        let mut rest = default.action_mask;
+        while rest != 0 {
+            let bit = rest & rest.wrapping_neg();
+            let action = ActionName::from_bit(bit)
+                .ok_or_else(|| "the default carries an unknown action bit".to_string())?;
+            actions.push(action);
+            rest &= !bit;
+        }
+        Ok(Self {
+            actions,
+            path_rules: default.path_rules.iter().map(PathRuleToml::from).collect(),
+        })
+    }
 }
 
 /// The `[network]` table: how far each network gate reaches. Either key
@@ -759,9 +825,13 @@ impl TryFrom<PolicyToml> for Policy {
             rootfs,
             authorization,
             network: source.network.map(NetworkConfig::from),
+            default: source.default.map(DefaultConfig::from),
         };
         if let Some(authorization) = &policy.authorization {
             authorization.validate()?;
+        }
+        if let Some(default) = &policy.default {
+            default.validate()?;
         }
         Ok(policy)
     }
@@ -808,6 +878,7 @@ impl TryFrom<&Policy> for PolicyToml {
             class: None,
             authorization,
             network: policy.network.as_ref().map(NetworkToml::from),
+            default: policy.default.as_ref().map(DefaultToml::try_from).transpose()?,
         })
     }
 }
@@ -1048,6 +1119,16 @@ mod tests {
             network: Some(NetworkToml {
                 bind: BindName::Ports,
                 raw_capture: RawCaptureName::Off,
+            }),
+            default: Some(DefaultToml {
+                actions: vec![ActionName::BindNet],
+                path_rules: vec![PathRuleToml {
+                    prefix: "/etc/shadow".into(),
+                    verdict: Some(VerdictName::Deny),
+                    read: None,
+                    write: None,
+                    exec: None,
+                }],
             }),
         };
         let policy = Policy::try_from(
@@ -1523,5 +1604,32 @@ bind = "ports"
         );
         assert_eq!(parse("").unwrap().network, None);
         assert!(toml::from_str::<PolicyToml>("[network]\nbind = \"listeners\"\n").is_err());
+    }
+
+    /// `[default]` compiles to the default entry; the grants it may not
+    /// carry, and an allow-list, are refused by name.
+    #[test]
+    fn the_default_section_compiles_and_refuses_wall_keys() {
+        use wabbit_common::authorization as auth;
+        let policy = parse(
+            r#"
+[default]
+actions = ["bind-net"]
+
+[[default.path_rules]]
+prefix = "/etc/shadow"
+verdict = "deny"
+"#,
+        )
+        .unwrap();
+        let default = policy.default.expect("the default compiled");
+        assert_eq!(default.action_mask, auth::ACTION_BIND_NET);
+        assert_eq!(default.path_rules.len(), 1);
+
+        for action in ["cgroupfs-write", "mount", "bpf-attach", "signal"] {
+            let error = parse(&format!("[default]\nactions = [\"{action}\"]\n")).unwrap_err();
+            assert!(error.contains("default may not"), "{action}: {error}");
+        }
+        assert!(toml::from_str::<PolicyToml>("[default]\ndefault_deny = true\n").is_err());
     }
 }

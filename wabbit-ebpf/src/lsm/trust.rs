@@ -24,10 +24,11 @@
 use aya_ebpf::helpers::{bpf_get_current_cgroup_id, bpf_get_current_pid_tgid};
 #[rustfmt::skip]
 pub use wabbit_common::authorization::{
-    CODE_ALLOWED, CODE_WOULD_DENY, CgroupKey, ENFORCE, HOOK_BPF, HOOK_BIND, HOOK_FILE_OPEN,
-    HOOK_KMOD, HOOK_SB_MOUNT, HOOK_SETSOCKOPT, HOOK_SOCKET_CREATE, HOOK_TASK_KILL, OBSERVE,
-    decision_key,
+    CODE_ALLOWED, CODE_WOULD_DENY, CgroupKey, DEFAULT_CGROUP_ID, ENFORCE, HOOK_BPF, HOOK_BIND,
+    HOOK_FILE_OPEN, HOOK_KMOD, HOOK_SB_MOUNT, HOOK_SETSOCKOPT, HOOK_SOCKET_CREATE,
+    HOOK_TASK_KILL, OBSERVE, decision_key,
 };
+use wabbit_common::authorization::Authorization;
 
 use crate::maps::{
     AUTHORIZATIONS, DECISIONS, ENFORCING, PROTECTED_PATHS, TRUSTED_CGROUPS, TRUSTED_PIDS,
@@ -89,11 +90,27 @@ pub fn trusted() -> bool {
     pid_trusted() || cgroup_trusted(&current_cgroup())
 }
 
-/// Does `cgroup` hold the authorization `action`?
+/// The entry that governs `cgroup`: its own, or — for a cgroup with no
+/// entry — the policy's default (keyed [`DEFAULT_CGROUP_ID`]), along
+/// with the id its `PATH_RULES` are keyed under. `None` when neither
+/// exists: the unlisted floor (no bits, no rules).
+#[inline(always)]
+pub fn governing(cgroup: &CgroupKey) -> Option<(u64, &'static Authorization)> {
+    if let Some(authorization) = unsafe { AUTHORIZATIONS.get(cgroup) } {
+        return Some((cgroup.cgroup_id, authorization));
+    }
+    let default = CgroupKey {
+        cgroup_id: DEFAULT_CGROUP_ID,
+    };
+    unsafe { AUTHORIZATIONS.get(&default) }.map(|authorization| (DEFAULT_CGROUP_ID, authorization))
+}
+
+/// Does `cgroup` hold the authorization `action` — through its own entry,
+/// or the default's when it has none?
 #[inline(always)]
 pub fn authorized(cgroup: &CgroupKey, action: u64) -> bool {
-    match unsafe { AUTHORIZATIONS.get(cgroup) } {
-        Some(authorization) => authorization.action_mask & action != 0,
+    match governing(cgroup) {
+        Some((_, authorization)) => authorization.action_mask & action != 0,
         None => false,
     }
 }
@@ -110,7 +127,8 @@ pub fn current_authorized(action: u64) -> bool {
 /// initramfs units, session scopes — must never lose `kill(2)` to a
 /// boundary nobody drew), while a *listed* cgroup gets exactly its
 /// bits — the operator names the cgroup, the operator chose its
-/// actions.
+/// actions. The policy's default entry is deliberately *not* consulted:
+/// an unlisted cgroup stays unlisted here.
 #[inline(always)]
 pub fn current_authorized_or_unlisted(action: u64) -> bool {
     match unsafe { AUTHORIZATIONS.get(&current_cgroup()) } {

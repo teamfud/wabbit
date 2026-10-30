@@ -24,6 +24,22 @@
 bind        = "ports"
 raw_capture = "icmp"
 
+# --- Default ----------------------------------------------------------------
+#
+# What every cgroup *no* [[authorization]] entry below names gets: user
+# sessions, unlisted services, classless IPC runs. (An entry for
+# /sys/fs/cgroup would NOT do this: rules apply to the exact cgroup
+# keyed, and the root cgroup itself holds only kernel helpers.) Listed
+# cgroups get exactly their own entry, never this on top. Deny-list only;
+# actions limited to kmods, firewall, raw-capture, bind-net.
+#
+# [default]
+# actions = []
+#
+# [[default.path_rules]]
+# prefix  = "/etc/shadow"
+# verdict = "deny"
+
 # --- Classes ----------------------------------------------------------------
 
 # A spawnable class: `wabbit-ipc --key policy.key --class shell run bash`

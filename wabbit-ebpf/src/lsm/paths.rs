@@ -41,7 +41,7 @@ use wabbit_common::authorization::{
 
 use crate::{
     lsm::trust,
-    maps::{AUTHORIZATIONS, PATH_RULES},
+    maps::PATH_RULES,
 };
 
 /// One buffer per hook (see the module docs).
@@ -323,7 +323,9 @@ impl PathOp {
 /// default decides: allow, unless its `Authorization` carries the
 /// default-deny flag, in which case only a rule carrying this
 /// operation's `*_ALLOW` bit opens. A cgroup with no `Authorization`
-/// entry has no rules and is default-allow.
+/// entry falls back to the policy's default entry and its rules (keyed
+/// under `DEFAULT_CGROUP_ID` — see [`trust::governing`]); with no default
+/// either, it has no rules and is default-allow.
 ///
 /// The per-prefix re-hash this replaces cost a full nested hash loop per
 /// boundary, which detonated the verifier's complexity limit on the first
@@ -333,9 +335,10 @@ impl PathOp {
 /// Trusted callers never reach this: `file_open` short-circuits them.
 #[inline(always)]
 pub fn path_rule_denies(resolved: &[u8], op: PathOp) -> bool {
-    let cgroup = trust::current_cgroup();
-    // The cgroup's default: allow, unless its Authorization says otherwise.
-    let Some(authorization) = (unsafe { AUTHORIZATIONS.get(&cgroup) }) else {
+    // The governing entry — the cgroup's own, or the policy default's —
+    // and the id its rules are keyed under. Its default: allow, unless
+    // the Authorization says otherwise.
+    let Some((rules_id, authorization)) = trust::governing(&trust::current_cgroup()) else {
         return false;
     };
     let default_deny = authorization.flags & FLAG_PATH_RULES_DEFAULT_DENY != 0;
@@ -356,13 +359,13 @@ pub fn path_rule_denies(resolved: &[u8], op: PathOp) -> bool {
         };
         if byte == b'/' && index > 0 {
             // The running hash is `path_hash(&resolved[..index])`.
-            deepest = op_verdict(cgroup.cgroup_id, hash, allow_bit, deny_bit).or(deepest);
+            deepest = op_verdict(rules_id, hash, allow_bit, deny_bit).or(deepest);
         }
         hash = fnv_step(hash, byte);
         index += 1;
     }
     // The whole path — the final and deepest boundary.
-    deepest = op_verdict(cgroup.cgroup_id, hash, allow_bit, deny_bit).or(deepest);
+    deepest = op_verdict(rules_id, hash, allow_bit, deny_bit).or(deepest);
 
     deepest.unwrap_or(default_deny)
 }

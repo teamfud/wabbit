@@ -117,6 +117,28 @@ pub const ACTION_RAW_CAPTURE: u64 = 1 << 10;
 /// connective tissue and is deliberately ungated.
 pub const ACTION_BIND_NET: u64 = 1 << 11;
 
+/// The reserved [`CgroupKey`] id of the policy's **default** entry: the
+/// `Authorization` (and the `PATH_RULES`) a cgroup with no entry of its
+/// own falls back to. kernfs ids start at 1 — the cgroupfs root's — so
+/// no real cgroup can collide with it.
+///
+/// The fallback is for *unlisted* cgroups only: a listed cgroup gets
+/// exactly its own entry, never the default's bits or rules on top. The
+/// `task_kill` gate ignores the default entirely — unlisted cgroups keep
+/// their default-allow signal posture, the failure-safety contract (see
+/// [`ACTION_SIGNAL_OTHERS`]).
+pub const DEFAULT_CGROUP_ID: u64 = 0;
+
+/// The action bits a default entry may carry. Everything else is
+/// rejected by the generator and the loader: the wall-lifting bits
+/// (`mount`, `cgroupfs-write`, `bpf-attach`) handed to every unlisted
+/// cgroup would dissolve the walls the whole class model leans on, and
+/// `signal` is never consulted from the default (see
+/// [`DEFAULT_CGROUP_ID`]) — a grant that silently means nothing is
+/// rejected by name instead.
+pub const DEFAULT_ALLOWED_ACTIONS: u64 =
+    ACTION_KMODS | ACTION_FIREWALL | ACTION_RAW_CAPTURE | ACTION_BIND_NET;
+
 /// `NET_POSTURE` index: how far the `bind_gate` reaches — one of the
 /// `BIND_GATE_*` values. The policy's `network` section sets it; an
 /// unpopulated map reads `0`, the strictest posture.
