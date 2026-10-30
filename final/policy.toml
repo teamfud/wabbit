@@ -1,0 +1,103 @@
+# The starter policy, signed into policy.wspf by this generator.
+# Edit and re-run the generator to rotate; everything not granted here
+# is denied by default.
+
+# A spawnable class: a signed run command may name it,
+#   systemd-licensed-ipc --key policy.key --class shell run bash
+# and the run executes in its own throwaway cgroup with exactly these
+# rules — nothing else. A run that names no class gets a cgroup with no
+# rules at all (deny-by-default is the floor). This class grants no
+# action bits at all: a shell that may read /usr, /bin and /dev and do
+# nothing privileged is the least-privilege shape that still works —
+# though a *usable* shell wants `actions = ["signal"]` for job control
+# (Ctrl-C interrupts, `kill %1`): the task_kill gate exempts only
+# self-signals, so without the bit the shell cannot stop its own
+# children.
+[[class]]
+name         = "shell"
+cgroup       = "/sys/fs/cgroup/systemd-licensed"
+default_deny = true
+protect      = true
+
+# The allow-list: a run in this class may open only these prefixes.
+[[class.path_rules]]
+prefix  = "/usr"
+verdict = "allow"
+[[class.path_rules]]
+prefix  = "/bin"
+verdict = "allow"
+[[class.path_rules]]
+prefix  = "/dev"
+verdict = "allow"
+
+# Verdicts are per-operation: read, write, and exec each carry their own,
+# falling back to the rule's `verdict` shorthand. A prefix like
+#   [[class.path_rules]]
+#   prefix  = "/var/www"
+#   verdict = "allow"
+#   write   = "deny"
+#   exec    = "deny"
+# keeps reads open while blocking writes and execution under it.
+
+# The boot-hardware class: what systemd legitimately needs to load
+# modules at boot. PID 1 mounts /boot/efi, and filesystem drivers ask
+# the kernel to autoload their helper modules *in PID 1's context* —
+# without the grant those mounts fail and the boot degrades. These two
+# entries are the minimum a distro boot needs; add more (multipathd, a
+# package manager's cgroup) as your boxes require.
+[[class]]
+name = "boot-hardware"
+actions = ["kmods"]
+
+# PID 1 bootstraps into init.scope from outside every wall — it starts
+# in the root cgroup and migrates itself before any authorization can
+# apply — so init.scope must opt out of the wall its bits would give it
+# (protect = false) or it would refuse its own PID 1 and kill the boot.
+# It also holds cgroupfs-write: that is what lets PID 1 spawn services
+# INTO cgroups that are walled (every unit cgroup holding a grant) —
+# and signal: the task_kill gate exempts only self-signals (and
+# SIGCONT, the thaw channel), and unit management is nothing but
+# signals (SIGTERM on stop, SIGKILL on final kill, SIGHUP on reload).
+# Without the grant systemd cannot manage a single unit.
+[[authorization]]
+cgroup = "/sys/fs/cgroup/init.scope"
+class  = "boot-hardware"
+actions = ["cgroupfs-write", "signal"]
+protect = false
+
+[[authorization]]
+cgroup = "/sys/fs/cgroup/system.slice/systemd-modules-load.service"
+class  = "boot-hardware"
+
+# udev's worker pool: udevd forks workers and SIGTERMs the idle ones —
+# self-exempt signals cover the workers' own exits, but the parent's
+# worker management is cross-task signaling. Without the grant the
+# pool never shrinks.
+[[authorization]]
+cgroup = "/sys/fs/cgroup/system.slice/systemd-udevd.service"
+class  = "boot-hardware"
+actions = ["signal"]
+
+# Kernel module AUTOloads run in the root cgroup: request_module spawns
+# a kernel usermode helper there, so no per-cgroup grant can cover
+# them — and the boot needs them (a vfat ESP mount autoloads its NLS
+# charset). Post-boot nothing but kernel threads and helpers live in
+# the root cgroup, so this preserves the stock kernel's autoload
+# behavior; *direct* modprobe stays per-cgroup. The signal grant rides
+# the same transient-population logic: usermode helpers signal, and
+# nobody else lives here to abuse it.
+[[authorization]]
+cgroup = "/sys/fs/cgroup"
+actions = ["kmods", "signal"]
+
+# Plain cgroup grants work the same way; entries can also inherit a
+# class and add to it (never subtract):
+# [[authorization]]
+# cgroup  = "/sys/fs/cgroup/system.slice/blue-team-tools.service"
+# class   = "shell"
+# actions = ["kmods"]
+
+# A cgroup may be migration-walled without holding any privileges:
+# [[authorization]]
+# cgroup  = "/sys/fs/cgroup/system.slice/precious.service"
+# protect = true
