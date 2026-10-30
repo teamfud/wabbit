@@ -1382,6 +1382,7 @@ dependencies = [
  "tokio",
  "wabbit-common",
  "wabbit-ebpf",
+ "wabbit-ipc",
  "wabbit-policy",
 ]
 
@@ -1422,6 +1423,20 @@ dependencies = [
 [[package]]
 name = "wabbit-install"
 version = "0.1.0"
+dependencies = [
+ "rustix 1.1.4",
+]
+
+[[package]]
+name = "wabbit-ipc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "ed25519-dalek",
+ "wabbit-common",
+ "zeroize",
+]
 
 [[package]]
 name = "wabbit-policy"

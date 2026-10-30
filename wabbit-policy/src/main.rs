@@ -128,20 +128,29 @@ struct PolicyToml {
 struct RootFSToml {
     executable: bool,
     writable: bool,
+    #[serde(default)]
     overrides: Vec<OverrideToml>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Debug)]
 #[serde(deny_unknown_fields)]
 struct OverrideToml {
+    #[serde(default)]
     inner_writable: bool,
+    #[serde(default)]
     inner_executable: bool,
+    #[serde(default)]
     outer_writable: bool,
+    #[serde(default)]
     outer_executable: bool,
+    #[serde(default)]
     outer_readable: bool,
+    #[serde(default)]
     outer_visible: bool,
+    #[serde(default)]
     priority: u16,
     path: PathBuf,
+    #[serde(default)]
     inner_path: Option<PathBuf>,
 }
 
@@ -151,10 +160,13 @@ struct AuthorizationToml {
     /// The canonical cgroupfs path of the cgroup this entry authorizes.
     cgroup: PathBuf,
     /// Action names, as [`ActionName`] spells them.
+    #[serde(default)]
     actions: Vec<ActionName>,
     /// Whether unruled paths are denied (allow-list) or allowed
     /// (deny-list) for this cgroup.
+    #[serde(default)]
     default_deny: bool,
+    #[serde(default)]
     path_rules: Vec<PathRuleToml>,
 }
 
@@ -359,11 +371,16 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         key_id: u8,
     },
-    /// Verify a signed policy against the compiled-in keys and decode it
-    /// to TOML, for audit.
+    /// Verify a signed policy and decode it to TOML, for audit.
     Inspect {
         /// The signed policy file.
         policy: PathBuf,
+        /// Verify against this public key (hex or base64) instead of the
+        /// compiled-in keys. `WABBIT_POLICY_PUBLIC_KEY` is compile-time
+        /// only (`option_env!`), so a deployed keypair's public half needs
+        /// this to verify with — the key it belongs to was never built in.
+        #[arg(long)]
+        public_key: Option<String>,
     },
 }
 
@@ -377,7 +394,7 @@ fn main() -> anyhow::Result<()> {
             key,
             key_id,
         } => build(&source, &output, &key, key_id),
-        Command::Inspect { policy } => inspect(&policy),
+        Command::Inspect { policy, public_key } => inspect(&policy, public_key.as_deref()),
     }
 }
 
@@ -406,21 +423,27 @@ fn gen_key(key_path: &Path) -> Result<()> {
     fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 600 {}", key_path.display()))?;
 
+    // The public half travels beside the secret as hex (mode 0644): the
+    // deployment wizard and any later tooling reads it from here instead
+    // of parsing the human guidance printed below.
+    let public_hex = hex::encode(verifying.as_bytes());
+    let public_path = format!("{}.pub", key_path.display());
+    fs::write(&public_path, format!("{public_hex}\n"))
+        .with_context(|| format!("writing {public_path}"))?;
+    fs::set_permissions(&public_path, std::fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("chmod 644 {public_path}"))?;
+
     println!(
         "wrote the private key seed to {} (mode 0600)",
         key_path.display()
     );
-    println!("keep it off every target system; it signs policy they trust.");
+    println!("wrote the public half to {public_path}");
+    println!("keep the seed off every target system; it signs policy they trust.");
     println!();
-    println!("paste the public half into wabbit-common/src/keys.rs:");
-    println!(
-        "pub const POLICY_PUBLIC_KEY: &str = \"{}\";",
-        hex::encode(verifying.as_bytes())
-    );
-    println!(
-        "or build with WABBIT_POLICY_PUBLIC_KEY={} to override it.",
-        hex::encode(verifying.as_bytes())
-    );
+    println!("build the wabbit chain with it compiled in:");
+    println!("WABBIT_POLICY_PUBLIC_KEY={public_hex} ./vm/build-artifact.sh");
+    println!("verify a policy against it:");
+    println!("wabbit-policy inspect policy.wspf --public-key {public_hex}");
     Ok(())
 }
 
@@ -458,9 +481,17 @@ fn build(source_path: &Path, output: &Path, key: &Path, key_id: u8) -> Result<()
     Ok(())
 }
 
-fn inspect(path: &Path) -> Result<()> {
-    let policy = wabbit_policy::read_file(path)?;
-    // read_file verifies; decode to TOML for the audit output.
+fn inspect(path: &Path, public_key: Option<&str>) -> Result<()> {
+    // Verify first: against the explicit key when given (deployed keypairs —
+    // the env override is compile-time only, so `option_env!` cannot carry a
+    // runtime key), else against the compiled-in keys.
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let policy = match public_key {
+        Some(key) => wabbit_policy::from_bytes_with_key(&bytes, key),
+        None => wabbit_policy::from_bytes(&bytes),
+    }
+    .with_context(|| format!("parsing policy {}", path.display()))?;
+    // Decode to TOML for the audit output.
     let toml = PolicyToml::try_from(&policy).map_err(|error| anyhow::anyhow!("{error}"))?;
     let text = toml::to_string_pretty(&toml).context("encoding the decoded policy")?;
     println!("# verified: {}", path.display());

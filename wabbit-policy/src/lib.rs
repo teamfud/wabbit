@@ -176,18 +176,17 @@ pub fn from_bytes(bytes: &[u8]) -> Result<Policy> {
     Ok(policy)
 }
 
-/// Parse a complete binary policy against one specific key, keyed by `id`
-/// in the header. Tests use their own keys this way; production
-/// verification goes through [`from_bytes`].
-pub fn from_bytes_with_key(bytes: &[u8], id: u8, public_key: &str) -> Result<Policy> {
+/// Parse a complete binary policy against one specific key: no key-id
+/// matching, just verify the signature against `public_key` (hex or
+/// base64). `wabbit-policy inspect --public-key` uses this for deployed
+/// keypairs whose key was never compiled in (the env override is
+/// `option_env!` — build-time only); tests use it with their own keys.
+pub fn from_bytes_with_key(bytes: &[u8], public_key: &str) -> Result<Policy> {
+    if bytes.len() > MAX_POLICY_SIZE {
+        bail!("policy exceeds maximum size of {MAX_POLICY_SIZE} bytes");
+    }
     let mut reader = Cursor::new(bytes);
     let header = Header::read(&mut reader).context("invalid policy header")?;
-    if header.key_id != id {
-        bail!(
-            "policy key id {} does not match the expected {id}",
-            header.key_id
-        );
-    }
     verify_signature(&signed_message(bytes), &header.signature, public_key)?;
     let policy = Policy::read(&mut reader).context("invalid policy body")?;
     if reader.position() != bytes.len() as u64 {
@@ -315,7 +314,7 @@ mod tests {
     }
 
     fn parse(bytes: &[u8]) -> Result<Policy> {
-        from_bytes_with_key(bytes, TEST_KEY_ID, TEST_PUBLIC_KEY)
+        from_bytes_with_key(bytes, TEST_PUBLIC_KEY)
     }
 
     #[test]

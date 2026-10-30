@@ -47,7 +47,62 @@ fn main() -> anyhow::Result<()> {
     };
     set_ebpf_remaps()?;
     aya_build::build_ebpf([ebpf_package], Toolchain::default())?;
-    strip_debug(&bins)
+    strip_debug(&bins)?;
+    embed_policy()
+}
+
+/// Bake a signed policy into this binary — the *first-install* path.
+///
+/// `WABBIT_EMBED_POLICY=<path to a signed .wspf>` copies the file into
+/// `OUT_DIR` and points `include_bytes!` at it (the `embedded_policy` cfg
+/// and the `WABBIT_EMBED_POLICY` rustc-env, both consumed by `main.rs`).
+/// The env propagates through the nested builds — `wabbit-initrd`'s build
+/// script compiles `wabbit` by a nested cargo that inherits the
+/// environment — so a baked policy rides the wabbit binary inside
+/// `wabbit-initrd` inside the initramfs image, with no filesystem
+/// footprint at all.
+///
+/// The policy is **verified at build time** against the same compiled-in
+/// `POLICY_PUBLIC_KEYS` the runtime verifies with: a chain that ships a
+/// policy it would refuse is a build bug, not a boot problem, and failing
+/// the build here costs nothing. (A tampered binary could not smuggle a
+/// policy past the runtime re-verify: the signature covers the bytes.)
+///
+/// Runtime precedence (see `main.rs`): the env-var file
+/// (`<prefix>_FILESYSTEM_CONFIGURATION_FILE`, the installer's `--policy`
+/// and the IPC rotation path) overrides the baked policy, which overrides
+/// `Policy::default()`.
+fn embed_policy() -> anyhow::Result<()> {
+    println!("cargo:rerun-if-env-changed=WABBIT_EMBED_POLICY");
+    println!("cargo:rustc-check-cfg=cfg(embedded_policy)");
+    let Some(path) = env::var_os("WABBIT_EMBED_POLICY") else {
+        return Ok(());
+    };
+    let path = PathBuf::from(&path);
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").context("reading OUT_DIR")?);
+    // Copy under a *content-hashed* name: the rustc-env value below is the
+    // file's path, and cargo fingerprints the rustc-env set — a same-path
+    // copy with new content would NOT recompile (the first deployment run
+    // shipped a stale embed this way). Hashing the bytes into the name
+    // makes any policy change change the path, which changes the
+    // fingerprint, which forces the recompile that re-embeds.
+    let bytes = std::fs::read(&path).context("reading the policy to embed")?;
+    let hash = wabbit_common::authorization::path_hash(&bytes);
+    let embedded = out_dir.join(format!("policy-{hash:016x}.wspf"));
+    std::fs::copy(&path, &embedded)
+        .with_context(|| format!("copying {} into OUT_DIR", path.display()))?;
+    let bytes = std::fs::read(&embedded).context("reading the embedded policy back")?;
+    wabbit_policy::from_bytes(&bytes).with_context(|| {
+        format!(
+            "the baked-in policy {} does not verify against this \
+             build's compiled-in policy keys",
+            path.display()
+        )
+    })?;
+    println!("cargo:rustc-env=WABBIT_EMBED_POLICY={}", embedded.display());
+    println!("cargo:rustc-cfg=embedded_policy");
+    println!("cargo:rerun-if-changed={}", path.display());
+    Ok(())
 }
 
 /// Hand `--remap-path-prefix` flags for this build host to the vendored

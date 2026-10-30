@@ -22,6 +22,8 @@ devenv.local.yaml
 # VM lab: cached cloud images and downloaded artifacts
 vm/qemu/cache/
 
+deployments/
+
 # PREFERENCES.toml
 # architecture/
 # AGENTS.md

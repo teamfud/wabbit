@@ -1,7 +1,14 @@
-//! Bundle the wabbit-initrd artifact into the installer at build time —
-//! the same arrangement wabbit-initrd uses to embed wabbit, so the
-//! installer carries its artifact and needs no checkout on the target
-//! system. `--artifact` overrides the bundle for custom builds.
+//! Bundle two artifacts into the installer at build time, so it carries
+//! everything it places and needs no checkout on the target system:
+//!
+//! * **wabbit-initrd** — the protector artifact (the same arrangement
+//!   wabbit-initrd itself uses to embed wabbit: a nested musl build that
+//!   ends up embedding bnuuy and the wabbit blob too). `--artifact`
+//!   overrides the bundle for custom builds.
+//! * **wabbit-ipc** — the signed-command client. The installer writes it
+//!   to the root filesystem's local bin folder, so operators get a
+//!   working client on the box without a second upload; `--client`
+//!   overrides it.
 //!
 //! A build script cannot use the parent cargo's target directory (its
 //! lock is held for the whole outer build), so this builds in a private
@@ -23,9 +30,38 @@ fn main() {
     println!("cargo:rerun-if-env-changed=WABBIT_BRAND_ENV_PREFIX");
     println!("cargo:rerun-if-env-changed=WABBIT_BRAND_SIGN_NAME");
     println!("cargo:rerun-if-env-changed=WABBIT_BRAND_SIGN_MAGIC");
+    // The policy knobs feed the bundled wabbit-initrd through its own nested
+    // build (the chain: this script's nested wabbit-initrd build embeds
+    // wabbit, which compiles its compiled-in key from
+    // `WABBIT_POLICY_PUBLIC_KEY` and bakes `WABBIT_EMBED_POLICY`), so a
+    // change of either must rerun this script to re-invoke it — otherwise
+    // cargo considers this script fresh, the nested build never re-runs,
+    // and the installer silently bundles a stale artifact. The policy file
+    // itself can also change in place under an unchanged path.
+    println!("cargo:rerun-if-env-changed=WABBIT_POLICY_PUBLIC_KEY");
+    println!("cargo:rerun-if-env-changed=WABBIT_EMBED_POLICY");
+    if let Some(path) = env::var_os("WABBIT_EMBED_POLICY") {
+        println!("cargo:rerun-if-changed={}", path.to_string_lossy());
+    }
     if let Err(error) = bundle() {
         panic!("building the bundled wabbit-initrd failed: {error}");
     }
+    if let Err(error) = bundle_client() {
+        panic!("building the bundled wabbit-ipc failed: {error}");
+    }
+    // This build's stamp: the mtime every file the installer writes
+    // will carry (see main.rs's `stamp_installed_files` — the dpkg/rpm
+    // convention: installed files show their *build* time, not the
+    // install moment, so `ls -l` is consistent with the distro-packaged
+    // files around them, and one build's files are identical no matter
+    // how many times it is installed). The value changes on every run of
+    // this script, and cargo fingerprints rustc-env values, so a fresh
+    // bundle always compiles with its own stamp.
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=WABBIT_INSTALL_BUILD_TIME={seconds}");
 }
 
 /// The target the bundled wabbit-initrd is built for: static musl, so the
@@ -104,8 +140,44 @@ fn bundle() -> Result<(), String> {
         "../wabbit-common/Cargo.toml",
         "../wabbit-ebpf/src",
         "../wabbit-ebpf/Cargo.toml",
+        "../wabbit-ipc/src",
+        "../wabbit-ipc/Cargo.toml",
     ] {
         println!("cargo:rerun-if-changed={path}");
     }
+    Ok(())
+}
+
+/// Build the `wabbit-ipc` client the same way as the wabbit-initrd
+/// bundle: a private nested musl build, the binary copied into `OUT_DIR`
+/// for `include_bytes!`. The client is a leaf crate (wabbit-common plus
+/// small std dependencies), so its nested build is quick — and it
+/// inherits the environment, so a branded or key-rotated build bundles a
+/// client to match.
+fn bundle_client() -> Result<(), String> {
+    let target = bundle_target();
+    let out_dir = PathBuf::from(env::var("OUT_DIR").map_err(|error| error.to_string())?);
+    let target_dir = out_dir.join("wabbit-ipc-bundle-build");
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let status = Command::new(cargo)
+        .arg("build")
+        .arg("--package=wabbit-ipc")
+        .arg("--release")
+        .arg("--target")
+        .arg(&target)
+        .arg(format!("--target-dir={}", target_dir.display()))
+        // Build script stdout is cargo's directive channel; a nested cargo
+        // must not pollute it. Its diagnostics go to stderr and flow
+        // through to the outer build's log.
+        .stdout(Stdio::null())
+        .status()
+        .map_err(|error| format!("spawning cargo: {error}"))?;
+    if !status.success() {
+        return Err(format!("the nested wabbit-ipc build failed: {status}"));
+    }
+
+    let built = target_dir.join(&target).join("release").join("wabbit-ipc");
+    let blob = out_dir.join("wabbit-ipc-blob");
+    fs::copy(&built, &blob).map_err(|error| format!("copying the client into OUT_DIR: {error}"))?;
     Ok(())
 }

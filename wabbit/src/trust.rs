@@ -52,6 +52,16 @@ fn parse_public_key(encoded: &str) -> Result<VerifyingKey> {
     VerifyingKey::from_bytes(&bytes).context("invalid Ed25519 public key")
 }
 
+/// Parse every compiled-in public key (the policy keys — the same root
+/// of trust signs policies and IPC commands) for the IPC server to
+/// verify commands against.
+pub(crate) fn compiled_public_keys() -> Result<Vec<VerifyingKey>> {
+    wabbit_common::keys::POLICY_PUBLIC_KEYS
+        .iter()
+        .map(|(_, key)| parse_public_key(key))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::{Signer, SigningKey};

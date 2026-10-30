@@ -339,6 +339,58 @@ pub fn verify_protections(
     Ok(())
 }
 
+/// The pre-shutdown self-test: the startup diagram's handoff loop, run once
+/// `wabbit` announces readiness ("ready for you to back off").
+///
+/// The same denial tests as [`verify_protections`], but the protections
+/// under test are *enforcing* now: `wabbit`'s guard has flipped, and
+/// bnuuy's gates — still attached until this process exits — shadow it on
+/// the hooks both defend. The workers spawn from this PID, outside every
+/// trust map (`TRUSTED_BPF_PIDS` vouches for this PID, not for its
+/// children; the guard trusts only `wabbit`), so each must be denied.
+///
+/// No fork-trace assertions here: the tracepoints were proven against
+/// their maps during startup, and their map descriptors were consumed
+/// there; the denials are what the handoff needs proved. The world is still
+/// frozen — nothing but this process and its workers can run.
+pub fn verify_handoff() -> Result<()> {
+    info!("verifying the enforcing protections from spawned workers (the pre-shutdown self-test)");
+    let scratch = scratch_dir()?;
+
+    // "test loading a dummy module" → denied. Delivered with EPERM by the
+    // enforcing `kernel_read_file` gates — bnuuy's and, on every target
+    // kernel, `wabbit`'s identity-keyed `kmod_gate`.
+    let dummy_module = scratch.join(format!("{NAME}-dummy.ko"));
+    fs::write(
+        &dummy_module,
+        format!("{NAME} verification: this is not an ELF module\n"),
+    )
+    .with_context(|| format!("writing {}", dummy_module.display()))?;
+    let (_, code) = run_worker(&worker_flag("kmod"), Some(&dummy_module))?;
+    check_verdict(code, "finit_module() of an out-of-tree image is denied")?;
+
+    // "verify by spawning another process and doing a bpf syscall" →
+    // denied: this PID is trusted, its workers are not.
+    let (_, code) = run_worker(&worker_flag("bpf"), None)?;
+    check_verdict(code, "bpf() from a PID outside every trust map is denied")?;
+
+    // "test write perms of /l/m" → denied. Only meaningful where a module
+    // tree exists in the initrd.
+    if Path::new("/lib/modules").is_dir() {
+        let target = PathBuf::from(format!("/lib/modules/{NAME}-handoff-verify"));
+        let (_, code) = run_worker(&worker_flag("modules-write"), Some(&target))?;
+        let _ = fs::remove_file(&target);
+        check_verdict(code, "writable open under /lib/modules is denied")?;
+    } else {
+        debug!("no /lib/modules in the initrd; skipping the modules-write test");
+    }
+
+    let _ = fs::remove_file(dummy_module);
+    let _ = fs::remove_dir(&scratch);
+    info!("the pre-shutdown self-test passed: the protections hold through the handoff");
+    Ok(())
+}
+
 /// Positive control: the initrd PID is trusted, so a valid `BPF_MAP_CREATE`
 /// must go through. Without this, a hook that denies everyone would make the
 /// workers' EPERM verdicts meaningless.

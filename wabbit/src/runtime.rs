@@ -13,10 +13,10 @@
 //! a path, so descriptors opened here keep referring to the same mounts
 //! whatever the transition does to the names, and resolving paths
 //! *relative to a descriptor* (`openat`) crosses the living submounts as
-//! usual. Holding them is how the not-yet-implemented later steps expect
-//! to find the live system after the boot: `/proc/1/root` for systemd's
-//! view of the real root, the pinned maps under `/sys/fs/bpf`,
-//! `/run/systemd/private` for the systemd poll.
+//! usual. Holding them is how the handoff's later steps find the live
+//! system after the boot: `/proc/1/root` for systemd's view of the real
+//! root, the pinned maps under `/sys/fs/bpf`, `/run/systemd/private` for
+//! the systemd poll (`crate::handoff`).
 //!
 //! The descriptors are opened `O_PATH` and without `CLOEXEC`: they exist
 //! to anchor their mounts and to serve as `openat` bases, and they stay

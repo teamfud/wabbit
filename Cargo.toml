@@ -6,6 +6,7 @@ members = [
     "wabbit-ebpf",
     "bnuuy",
     "wabbit-install",
+    "wabbit-ipc",
     "wabbit-policy",
 ]
 default-members = ["wabbit", "wabbit-common"]

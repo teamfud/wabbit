@@ -10,8 +10,16 @@
 
   #
   # https://devenv.sh/packages/
-  packages = [ pkgs.git pkgs.sops pkgs.age ];
+  packages = [ pkgs.git pkgs.sops pkgs.age pkgs.gum pkgs.mold ];
   dotenv.enable = true;
+
+  # enable nightly rust
+  # languages.rust.enable = true;
+  # languages.rust.channel = "nightly";
+  # languages.rust.mold.enable = true;
+  # languages.rust.targets = [ "x86_64-unknown-linux-musl" "aarch64-unknown-linux-musl" ];
+  # languages.rust.components = [ "rustc" "cargo" "clippy" "rustfmt" "rust-analyzer" "miri" "rust-src" ];
+
 
   # disable mcp
 

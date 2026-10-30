@@ -10,14 +10,29 @@ use aya_build::Toolchain;
 fn main() -> anyhow::Result<()> {
     // The white-label knobs: the embedded bnuuy object and wabbit binary
     // are compiled by nested cargo runs (which inherit the environment),
-    // so a change must rerun this build script to re-invoke them.
+    // so a change must rerun this build script to re-invoke them. The
+    // policy knobs are in the same position: the embedded wabbit compiles
+    // its compiled-in key and bakes its policy from the environment, so a
+    // changed `WABBIT_POLICY_PUBLIC_KEY` or `WABBIT_EMBED_POLICY` must
+    // rerun the script too — otherwise cargo considers the script fresh,
+    // the nested `cargo build --package=wabbit` never re-runs, and the
+    // chain silently ships a stale embed from the previous deployment.
     for var in [
         "WABBIT_BRAND_NAME",
         "WABBIT_BRAND_ENV_PREFIX",
         "WABBIT_BRAND_SIGN_NAME",
         "WABBIT_BRAND_SIGN_MAGIC",
+        "WABBIT_POLICY_PUBLIC_KEY",
+        "WABBIT_EMBED_POLICY",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
+    }
+    // The baked policy file itself can also change *in place* — a
+    // deployment re-signs the same path — without its env-var value (the
+    // path string) changing at all. The script's output (the nested wabbit
+    // it embeds here) depends on that file's content, so declare it.
+    if let Some(path) = env::var_os("WABBIT_EMBED_POLICY") {
+        println!("cargo:rerun-if-changed={}", path.to_string_lossy());
     }
     let cargo_metadata::Metadata { packages, .. } = cargo_metadata::MetadataCommand::new()
         .no_deps()

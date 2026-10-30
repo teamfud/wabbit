@@ -8,6 +8,11 @@ edition.workspace = true
 
 license.workspace = true
 
+[dev-dependencies]
+# The end-to-end IPC test drives the real signed-command client against
+# the real server, on a real socket, through a real signature.
+wabbit-ipc = { path = "../wabbit-ipc" }
+
 [dependencies]
 wabbit-common = { path = "../wabbit-common", features = ["user"] }
 wabbit-policy = { path = "../wabbit-policy", default-features = false }
@@ -39,6 +44,11 @@ procfs = { version = "0.18.0", features = ["flate2"] }
 anyhow = { workspace = true }
 aya-build = { workspace = true }
 cargo_metadata = { workspace = true }
+# Verifies a baked-in policy (`WABBIT_EMBED_POLICY`) against this build's
+# compiled-in keys — see build.rs's `embed_policy` — and hashes its bytes
+# into the embedded file's name (the cache-busting path).
+wabbit-common = { path = "../wabbit-common" }
+wabbit-policy = { path = "../wabbit-policy", default-features = false }
 # TODO(https://github.com/rust-lang/cargo/issues/12375): this should be an artifact dependency, but
 # it's not possible to tell cargo to use `-Z build-std` to build it. We cargo-in-cargo in the build
 # script to build this, but we want to teach cargo about the dependency so that cache invalidation

@@ -278,15 +278,17 @@ run_test() {
   # freeze, cgroup2, the memfd wabbit — and wabbit itself gets tested on
   # every distro, not just its protector.
   #
-  # The success state has no ssh in it: a started wabbit parks waiting for
-  # Ctrl-C, wabbit-initrd babysits it with the world FROZEN (the documented
-  # design until the handoff step exists), and the freeze stops the guest's
-  # timeout(1) and sshd with it. Nothing guest-side can end the run, so the
+  # The success state has no ssh in it during the run: a started wabbit
+  # parks waiting for Ctrl-C while wabbit-initrd is still alive and the
+  # world FROZEN, and the freeze stops the guest's timeout(1) and sshd with
+  # it. The handoff completes the run on its own — wabbit-initrd's
+  # pre-shutdown self-test, the go-ahead, its exit — and the world thaws
+  # with it, but nothing guest-side needs to do anything for a PASS, so the
   # runner sends wabbit-initrd's output to /dev/console and the host
   # follows the qemu serial console, which drains no matter what the guest
   # does. PASS = the console shows wabbit-initrd's phases and wabbit's
-  # parking marker; the teardown destroys the VM (and with it the frozen
-  # world — nothing else can).
+  # parking marker; the teardown destroys the VM (and with it the parked
+  # wabbit — nothing else can).
   #
   # The failure paths thaw (the Drop backstop or the watchdog resume the
   # world when wabbit-initrd exits), so the host polls for the exit marker
@@ -327,7 +329,7 @@ EOF
     if grep -q "Waiting for Ctrl-C" "$console" 2>/dev/null; then
       echo "=== the run as seen on the serial console ==="
       console_excerpt "$console"
-      echo "PASS: wabbit started and parked (world frozen by design until teardown)"
+      echo "PASS: wabbit started and parked (the handoff completed; wabbit-initrd exited by design)"
       return 0
     fi
     # The watchdog firing is the run's terminal event: it only prints when
@@ -354,6 +356,17 @@ EOF
     if status=$(vm_ssh "$distro" \
         'test -f /run/wabbit/exit-status && cat /run/wabbit/exit-status' \
         2>/dev/null); then
+      # wabbit-initrd exited. A completed handoff races wabbit's parking
+      # marker by moments (the initrd exits at wabbit's ack; wabbit parks
+      # right after), so settle before treating the exit as terminal —
+      # the marker means PASS even though the initrd is already gone.
+      sleep 3
+      if grep -q "Waiting for Ctrl-C" "$console" 2>/dev/null; then
+        echo "=== the run as seen on the serial console ==="
+        console_excerpt "$console"
+        echo "PASS: wabbit started and parked (the handoff completed; wabbit-initrd exited by design)"
+        return 0
+      fi
       break
     fi
     sleep 3
@@ -414,15 +427,15 @@ test_distros=(noble jammy bookworm rocky)
 # own initramfs extension points, the lsm=bpf enrollment, the initramfs
 # rebuild — then reboot and watch the boot chain run for real.
 #
-# The second boot never finishes: wabbit-initrd babysits wabbit with the
-# world frozen and the pre-switch wait holds the init there, which is the
-# documented choreography until the handoff step exists. So the guest
-# answers no ssh during the test (sshd is frozen; the boot never reaches
-# it anyway) — the host follows the serial console instead, which qemu
-# drains into a host-side file no matter what the guest does. winit's log
-# lines and wabbit's printlns land there; the bnuuy sign itself lives in
-# the initramfs /run and cannot be retrieved, but every phase it records
-# is also logged at info.
+# The second boot finishes for real now: the handoff completes inside the
+# initrd (wabbit announces readiness, wabbit-initrd runs its pre-shutdown
+# self-test against the enforcing guard, exchanges the go-ahead, exits),
+# the init's pre-switch wait releases at wabbit-initrd's death, switch_root
+# runs, systemd boots, and wabbit — spared by argv[0][0] == '@' — joins
+# PID 1's namespace, chroots into its view of the root, polls systemd up,
+# and parks. The host still follows the serial console (the console is
+# the one channel that needs nothing guest-side); the marker now arrives
+# after the full boot, so the verdict window covers it.
 deploy() {
   # The EXIT trap fires at script exit — long after this function has
   # returned and its locals have died — so `distro` must be the global,
@@ -463,7 +476,7 @@ deploy() {
     if grep -q "Waiting for Ctrl-C" "$console" 2>/dev/null; then
       echo "=== the boot chain as seen on the console ==="
       console_excerpt "$console"
-      echo "PASS: $distro booted installer → initramfs hooks → wabbit-initrd → wabbit (running, world frozen by design)"
+      echo "PASS: $distro booted installer → initramfs hooks → wabbit-initrd → handoff → switch_root → wabbit (parked, serving from the booted root)"
       break
     fi
     if [ "$waited" -ge "$deadline" ]; then

@@ -93,7 +93,25 @@ fn main() {
 fn run() -> Result<i32> {
     // The brand, not the crate's module path, prefixes console output.
     env_logger::Builder::from_env(env_logger::Env::default())
-        .format(|buf, record| writeln!(buf, "[{} {}] {}", NAME, record.level(), record.args()))
+        .format(|buf, record| {
+            // Wall-clock epoch milliseconds: std-only (the `humantime`
+            // feature that backs env_logger's own timestamps drags a
+            // datetime crate into a static initrd binary), and enough to
+            // order two processes' interleaved console lines — the trust
+            // rendezvous race was diagnosed on exactly that ordering.
+            let millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_millis())
+                .unwrap_or_default();
+            writeln!(
+                buf,
+                "[{} {} {:5.5}] {}",
+                NAME,
+                millis,
+                record.level(),
+                record.args()
+            )
+        })
         .init();
     // Panics go through the sign too: the world's rescue is the `Drop`
     // backstop's job, this is only the forensic trail.
@@ -161,17 +179,20 @@ fn run() -> Result<i32> {
     ));
 
     // wabbit starts on the frozen world, inside its cgroup, with argv[0][0]
-    // set to '@' so the switch-root kill spares it, and the initrd babysits
-    // it to keep the `Ebpf` handle — and with it every bnuuy link — alive
-    // for exactly as long as wabbit runs. The world stays frozen through
-    // that in the startup sequence, but a dead initrd must never leave it
-    // that way.
-    let launched = launch::launch_embedded_wabbit(&mut ebpf, &cgroup.path);
+    // set to '@' so the switch-root kill spares it. The launch runs the
+    // handoff exchange — wabbit's readiness announcement, the pre-shutdown
+    // self-test against the enforcing guard, the go-ahead — and returns
+    // while wabbit runs on; the world resume below is what releases it
+    // from the freeze, and the exit right after is what releases the init
+    // into switch_root. Only wabbit crosses that line.
+    let handoff = launch::launch_embedded_wabbit(&mut ebpf, &cgroup.path);
     world.resume().context("resuming the world")?;
     sign::phase("resumed the world");
-    let code = launched?;
-    sign::phase(&format!("{NAME} exited with code {code}"));
-    Ok(code)
+    handoff?;
+    sign::phase(&format!(
+        "handoff complete: {NAME} runs on alone now; this process exits before switch_root"
+    ));
+    Ok(0)
 }
 
 /// Fail fast on an unusable environment, before the first freeze.

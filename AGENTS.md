@@ -14,6 +14,22 @@ policy tool, and one eBPF program:
 The project is intended for controlled blue-team and regulated CTF use. It
 requires Linux mount and eBPF privileges and is not an EDR.
 
+## Agent conventions
+
+Long or noisy commands (lab runs, workspace builds, artifact chains) never
+stream their raw output into the transcript: it truncates or drowns. Run
+them redirected into a log under `/tmp/opencode/` and show a tailed,
+grep'd excerpt instead:
+
+```sh
+./vm/qemu/lab.sh test noble >/tmp/opencode/test-noble.log 2>&1
+tail -n 40 /tmp/opencode/test-noble.log
+```
+
+`/tmp/opencode` is pre-created and approved for this; keep every run's
+evidence there (its log stays for the whole session — re-read it rather
+than re-running multi-minute commands).
+
 ## Workspace and build flow
 
 The root `Cargo.toml` defines the workspace. Building the `wabbit` package
@@ -84,24 +100,26 @@ default, and without it nothing of bnuuy can attach). Two flows:
   with the live root bind-mounted at `/sysroot` so the sysroot poll
   completes and the real launch path — the second freeze, cgroup2, the
   memfd wabbit — actually runs, testing wabbit itself on every distro.
-  The success state has no ssh in it (wabbit parks while wabbit-initrd
-  babysits it with the world frozen, the documented design until the
-  handoff step exists, and the freeze stops the guest's timeout and sshd
-  too), so the runner sends wabbit-initrd's output to the console and
-  the verdict watches the qemu serial console for the phase lines and
-  wabbit's `Waiting for Ctrl-C` marker; teardown destroys the frozen
-  world. The failure paths thaw (the Drop backstop or the watchdog),
-  so the host pulls the bnuuy sign out over ssh as the forensic record.
+  The handoff completes the run (wabbit announces readiness, wabbit-initrd
+  self-tests, exchanges the go-ahead, and exits), and wabbit — started
+  outside an initramfs — skips the switch-root crossing and parks. The
+  runner sends wabbit-initrd's output to the console and the verdict
+  watches the qemu serial console for the phase lines and wabbit's
+  `Waiting for Ctrl-C` marker; teardown destroys the VM (and the parked
+  wabbit with it). The failure paths thaw (the Drop backstop or the
+  watchdog), so the host pulls the bnuuy sign out over ssh as the
+  forensic record.
 * `deploy <distro>` proves the placement: `wabbit-install` (built musl —
   the host glibc is newer than every guest's) is uploaded and run as
   root, placing the artifact through the distro's own initramfs
   extension points, enrolling `lsm=bpf`, and rebuilding the initramfs;
   the reboot boots the real chain (init → launch hook → wabbit-initrd →
-  sysroot poll → wabbit), which never finishes by design — wabbit is
-  babysat frozen and the pre-switch wait holds the init — so the verdict
-  watches the qemu serial console (the launch hook's `>/dev/console`
-  redirect) for winit's info lines and wabbit's `Waiting for Ctrl-C`
-  marker.
+  sysroot poll → wabbit → handoff → `switch_root` → systemd), and
+  wabbit crosses for real: spared by `argv[0][0] == '@'`, it joins PID
+  1's mount namespace, chroots into its view of the root, polls
+  systemd up, and parks — so the verdict watches the qemu serial
+  console (the launch hook's `>/dev/console` redirect) for winit's
+  info lines and wabbit's `Waiting for Ctrl-C` marker.
 
 `vm/README.md` documents the flow and the per-distro
 kernel-compatibility expectations; a Vagrantfile exists for VirtualBox
@@ -137,10 +155,19 @@ The intended startup path begins in the initrd:
    and starts the embedded `wabbit` (materialized at runtime) with
    `argv[0][0]` set to `@` so systemd's switch-root kill spares it, moving
    it into the wabbit cgroup before it can fork and granting its PID
-   `bpf(2)` trust in the bnuuy map. Until the handoff step exists, the
-   initrd babysits wabbit with the world frozen and resumes it if wabbit
-   exits or fails to start. `wabbit-initrd` exits before `switch_root`;
-   only `wabbit` crosses the transition.
+   `bpf(2)` trust in the bnuuy map. The handoff then runs over a socketpair
+   duped into the child (`wabbit_common::handoff`): the grant itself is
+   announced with a `trusted` message, because `wabbit`'s first `bpf(2)`
+   call — the guard object's first map create — races the insert and a
+   lost race reads the trust map without its PID (`EPERM`, measured as
+   nondeterministic across boots of the same artifact); `wabbit` blocks on
+   the message before anything touches `bpf(2)`, then announces readiness,
+   `wabbit-initrd` runs its pre-shutdown self-test against the
+   enforcing guard, exchanges the go-ahead, and exits — its bnuuy links
+   detach with it, the world thaws with the caller's resume, and the init's
+   pre-switch wait releases at its death into `switch_root`.
+   `wabbit-initrd` exits before `switch_root`; only `wabbit` crosses the
+   transition.
 5. `wabbit` starts as the outer process. It opens and retains descriptors for
    `/proc`, `/sys`, `/dev`, and related filesystems before they move under
    `/sysroot` (`wabbit/src/runtime.rs`); reads and verifies the WSPF
@@ -155,19 +182,32 @@ The intended startup path begins in the initrd:
    trust — each performs exactly one syscall, and the observing phase asserts
    the gates fired and traced their decisions into `DECISIONS` (with the
    workers' forks kernel-recorded in `FORK_EVENTS`) before the enforcing
-   flip re-runs the steps expecting `EPERM`. Under wabbit-initrd's babysit,
+   flip re-runs the steps expecting `EPERM`. While `wabbit-initrd` lives,
    bnuuy's earlier-attached gates shadow guard's for the hooks both defend
    (`bpf`, `kernel_read_file`, module-tree writes, bpffs opens) — those
    steps run enforcing-only, proving *a* denial, while the reachable steps
    (mount over the protected cgroup paths, netfilter netlink socket, a
    writable cgroupfs open, legacy firewall `setsockopt`) prove guard's own
-   gates in both phases. Policy-driven map content (`AUTHORIZATIONS`,
-   `PATH_RULES`) is the next phase: the gates consult them, nothing populates
-   them yet.
-   The final pre-shutdown test with `wabbit-initrd`, and letting the initrd
-   process exit, is the not-yet-implemented handoff step.
-7. After initrd handoff, `wabbit` waits for systemd, obtains systemd's view of
-   the root through `/proc/1/root`, and chroots into the main root. Signed IPC
+   gates in both phases. The `MODULE_LOADS`-empty assertion covers the
+   enforcing phase only: the observing phase *allows* every reachable
+   syscall by design, and on a modular kernel some of those legitimately
+   auto-load in-tree modules (the firewall step's legacy `setsockopt`
+   requests `ip_tables` via modprobe on Rocky 9 — measured), so the flip
+   clears the trace before the enforcing round asserts it empty.
+   The handoff completes the startup: `wabbit` announces readiness on the
+   handoff socket, `wabbit-initrd` runs its pre-shutdown self-test
+   (`verify::verify_handoff` — kmod, bpf, and modules-write workers from
+   its own PID, which no trust map vouches for), sends the go-ahead, and
+   exits at wabbit's ack.
+7. After the handoff, `wabbit` crosses the transition: it polls PID 1's root
+   through the held procfs descriptor (`1/root` — its `(st_dev, st_ino)`
+   diverging from its own marks `switch_root` done), joins PID 1's mount
+   namespace (`1/ns/mnt`, on the main thread before the Tokio runtime —
+   `setns(CLONE_NEWNS)` refuses a shared `fs_struct`), chroots into PID 1's
+   view of the root, and polls `/run/systemd/private` for systemd's
+   readiness (`wabbit/src/handoff.rs`). A `wabbit` started outside an
+   initramfs (the lab's `test` flow, a standalone run) skips the crossing:
+   the root is not rootfs, so there is nothing to cross into. Signed IPC
    requests can then create an authorized child cgroup, grant that cgroup
    permissions through the eBPF maps, and spawn an interactive process.
 
@@ -361,11 +401,22 @@ init-premount/init-bottom hooks for initramfs-tools, pre-mount/pre-pivot
 hooks via a 90wabbit dracut module — plus the `lsm=bpf` kernel command
 line (skipped where the BPF LSM is already active) and the initramfs
 rebuild, with `--dry-run`, `--remove`, and `--no-switch-wait` (omit the
-pre-switch_root wait) available. Its build script bundles the
+pre-switch_root wait) available. The dracut module's hooks are installed
+through dracut's own `inst_hook`: a module's `install()` hook must never
+invoke `install(1)` by bare name — bash resolves it to the `install()`
+function the module itself defines, recursing until the C stack dies,
+and dracut goes down with a bare SIGSEGV that looks exactly like a distro
+bug (measured on Rocky 9.8; the same recursion is why the bare-name trap
+is worth its own sentence here). Its build script bundles the
 `wabbit-initrd` artifact into the installer — a nested musl build in a
 private target directory, the same arrangement `wabbit-initrd` uses to
 embed wabbit — so the installer carries its artifact and needs no
-checkout on the target system; `--artifact` overrides the bundle.
+checkout on the target system; `--artifact` overrides the bundle. The
+same build script bundles the `wabbit-ipc` client the same way, and the
+installer writes it to `/usr/local/bin/<name>-ipc` (every target
+distro's PATH) during install — the box gets a working signed-command
+client with no second upload; `--client` overrides the bundle, and
+`--remove` takes the client back out.
 
 All of wabbit-initrd's mounts (bpffs at `/sys/fs/bpf`, tracefs at
 `/sys/kernel/tracing`, cgroup2 at `/sys/fs/cgroup`) target mount points the
@@ -383,7 +434,7 @@ but deletes the initramfs rootfs (memfd-launched wabbit is unaffected), while
 a systemd initrd's switch-root kills every leftover process except those
 whose `argv[0][0]` is `@` — which wabbit gets from its launcher.
 
-The bnuuy eBPF code follows three disciplines the VM lab proved load-bearing:
+The bnuuy eBPF code follows four disciplines the VM lab proved load-bearing:
 
 * **one shared `bpf_d_path` buffer per hook** (256 bytes, passed by `&mut`):
   two buffers in separate frames overflow the 512-byte eBPF stack limit once
@@ -396,7 +447,20 @@ The bnuuy eBPF code follows three disciplines the VM lab proved load-bearing:
   a `no_std` eBPF program has its panic path outlined into `.text.unlikely.`
   with a relocation against a section symbol nothing resolves, which
   silently guts the program at load time — the symptom is a verifier report
-  of zero processed instructions and "last insn is not an exit or jmp".
+  of zero processed instructions and "last insn is not an exit or jmp";
+* **no variable-offset stack reads**: a runtime-indexed byte read
+  (`slice.get(i)` with `i` from a loop bound, or `buf.get(len - 1)` with
+  `len` from `bpf_d_path`) lowers to `*(u8 *)(fp + off)` with a scalar
+  offset, and the 5.15 and 6.1 verifiers reject it outright ("invalid
+  variable-offset read from stack", measured on jammy/bookworm; 5.14 and
+  6.8 accept it, so the failure reads as kernel-random until a verbose dump
+  pins it). Every runtime-indexed byte read goes through
+  `bpf_probe_read_kernel` instead — the helper's destination is a fixed
+  stack slot and its source is `ARG_ANYTHING`, so the offset is always
+  provable; fixed-index reads (`get(..n)` on a constant) are unaffected.
+  bnuuy never trips this because it has no loops and never strips a NUL;
+  the guard's FNV-1a walks and NUL strip do, and `paths.rs`'s
+  `read_indexed` is the load-bearing shape.
 
 ### Failure safety
 
@@ -465,28 +529,56 @@ worker's fork, and the `MODULE_LOADS` map must stay empty.
 ## IPC
 
 The namespace process optionally exposes a Unix-domain socket named through
-`WABBIT_IPC_SOCKET`. `wabbit/src/ipc.rs` uses a small length-prefixed binary
-protocol:
+`WABBIT_IPC_SOCKET`. Every request is a **signed command** — the wire layout
+lives in `wabbit-common/src/ipc_command.rs`, shared byte-for-byte with the
+client — and the server (`wabbit/src/ipc.rs`) gates each one three ways, in
+order:
 
-- request `1`: execute a program and arguments in the namespace;
-- request `2`: apply a signed `Policy`;
-- response `1`: process output and exit status;
-- response `2`: operation failure and message;
-- response `3`: filesystem configuration applied.
+1. **the signature**: Ed25519 over the whole envelope, verified against the
+   compiled-in policy keys (the deployment's signing key signs policies *and*
+   commands; the magic differs — `WBIC` vs `WSPF` — so neither can replay as
+   the other);
+2. **the boot id**: the command names the boot it was minted for (from
+   `/proc/sys/kernel/random/boot_id`), and the server reads its own once at
+   startup — a command from any other boot is refused, which is what makes
+   the per-boot counter below sufficient;
+3. **the command id**: a `u64` that must be *strictly greater* than the last
+   accepted this boot, burned on acceptance — so the exact bytes of a command
+   that already ran (a captured request, a double-sent client) are rejected
+   by construction.
 
-`NamespaceIpc` is the client API. `run_task` returns captured stdout, stderr,
-and the process exit code. `reconfigure_filesystems` sends a complete signed
-policy file (the bytes produced by `policy::sign`). The server verifies the
-signature and parses the policy before doing anything else, then applies each
-section the policy contains (today, the rootfs section with `inner = true`)
-while holding a mutex. It merges the new policy into its stored policy only
-after that succeeds; sections the policy omits are left unchanged. Unsigned or
-tampered policies are rejected without touching any mounts.
+Unsigned requests are refused by name (the error tells the caller to use
+`wabbit-ipc`). The socket itself still decides who may *connect*: set its
+ownership and permissions for the operator class; the signature decides what
+a connected client can make wabbit do.
 
-The socket otherwise has no application-level authentication or authorization,
-and task execution requests are not signed. Task operations should therefore be
-protected by socket ownership/permissions and by the surrounding service
-isolation before exposing the socket to untrusted users.
+Two commands exist, both in the envelope: **run** — execute a program in the
+namespace, capturing output — and **reconfigure** — apply a complete *signed
+policy file*, which the server verifies *again*, against the same keys,
+before applying anything. A reconfigure is double-signed by construction.
+The server applies each section the policy contains (today, the rootfs
+section with `inner = true`) while holding a mutex, and merges the new
+policy into its stored policy only after that succeeds; omitted sections
+are left unchanged, and a policy that fails verification or application
+touches no mounts and burns its command id (a failed command cannot come
+back — the signer mints a fresh one).
+
+`wabbit-ipc` is the client crate: the library
+(`wabbit_ipc::CommandClient`) manages the counter file, the boot id, the
+envelope, and the signature, and the binary is the human entry point —
+
+```sh
+wabbit-ipc --key policy.key run sh -c 'uptime'    # run in the namespace
+wabbit-ipc --key policy.key policy policy.wspf    # apply a signed policy
+wabbit-ipc --key policy.key send "$(wabbit-ipc encode-run sh -c uptime)"
+```
+
+The counter file (default `~/.wabbit-ipc-counter`) is the client's half of
+the anti-replay: one monotonic `u64` per signing key, read-and-increment
+per command. Everything signing with a given key must share one counter
+(the strictly-increasing check is server-global, not per client). A lost
+or damaged counter restarts from the bottom and fails safe — the server
+refuses any id it has already accepted.
 
 ## Trust helpers
 
@@ -500,8 +592,10 @@ The signed-string format is:
 `extract_signed_string` validates and returns the payload without verifying
 the signer. `verify_signed_string` parses a 32-byte public key supplied as
 standard base64 or hexadecimal, verifies the exact UTF-8 payload bytes, and
-returns the payload only on success. The trust layer is not currently wired
-into filesystem configuration loading or IPC authorization.
+returns the payload only on success. Filesystem configuration loading
+verifies its policy through the WSPF format's own signature, and the IPC
+server verifies its commands through `compiled_public_keys` — the same
+compiled-in key list both sides share with the policy format.
 
 ## Binary policy files
 
@@ -571,6 +665,49 @@ v3→v4 is one version bump; the v3 single-key format has shipped nowhere.
 * One tool serves both flows: boot-time policy *and* runtime rotation (the
   IPC `Reconfigure` request applies a complete signed policy — same file,
   same tool).
+
+**Baked-in policy (first-install path).** `WABBIT_EMBED_POLICY=<signed
+.wspf>` at build time makes `wabbit/build.rs` copy the file into `OUT_DIR`
+under a **content-hashed name**, **verify it against this build's compiled-in
+policy keys** (a chain that would refuse its own policy never ships), and
+flip the `embedded_policy` cfg so `include_bytes!` embeds it in the wabbit
+binary. The env propagates through `wabbit-initrd`'s nested build, so a
+baked policy rides the wabbit binary inside `wabbit-initrd` inside the
+initramfs image — no filesystem footprint at all. The content-hash and the
+`rerun-if-changed`/`rerun-if-env-changed` declarations in every nested
+build script (`wabbit`, `wabbit-initrd`, `wabbit-install`) are load-bearing:
+`option_env!` and the embed are consumed by *nested* cargo runs that the
+outer builds invoke, and cargo only reruns a script on vars/paths it
+declared — without the declarations a changed key or a re-signed same-path
+policy leaves every script "fresh", the nested builds never re-run, and the
+chain silently ships a stale embed from the previous deployment. Runtime
+precedence (`configured_policy`): the env-var file
+(`<prefix>_FILESYSTEM_CONFIGURATION_FILE` — the installer's
+`--policy`, which installs to `/etc/<name>/policy.wspf`, copies into the
+image, and exports the env var from the launch hook; also the IPC rotation
+path) overrides the baked policy, which overrides `Policy::default()`.
+The runtime re-verifies the embedded bytes, so a tampered binary cannot
+smuggle a policy; the build-time check is for the builder's own mistakes.
+
+**The deployment generator** (`vm/generate-deployment.sh`, gum for progress
+output only — no prompts): `--source`/`--bake`/`--key` flags in, one
+deployment directory out. Builds the CLI, generates or reuses the signing
+keypair, signs the TOML source (`<out>/policy.toml`) into
+`<out>/policy.wspf`, verifies the round trip with `wabbit-policy inspect
+--public-key`, builds the musl chain with `WABBIT_POLICY_PUBLIC_KEY`
+exported (compiled into every wabbit binary; and `WABBIT_EMBED_POLICY`
+baking the policy into the wabbit binary when `--bake`), and copies the
+artifacts in: the static-musl signing CLI (`wabbit-policy` — its `inspect`
+verifies natively against this deployment's compiled-in key, on any
+host), the artifact, the installer, and a client copy. `policy.key` stays
+off every box; the box needs only `wabbit-install` (plus `policy.wspf`
+when not baked) — the installer carries the chain and the client tool
+inside itself.
+
+**`wabbit-policy inspect --public-key <hex>`**: `WABBIT_POLICY_PUBLIC_KEY`
+is `option_env!` — compile-time only — so verifying a deployed keypair's
+policy needs the explicit flag; the CLI's default verifies against the
+compiled-in keys.
 
 **TOML source** (the `authorization` section, v4, alongside `rootfs`):
 

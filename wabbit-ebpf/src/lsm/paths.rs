@@ -15,12 +15,25 @@
 //!   index has its panic path outlined into `.text.unlikely.` with a
 //!   relocation against a section symbol nothing resolves, which silently
 //!   guts the program at load time;
+//! * **runtime-indexed byte reads go through `bpf_probe_read_kernel`**
+//!   (`read_indexed`), never a direct `slice.get(index)` — that lowers to
+//!   a **variable-offset stack read**, which the 5.15 and 6.1 verifiers
+//!   reject outright ("invalid variable-offset read from stack", measured
+//!   on the matrix; 5.14 and 6.8 accept it, so the failure reads as
+//!   kernel-random until a verbose dump pins it). The helper takes its
+//!   destination as a fixed stack slot and its source as `ARG_ANYTHING`,
+//!   so a runtime offset is always provable. Fixed-index reads
+//!   (`get(..n)` on constant `n`) are unaffected: bnuuy's matrix-proven
+//!   prefix comparisons use them everywhere;
 //! * **`bpf_d_path` needs trusted provenance** — `&file->f_path` is pure
 //!   pointer arithmetic (never dereferenced, never copied to the stack),
 //!   so the register stays a `PTR_TO_BTF_ID` and the verifier checks the
 //!   offset against the running kernel's BTF.
 
-use aya_ebpf::{bindings, helpers::bpf_d_path};
+use aya_ebpf::{
+    bindings,
+    helpers::{bpf_d_path, bpf_probe_read_kernel},
+};
 use wabbit_common::authorization::{
     FLAG_PATH_RULES_DEFAULT_DENY, PATH_RULE_ALLOW, PATH_RULE_DENY, PathRuleKey,
 };
@@ -89,6 +102,16 @@ pub mod file_layout {
 /// continuations). Strip the NUL here, once, so every consumer —
 /// `names_or_contains` equality, the protected-path walk, the rule walk —
 /// hashes the same bytes the userspace key convention does.
+///
+/// The NUL byte itself is read through `bpf_probe_read_kernel`, never a
+/// direct `buffer.get(length - 1)`: `length` is a runtime value, so a
+/// direct read is a **variable-offset stack read**, which the 5.15 and 6.1
+/// verifiers reject outright ("invalid variable-offset read from stack",
+/// measured on the matrix — 5.14 and 6.8 accept it, so the failure looked
+/// kernel-random until the verbose dumps pinned it). The helper takes its
+/// destination as a fixed stack slot and its source as `ARG_ANYTHING`, so
+/// a runtime offset costs nothing the verifier cannot prove.
+///
 /// # Safety
 /// This function dereferences raw pointers.
 #[inline(always)]
@@ -101,38 +124,46 @@ pub unsafe fn resolve(
         return None;
     }
     let mut length = length as usize;
-    // `get`, never a panicking slice (see the module docs).
-    if length > 0 && buffer.get(length - 1) == Some(&0) {
-        length -= 1;
+    // `get`, never a panicking slice (see the module docs) — and the
+    // NUL-strip read goes through the helper (see above).
+    if length > 0 {
+        let last = unsafe { read_indexed(buffer.as_ptr(), length - 1) };
+        if last == Some(0) {
+            length -= 1;
+        }
     }
     buffer.get(..length)
 }
 
-/// Byte-wise equality. `==` on slices lowers to a `memcmp` call LLVM
-/// outlines into `.text`; bnuuy's matrix-proven object carries `memset`
-/// alone, and this keeps the guard in the same call class — the hand loop
-/// emits no call at all.
+/// One byte at a runtime index, read through `bpf_probe_read_kernel`:
+/// every runtime-indexed byte read in this module goes through here, never
+/// a direct `slice.get(index)`, because that lowers to a variable-offset
+/// stack read which the 5.15 and 6.1 verifiers reject (see [`resolve`]).
+///
+/// `index` must be within `base`'s length — the callers' loop bounds
+/// enforce it before the call.
+///
+/// # Safety
+/// This function dereferences `base` at `index`.
 #[inline(always)]
-fn bytes_equal(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
+unsafe fn read_indexed(base: *const u8, index: usize) -> Option<u8> {
+    let byte = unsafe { bpf_probe_read_kernel(base.wrapping_add(index)) };
+    match byte {
+        Ok(byte) => Some(byte),
+        Err(_) => None,
     }
-    let mut index = 0;
-    // `get`, never indexing (see the module docs).
-    while index < left.len() {
-        if left.get(index) != right.get(index) {
-            return false;
-        }
-        index += 1;
-    }
-    true
 }
 
 /// Does `resolved` name `base` itself, or something directly inside it?
+///
+/// The prefix comparison is a slice equality, bnuuy's matrix-proven shape:
+/// the lengths are compiler-known constants (≤ 16 bytes each), so the
+/// compare lowers to inline loads — never an outlined `memcmp` call, the
+/// class bpf-linker cannot relocate (see the module docs).
 #[inline(always)]
 pub fn names_or_contains(resolved: &[u8], base: &[u8]) -> bool {
     match resolved.get(..base.len()) {
-        Some(prefix) if bytes_equal(prefix, base) => {
+        Some(prefix) if prefix == base => {
             resolved.len() == base.len() || resolved.get(base.len()) == Some(&b'/')
         }
         _ => false,
@@ -212,9 +243,11 @@ pub fn under_protected_cgroup(resolved: &[u8]) -> bool {
     let len = resolved.len().min(PATH_WALK_CAP);
     let mut hash = FNV_OFFSET_BASIS;
     let mut index = 0;
-    // `get`, never indexing (see the module docs).
+    // Every byte read goes through `read_indexed` (see it): a direct
+    // `resolved.get(index)` is a variable-offset stack read, which the
+    // 5.15 and 6.1 verifiers reject.
     while index < len {
-        let Some(&byte) = resolved.get(index) else {
+        let Some(byte) = (unsafe { read_indexed(resolved.as_ptr(), index) }) else {
             break;
         };
         if byte == b'/' && index > 0 {
@@ -270,14 +303,15 @@ pub fn path_rule_denies(resolved: &[u8]) -> bool {
 
     // One forward pass, remembering the deepest matching rule's verdict.
     // The cap is a constant, so the verifier sees a bounded loop (see
-    // [`PATH_WALK_CAP`]).
+    // [`PATH_WALK_CAP`]); every byte read goes through `read_indexed`
+    // (see it — a direct `resolved.get(index)` is a variable-offset stack
+    // read the 5.15 and 6.1 verifiers reject).
     let len = resolved.len().min(PATH_WALK_CAP);
     let mut deepest: Option<bool> = None;
     let mut hash = FNV_OFFSET_BASIS;
     let mut index = 0;
-    // `get`, never indexing (see the module docs).
     while index < len {
-        let Some(&byte) = resolved.get(index) else {
+        let Some(byte) = (unsafe { read_indexed(resolved.as_ptr(), index) }) else {
             break;
         };
         if byte == b'/' && index > 0 {

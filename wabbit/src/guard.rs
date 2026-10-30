@@ -18,9 +18,9 @@
 //!
 //! # Which denials are provable, honestly
 //!
-//! wabbit-initrd's bnuuy gates stay attached while it babysits wabbit (the
-//! handoff step does not exist yet), and LSM hooks run in attach order:
-//! bnuuy attached first, and the LSM chain stops at the first denial — so
+//! wabbit-initrd's bnuuy gates stay attached while it lives (until the
+//! handoff's exit), and LSM hooks run in attach order: bnuuy attached
+//! first, and the LSM chain stops at the first denial — so
 //! for the hooks both defend (`bpf`, `kernel_read_file`, module-tree
 //! writes, bpffs opens) bnuuy's verdict wins and guard's gate never runs.
 //! A worker there is *still denied* (defense in depth), but the denial is
@@ -203,6 +203,29 @@ impl Guard {
         self.set_enforcing(ENFORCE).context("flipping ENFORCING")?;
         info!("guard is enforcing");
 
+        // The enforcing phase owns the module-load assertion: the
+        // observing phase *allows* every reachable syscall by design, and
+        // some of those legitimately trigger in-tree auto-loads on
+        // modular kernels (the firewall step's legacy `setsockopt`
+        // requests `ip_tables`, loaded by modprobe, on Rocky 9 — measured).
+        // Clear the trace here so the assertion below proves the
+        // protection, not the observation.
+        let mut module_loads: HashMap<_, u32, u8> = self
+            .ebpf
+            .map_mut("MODULE_LOADS")
+            .context("finding MODULE_LOADS")?
+            .try_into()
+            .context("opening MODULE_LOADS")?;
+        let observed: Vec<u32> = module_loads
+            .keys()
+            .collect::<Result<Vec<u32>, MapError>>()
+            .context("reading MODULE_LOADS")?;
+        for pid in observed {
+            debug!("observing phase recorded a module load by pid {pid}");
+            let _ = module_loads.remove(&pid);
+        }
+        drop(module_loads);
+
         // The enforcing phase: the reachable steps must now be denied with
         // `EPERM`, and their forks still recorded.
         for (step, arg) in &reachable {
@@ -226,7 +249,9 @@ impl Guard {
         let pid = self.run_worker(&selftest_cgroup, STEP_MOUNT, &self.cgroup_string(), true)?;
         self.check_fork_event(pid, STEP_MOUNT)?;
 
-        // Nothing may have loaded a module in either phase.
+        // Nothing may have loaded a module while enforcing: the gates deny
+        // every untrusted load, and modprobe's request_module spawns run
+        // outside every trust map.
         let module_loads: HashMap<_, u32, u8> = self
             .ebpf
             .map_mut("MODULE_LOADS")
@@ -238,7 +263,10 @@ impl Guard {
             .collect::<Result<Vec<u32>, MapError>>()
             .context("reading MODULE_LOADS")?;
         if !loaders.is_empty() {
-            bail!("modules were loaded during the self-test by PIDs {loaders:?}");
+            bail!(
+                "modules were loaded during the enforcing self-test by PIDs {loaders:?}: \
+                 the module-load gates did not hold"
+            );
         }
 
         let _ = fs::remove_dir(&selftest_cgroup);

@@ -4,7 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
-# Deliberately dependency-free: the installer runs on target systems as
-# root, where less to build and less to trust is a feature.
+# Deliberately minimal: the installer runs on target systems as root,
+# where less to build and less to trust is a feature. rustix is a thin
+# syscall wrapper (the same one the rest of the workspace uses) and the
+# only dependency — it sets the installed files' mtimes.
 
 [dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }
