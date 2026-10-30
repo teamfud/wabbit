@@ -36,7 +36,7 @@ use aya_ebpf::{
 };
 use wabbit_common::authorization::{
     FLAG_PATH_RULES_DEFAULT_DENY, PATH_RULE_EXEC_ALLOW, PATH_RULE_EXEC_DENY, PATH_RULE_READ_ALLOW,
-    PATH_RULE_READ_DENY, PATH_RULE_WRITE_ALLOW, PATH_RULE_WRITE_DENY, PathRuleKey,
+    PATH_RULE_READ_DENY, PATH_RULE_WRITE_ALLOW, PATH_RULE_WRITE_DENY, PathRuleKey, Yard,
 };
 
 use crate::{
@@ -66,6 +66,11 @@ const BPFFS_PATHS: &[&[u8]] = &[b"/sys/fs/bpf"];
 /// The cgroupfs root. The gates key protected cgroups by hash of the
 /// canonical path *below this root* — no trailing `/`.
 pub const CGROUPFS_ROOT: &[u8] = b"/sys/fs/cgroup";
+
+/// The `/` count of [`CGROUPFS_ROOT`]: a cgroupfs prefix's level in the
+/// unified hierarchy (the root being level 0) is its slash count minus
+/// this.
+const ROOT_SLASHES: u32 = 3;
 
 /// `struct file` layouts, for the hooks that must reach into a `file` the
 /// kernel handed them. The struct was reordered mid-series — the
@@ -222,11 +227,12 @@ pub use wabbit_common::authorization::PATH_WALK_CAP;
 
 /// One FNV-1a step.
 #[inline(always)]
-const fn fnv_step(hash: u64, byte: u8) -> u64 {
+pub const fn fnv_step(hash: u64, byte: u8) -> u64 {
     (hash ^ byte as u64).wrapping_mul(FNV_PRIME)
 }
 
-/// Does `resolved` fall under a *protected* cgroupfs path?
+/// The deepest protected cgroupfs prefix `resolved` falls under, as that
+/// protected cgroup — the yard — or `None` when the path is not protected.
 ///
 /// One forward pass: the walk consumes each byte, maintaining the FNV-1a
 /// hash of the prefix consumed so far, and at every `/` boundary — where
@@ -236,18 +242,28 @@ const fn fnv_step(hash: u64, byte: u8) -> u64 {
 /// mount *target* is a complete path with no trailing `/`. The cgroupfs
 /// root's own boundaries (at or before [`CGROUPFS_ROOT`]) are skipped —
 /// the root is never a protected path, or every cgroupfs write would be
-/// walled off. A hash collision can only add a protected path, never
-/// remove one.
+/// walled off. The **deepest** match wins, so a path below a protected
+/// cgroup reports that cgroup (the yard the caller would have to already
+/// be inside — or below: the wall's insider rule walks the caller's
+/// ancestors, so a *worker sub-cgroup* of a protected unit cgroup is
+/// inside the yard too); a hash collision can only add a protected
+/// path, never remove one. The level of the matched boundary — its
+/// depth in the unified hierarchy, the root being level 0 — rides along
+/// in the [`Yard`].
 #[inline(always)]
-pub fn under_protected_cgroup(resolved: &[u8]) -> bool {
+pub fn under_protected_yard(resolved: &[u8]) -> Option<Yard> {
     if !is_cgroupfs_path(resolved) {
-        return false;
+        return None;
     }
     // The cap is a constant, so the verifier sees a bounded loop (see
     // [`PATH_WALK_CAP`]).
     let len = resolved.len().min(PATH_WALK_CAP);
     let mut hash = FNV_OFFSET_BASIS;
     let mut index = 0;
+    let mut yard: Option<Yard> = None;
+    // The `/` count of the consumed prefix: the root (`/sys/fs/cgroup`)
+    // has three, so a prefix's level below the root is `slashes - 3`.
+    let mut slashes: u32 = 0;
     // Every byte read goes through `read_indexed` (see it): a direct
     // `resolved.get(index)` is a variable-offset stack read, which the
     // 5.15 and 6.1 verifiers reject.
@@ -255,17 +271,32 @@ pub fn under_protected_cgroup(resolved: &[u8]) -> bool {
         let Some(byte) = (unsafe { read_indexed(resolved.as_ptr(), index) }) else {
             break;
         };
-        if byte == b'/' && index > 0 {
-            // The running hash is `path_hash(&resolved[..index])`.
-            if trust::protected(hash) {
-                return true;
+        if byte == b'/' {
+            // The running hash is `path_hash(&resolved[..index])`. A
+            // deeper yard overwrites a shallower one: the wall wants the
+            // cgroup the caller would have to already be inside or
+            // below.
+            if index > 0 {
+                if let Some(found) = trust::protected(hash) {
+                    yard = Some(Yard {
+                        level: slashes.saturating_sub(ROOT_SLASHES),
+                        ..found
+                    });
+                }
             }
+            slashes += 1;
         }
         hash = fnv_step(hash, byte);
         index += 1;
     }
     // The whole path — the final boundary, the mount-target case.
-    trust::protected(hash)
+    if let Some(found) = trust::protected(hash) {
+        yard = Some(Yard {
+            level: slashes.saturating_sub(ROOT_SLASHES),
+            ..found
+        });
+    }
+    yard
 }
 
 /// Is `resolved` exactly the cgroupfs root? (`sb_mount` targeting it mounts
@@ -312,7 +343,7 @@ impl PathOp {
 /// `wabbit_common::authorization::FLAG_PATH_RULES_DEFAULT_DENY`)
 /// resolve **longest-deciding-prefix-wins, per operation**: one forward
 /// pass — the same incremental FNV-1a walk as
-/// [`under_protected_cgroup`], with the running hash equal to
+/// [`under_protected_yard`], with the running hash equal to
 /// `path_hash` of the prefix consumed so far at every `/` boundary, and
 /// the whole path at the end — that remembers the verdict of the deepest
 /// *rule that decides this operation* seen: walking shallow to deep and

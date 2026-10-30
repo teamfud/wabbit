@@ -26,7 +26,7 @@ use aya_ebpf::{
     btf_maps::{Array, HashMap},
     macros::btf_map,
 };
-use wabbit_common::authorization::{Authorization, CgroupKey, PathRuleKey};
+use wabbit_common::authorization::{Authorization, CgroupKey, PathRuleKey, Yard};
 
 /// Per-cgroup authorization classes, keyed by the cgroup's id. Written by
 /// the userspace when an authorized child cgroup is created (the signed
@@ -52,12 +52,17 @@ pub static TRUSTED_PIDS: HashMap<u32, u32, 1024> = HashMap::new();
 
 /// The protected cgroupfs paths — wabbit's own cgroup and every cgroup
 /// holding an authorization bit — keyed by [`path_hash`] of the canonical
-/// path (see the module docs). The `file_open` and `sb_mount` gates deny
-/// writable opens and mounts under these for everyone outside them: that
-/// is the wall around `cgroup.procs` migration that the whole class model
-/// leans on.
+/// path, the value carrying that cgroup's kernfs id and hierarchy level
+/// (see [`Yard`]). The `file_open` and `sb_mount` gates deny writable opens
+/// and mounts under these for everyone outside them: that is the wall
+/// around `cgroup.procs` migration that the whole class model leans on.
+/// The id and level let the wall tell insiders from outsiders: a caller at
+/// or below the yard (systemd's unit children and daemons, already
+/// attached into the unit's cgroup by PID 1, opening `cgroup.procs` of
+/// their own subtree) is the yard's own housekeeping, not an outsider
+/// writing itself in.
 #[btf_map]
-pub static PROTECTED_PATHS: HashMap<u64, u32, 1024> = HashMap::new();
+pub static PROTECTED_PATHS: HashMap<u64, Yard, 1024> = HashMap::new();
 
 /// Per-cgroup path rules: the per-operation allow/deny path profiles
 /// (`wabbit-common/src/cgroup_types.rs`'s `PathProfile`, simplified —

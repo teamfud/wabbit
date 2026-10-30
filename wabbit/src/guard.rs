@@ -90,7 +90,7 @@ use rustix::{
 use wabbit_common::{
     authorization::{
         CODE_WOULD_DENY, CgroupKey, ENFORCE, HOOK_BIND, HOOK_FILE_OPEN, HOOK_SB_MOUNT,
-        HOOK_SETSOCKOPT, HOOK_SOCKET_CREATE, HOOK_TASK_KILL, decision_key, path_hash,
+        HOOK_SETSOCKOPT, HOOK_SOCKET_CREATE, HOOK_TASK_KILL, Yard, decision_key, path_hash,
     },
     brand::NAME,
 };
@@ -111,6 +111,15 @@ const TRACING_ROOT: &str = "/sys/kernel/tracing";
 /// lazy-preempt-padded one. See `wabbit-ebpf/src/tracepoints/watch.rs`.
 const CHILD_PID_VANILLA: usize = 44;
 const CHILD_PID_PREEMPT_LAZY: usize = 48;
+
+/// The `cgroup_mkdir` record layouts, for the yard keeper's
+/// variants: the `id` (u64) and the `path` `__data_loc` sit at 16/24 on a
+/// vanilla `trace_entry` header and at 24/32 behind RHEL's lazy-preempt
+/// pad. See `wabbit-ebpf/src/tracepoints/keeper.rs`.
+const DST_ID_VANILLA: usize = 16;
+const PATH_VANILLA: usize = 24;
+const DST_ID_PREEMPT_LAZY: usize = 24;
+const PATH_PREEMPT_LAZY: usize = 32;
 
 /// The loaded guard: the `aya::Ebpf` object, held for this process's whole
 /// lifetime because the attachment's lifetime *is* the enforcement — its
@@ -1334,15 +1343,17 @@ fn trust_self(ebpf: &mut aya::Ebpf, cgroup: &Path, cgroup_id: u64) -> Result<()>
 
     // The cgroup's path is protected: everything below it (cgroup.procs,
     // cgroup.freeze, cgroup.kill) is walled off for everyone outside it —
-    // the migration wall the whole class model leans on.
-    let mut protected: HashMap<_, u64, u32> = ebpf
+    // the migration wall the whole class model leans on. The value is the
+    // cgroup's own yard (id and level: the eBPF wall walks the opening
+    // caller's ancestors to tell the yard's insiders from outsiders).
+    let mut protected: HashMap<_, u64, Yard> = ebpf
         .map_mut("PROTECTED_PATHS")
         .context("finding PROTECTED_PATHS")?
         .try_into()
         .context("opening PROTECTED_PATHS")?;
     let canonical = cgroup.display().to_string();
     protected
-        .insert(path_hash(canonical.as_bytes()), 1, 0)
+        .insert(path_hash(canonical.as_bytes()), yard_for(&canonical, cgroup_id), 0)
         .with_context(|| format!("protecting the cgroup path {canonical}"))?;
     Ok(())
 }
@@ -1487,12 +1498,12 @@ fn populate_authorizations(ebpf: &mut aya::Ebpf, policy: &Policy, own_cgroup: &P
     }
 
     {
-        let mut protected: HashMap<_, u64, u32> = ebpf
+        let mut protected: HashMap<_, u64, Yard> = ebpf
             .map_mut("PROTECTED_PATHS")
             .context("finding PROTECTED_PATHS")?
             .try_into()
             .context("opening PROTECTED_PATHS")?;
-        for (entry, _) in &resolved {
+        for (entry, ino) in &resolved {
             // The migration wall: every cgroup holding an action bit is
             // protected (the walls around those bits are load-bearing),
             // `FLAG_PROTECT` extends the same wall to cgroups that hold
@@ -1503,7 +1514,8 @@ fn populate_authorizations(ebpf: &mut aya::Ebpf, policy: &Policy, own_cgroup: &P
             // path — `cgroup.procs`, `cgroup.freeze`, `cgroup.kill` — is
             // denied to every cgroup outside it, so nothing can move a
             // process into a protected cgroup or kill it through the
-            // cgroupfs.
+            // cgroupfs — except the yard's own insiders (the eBPF wall
+            // walks the opening caller's ancestors against this yard).
             let cgroup = entry.cgroup.to_str().expect("validated UTF-8");
             if cgroup == wabbit_common::cgroup_types::CGROUPFS_ROOT {
                 // Never the root: it is a prefix of every cgroupfs path,
@@ -1520,8 +1532,12 @@ fn populate_authorizations(ebpf: &mut aya::Ebpf, policy: &Policy, own_cgroup: &P
                 continue;
             }
             protected
-                .insert(path_hash(cgroup.as_bytes()), 1, 0)
+                .insert(path_hash(cgroup.as_bytes()), yard_for(cgroup, *ino), 0)
                 .with_context(|| format!("protecting the cgroup path {cgroup}"))?;
+            info!(
+                "the cgroup path {cgroup} is protected (yard id {})",
+                ino
+            );
         }
     }
 
@@ -1650,6 +1666,29 @@ fn entry_is_protected(action_mask: u64, flags: u64) -> bool {
     action_mask != 0 && flags & FLAG_UNPROTECTED == 0
 }
 
+/// One protected cgroup — a yard — as `PROTECTED_PATHS`' value: the cgroup's
+/// kernfs id and its level in the unified hierarchy (the root being level
+/// 0). The eBPF wall walks the opening caller's ancestors
+/// (`bpf_get_current_ancestor_cgroup_id`) against the yard to tell the
+/// yard's own insiders — a task at or below it — from the outsiders the
+/// wall exists for. The level comes from the canonical path's `/` count
+/// past the cgroupfs root, spelled the same way on both sides (see
+/// `paths::ROOT_SLASHES`).
+fn yard_for(canonical: &str, cgroup_id: u64) -> Yard {
+    let root_slashes =
+        wabbit_common::cgroup_types::CGROUPFS_ROOT.bytes().filter(|&b| b == b'/').count();
+    let level = canonical
+        .bytes()
+        .filter(|&b| b == b'/')
+        .count()
+        .saturating_sub(root_slashes) as u32;
+    Yard {
+        cgroup_id,
+        level,
+        _reserved: 0,
+    }
+}
+
 /// Attach one LSM gate, trying the candidate programs in order: the first
 /// that loads is the one whose layout fits the running kernel (the
 /// verifier validates the arguments against the kernel's BTF, so a
@@ -1721,6 +1760,47 @@ fn attach_tracepoints(ebpf: &mut aya::Ebpf) -> Result<bool> {
     attach_tracepoint(ebpf, "module_load_logger", "module", "module_load")?;
     // The load-path scaffold: proves the logger pipe reaches userspace.
     attach_tracepoint(ebpf, "sys_enter_trace", "raw_syscalls", "sys_enter")?;
+
+    // The yard keeper: every `cgroup_mkdir` refreshes the live id of the
+    // protected path being created, so the wall's insider rule keeps
+    // classifying systemd's recreated unit cgroups correctly (see the
+    // keeper's module docs). Creation is the causally safe point: no
+    // task can be inside a cgroup before it exists, so the map is fresh
+    // before any insider can be. Same variant dance as the fork
+    // watcher: the record layout is distro-patched, so the kernel's own
+    // format file picks the compiled layout.
+    let format_path = format!("{TRACING_ROOT}/events/cgroup/cgroup_mkdir/format");
+    let yard_variants: &[&str] = match fs::read_to_string(&format_path) {
+        Ok(format_file) => match (
+            parse_field_offset(&format_file, "id"),
+            parse_field_offset(&format_file, "path"),
+        ) {
+            (Some(DST_ID_VANILLA), Some(PATH_VANILLA)) => &["yard_keeper_mkdir_vanilla"],
+            (Some(DST_ID_PREEMPT_LAZY), Some(PATH_PREEMPT_LAZY)) => {
+                &["yard_keeper_mkdir_preempt_lazy"]
+            }
+            other => {
+                warn!(
+                    "cgroup_mkdir's id/path sit at offsets {:?}, matching no compiled \
+                     yard keeper; attaching both known layouts — a misread record is \
+                     inert (it matches no protected key), but the migration wall's ids \
+                     may go stale without the right one",
+                    other
+                );
+                &["yard_keeper_mkdir_vanilla", "yard_keeper_mkdir_preempt_lazy"]
+            }
+        },
+        Err(error) => {
+            warn!(
+                "reading {format_path} failed ({error}); attaching both yard keeper \
+                 layouts — the migration wall's ids may go stale without the keeper"
+            );
+            &["yard_keeper_mkdir_vanilla", "yard_keeper_mkdir_preempt_lazy"]
+        }
+    };
+    for variant in yard_variants {
+        attach_tracepoint(ebpf, variant, "cgroup", "cgroup_mkdir")?;
+    }
     Ok(true)
 }
 
@@ -1740,9 +1820,21 @@ fn attach_tracepoint(ebpf: &mut aya::Ebpf, name: &str, category: &str, event: &s
 /// `child_pid`'s offset within the `sched_process_fork` record, as the
 /// running kernel's own format file spells it.
 fn parse_child_pid_offset(format_file: &str) -> Option<usize> {
+    parse_field_offset(format_file, "child_pid")
+}
+
+/// One named field's offset within a tracepoint record, as the running
+/// kernel's own format file spells it (`field:<type> <name>; offset:<n>;
+/// ...`). The format file is the ground truth the record layout cannot
+/// be read from a load failure — tracepoint context reads are not
+/// validated against BTF, so a program with the wrong offset loads
+/// fine and reads garbage.
+fn parse_field_offset(format_file: &str, field: &str) -> Option<usize> {
     format_file
         .lines()
-        .find(|line| line.trim_start().starts_with("field:") && line.contains("child_pid"))
+        .find(|line| {
+            line.trim_start().starts_with("field:") && line.contains(&format!(" {field};"))
+        })
         .and_then(|line| line.split_once("offset:"))
         .and_then(|(_, offset)| offset.split(';').next())
         .and_then(|offset| offset.trim().parse().ok())

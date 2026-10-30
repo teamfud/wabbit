@@ -21,7 +21,7 @@
 #                         can sniff inbound traffic
 #                "off"  - no raw socket is gated
 [network]
-bind        = "ports"
+bind = "ports"
 raw_capture = "icmp"
 
 # --- Default ----------------------------------------------------------------
@@ -47,33 +47,33 @@ raw_capture = "icmp"
 # with exactly these rules. `signal` keeps job control working (Ctrl-C,
 # `kill %1`): the task_kill gate exempts only self-signals.
 [[class]]
-name         = "shell"
-cgroup       = "/sys/fs/cgroup/wabbit"
-actions      = ["signal"]
+name = "shell"
+cgroup = "/sys/fs/cgroup/wabbit"
+actions = ["signal"]
 default_deny = true
-protect      = true
+protect = true
 
 [[class.path_rules]]
-prefix  = "/usr"
+prefix = "/usr"
 verdict = "allow"
 [[class.path_rules]]
-prefix  = "/bin"
+prefix = "/bin"
 verdict = "allow"
 [[class.path_rules]]
-prefix  = "/dev"
+prefix = "/dev"
 verdict = "allow"
 
 # What systemd needs to load modules at boot (PID 1's /boot/efi mount
 # autoloads its NLS charset in PID 1's context).
 [[class]]
-name    = "boot-hardware"
+name = "boot-hardware"
 actions = ["kmods"]
 
 # What a network daemon needs: bind-net to bind AF_INET/AF_INET6 sockets
 # (both are deny-by-default), raw-capture for DHCP (AF_PACKET) and IPv6
 # neighbor/router discovery (raw ICMPv6).
 [[class]]
-name    = "network-daemon"
+name = "network-daemon"
 actions = ["bind-net", "raw-capture"]
 
 # --- Boot-time grants (every distro needs these) ---------------------------
@@ -84,25 +84,25 @@ actions = ["bind-net", "raw-capture"]
 # bind-net covers socket activation: systemd binds the listener itself
 # (Ubuntu 24.04's ssh.socket binds port 22 from PID 1).
 [[authorization]]
-cgroup  = "/sys/fs/cgroup/init.scope"
-class   = "boot-hardware"
+cgroup = "/sys/fs/cgroup/init.scope"
+class = "boot-hardware"
 actions = ["cgroupfs-write", "signal", "bind-net"]
 protect = false
 
 [[authorization]]
 cgroup = "/sys/fs/cgroup/system.slice/systemd-modules-load.service"
-class  = "boot-hardware"
+class = "boot-hardware"
 
 # udevd SIGTERMs its idle workers.
 [[authorization]]
-cgroup  = "/sys/fs/cgroup/system.slice/systemd-udevd.service"
-class   = "boot-hardware"
+cgroup = "/sys/fs/cgroup/system.slice/systemd-udevd.service"
+class = "boot-hardware"
 actions = ["signal"]
 
 # Module autoloads run as kernel usermode helpers in the root cgroup, and
 # wabbit-initrd's boot-failure rescues thaw from there.
 [[authorization]]
-cgroup  = "/sys/fs/cgroup"
+cgroup = "/sys/fs/cgroup"
 actions = ["kmods", "signal"]
 
 # --- Network ----------------------------------------------------------------
@@ -115,62 +115,62 @@ actions = ["kmods", "signal"]
 # SSH: sshd.service on Rocky/Debian, ssh.service on Ubuntu. sshd signals
 # its privilege-separated children.
 [[authorization]]
-cgroup  = "/sys/fs/cgroup/system.slice/sshd.service"
+cgroup = "/sys/fs/cgroup/system.slice/sshd.service"
 actions = ["bind-net", "signal"]
 
 [[authorization]]
-cgroup  = "/sys/fs/cgroup/system.slice/ssh.service"
+cgroup = "/sys/fs/cgroup/system.slice/ssh.service"
 actions = ["bind-net", "signal"]
 
 # DHCP/RA clients. NetworkManager (Rocky) and ifupdown (Debian) also
 # signal the dhclient they spawn.
 [[authorization]]
-cgroup  = "/sys/fs/cgroup/system.slice/NetworkManager.service"
-class   = "network-daemon"
+cgroup = "/sys/fs/cgroup/system.slice/NetworkManager.service"
+class = "network-daemon"
 actions = ["signal"]
 
 [[authorization]]
 cgroup = "/sys/fs/cgroup/system.slice/systemd-networkd.service"
-class  = "network-daemon"
+class = "network-daemon"
 
 [[authorization]]
-cgroup  = "/sys/fs/cgroup/system.slice/networking.service"
-class   = "network-daemon"
+cgroup = "/sys/fs/cgroup/system.slice/networking.service"
+class = "network-daemon"
 actions = ["signal"]
 
 # ifupdown brings allow-hotplug interfaces up in a per-interface unit,
 # and the interface name is part of the path: ens3 is the lab's
 # virtio-net NIC. Add one entry per interface on real hardware.
 [[authorization]]
-cgroup  = "/sys/fs/cgroup/system.slice/system-ifup.slice/ifup@ens3.service"
-class   = "network-daemon"
+cgroup = "/sys/fs/cgroup/system.slice/system-ifup.slice/ifup@ens3.service"
+class = "network-daemon"
 actions = ["signal"]
 
 # cloud-init's ephemeral DHCP while it looks for its datasource.
 [[authorization]]
 cgroup = "/sys/fs/cgroup/system.slice/cloud-init-local.service"
-class  = "network-daemon"
+class = "network-daemon"
 
 # DNS: systemd-resolved binds its stub listener on 127.0.0.53.
 [[authorization]]
-cgroup  = "/sys/fs/cgroup/system.slice/systemd-resolved.service"
+cgroup = "/sys/fs/cgroup/system.slice/systemd-resolved.service"
 actions = ["bind-net"]
 
 # Time: chronyd.service on Rocky, chrony.service on Debian/Ubuntu.
 [[authorization]]
-cgroup  = "/sys/fs/cgroup/system.slice/chronyd.service"
+cgroup = "/sys/fs/cgroup/system.slice/chronyd.service"
 actions = ["bind-net"]
 
 [[authorization]]
-cgroup  = "/sys/fs/cgroup/system.slice/chrony.service"
+cgroup = "/sys/fs/cgroup/system.slice/chrony.service"
 actions = ["bind-net"]
 
 # Firewall daemons that load rules at boot (firewalld is on by default
 # on Rocky; nftables.service loads /etc/nftables.conf).
 [[authorization]]
-cgroup  = "/sys/fs/cgroup/system.slice/firewalld.service"
+cgroup = "/sys/fs/cgroup/system.slice/firewalld.service"
 actions = ["firewall"]
 
 [[authorization]]
-cgroup  = "/sys/fs/cgroup/system.slice/nftables.service"
+cgroup = "/sys/fs/cgroup/system.slice/nftables.service"
 actions = ["firewall"]

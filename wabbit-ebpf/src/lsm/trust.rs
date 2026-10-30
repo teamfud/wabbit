@@ -21,12 +21,15 @@
 //! observing self-test phase of the startup diagram ("i am active but not
 //! enforcing"); the flip to `1` is what turns the denials on.
 
-use aya_ebpf::helpers::{bpf_get_current_cgroup_id, bpf_get_current_pid_tgid};
+use aya_ebpf::{
+    helpers::{bpf_get_current_ancestor_cgroup_id, bpf_get_current_cgroup_id,
+              bpf_get_current_pid_tgid},
+};
 #[rustfmt::skip]
 pub use wabbit_common::authorization::{
     CODE_ALLOWED, CODE_WOULD_DENY, CgroupKey, DEFAULT_CGROUP_ID, ENFORCE, HOOK_BPF, HOOK_BIND,
     HOOK_FILE_OPEN, HOOK_KMOD, HOOK_SB_MOUNT, HOOK_SETSOCKOPT, HOOK_SOCKET_CREATE,
-    HOOK_TASK_KILL, OBSERVE, decision_key,
+    HOOK_TASK_KILL, OBSERVE, decision_key, Yard,
 };
 use wabbit_common::authorization::Authorization;
 
@@ -139,10 +142,76 @@ pub fn current_authorized_or_unlisted(action: u64) -> bool {
 
 /// Is `path` (already hashed by the caller, with
 /// `wabbit_common::authorization::path_hash`) a protected cgroupfs path?
-/// See [`PROTECTED_PATHS`] for the key convention.
+/// See [`PROTECTED_PATHS`] for the key convention. Returns the protected
+/// cgroup — the yard — for the wall's insider rule, or `None` when the
+/// path is not protected.
 #[inline(always)]
-pub fn protected(path: u64) -> bool {
-    unsafe { PROTECTED_PATHS.get(&path) }.is_some()
+pub fn protected(path: u64) -> Option<Yard> {
+    unsafe { PROTECTED_PATHS.get(&path) }.copied()
+}
+
+/// The deepest protected level the wall may walk to when classifying a
+/// caller: a bound on the ancestor levels
+/// `bpf_get_current_ancestor_cgroup_id` is asked for. The walk cap
+/// ([`PATH_WALK_CAP`], 64 bytes) already limits how deep a protected
+/// *path* can be spelled (~6 levels on the target distros), and no unit
+/// nests deeper than the cap allows, so 12 is generous twice over.
+const MAX_ANCESTOR_LEVEL: u32 = 12;
+
+/// Is the current task *inside* `yard` — at it, or somewhere below it?
+///
+/// The wall's insider rule: a caller at or below the protected cgroup it
+/// is writing below (its own `cgroup.procs`, its worker sub-cgroups) is
+/// the yard's own housekeeping, and an insider of one yard is still an
+/// outsider of every other. Two identities decide it: the caller's own
+/// cgroup (`bpf_get_current_cgroup_id` — systemd moves the child *into*
+/// the unit cgroup before its own re-attach, so the caller can be at the
+/// yard itself), and its ancestors
+/// (`bpf_get_current_ancestor_cgroup_id(level)`, walking strictly *above*
+/// the caller's own cgroup — the daemon in a worker *sub-cgroup* of the
+/// unit is only reachable that way). The ids are kernfs inode numbers,
+/// unique across the whole hierarchy, so a match at either means the
+/// caller is inside the yard. The level bound keeps the loop
+/// verifier-bounded; a helper that fails (past the caller's own level)
+/// returns 0 and ends the walk.
+///
+/// A **trusted** yard — wabbit's own cgroup — never takes the allowance:
+/// its subtree (the self-test's sacrificial cgroups, the run cgroups) is
+/// deliberately outside the trust the yard itself carries, so the wall
+/// below it stays strict.
+#[inline(always)]
+pub fn inside_yard(yard: Yard) -> bool {
+    // A *trusted* yard — wabbit's own cgroup, the one full trust
+    // short-circuits for tasks *in* it — takes no insider allowance: its
+    // subtree (the self-test's sacrificial cgroups, the run cgroups) is
+    // deliberately outside that trust, and allowing them what the gate
+    // must deny would both gut the self-test (its worker would sail
+    // through the wall it exists to prove) and open the run cgroups to
+    // their own programs.
+    if cgroup_trusted(&CgroupKey {
+        cgroup_id: yard.cgroup_id,
+    }) {
+        return false;
+    }
+    // At the yard: systemd's own attach order puts the unit child there
+    // before the child's re-attach open.
+    if current_cgroup().cgroup_id == yard.cgroup_id {
+        return true;
+    }
+    // Below the yard: workers in sub-cgroups are only reachable through
+    // their ancestors.
+    let mut level = 1u32;
+    while level <= MAX_ANCESTOR_LEVEL {
+        let ancestor = unsafe { bpf_get_current_ancestor_cgroup_id(level as i32) };
+        if ancestor == 0 {
+            break;
+        }
+        if ancestor == yard.cgroup_id {
+            return true;
+        }
+        level += 1;
+    }
+    false
 }
 
 /// Close a gate's decision: trace it, then apply the mode.

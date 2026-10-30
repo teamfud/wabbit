@@ -369,6 +369,20 @@ pub struct CgroupKey {
     pub cgroup_id: u64,
 }
 
+/// One **protected cgroup** — a *yard* — as `PROTECTED_PATHS`' value: the
+/// cgroup's kernfs id and its level in the unified hierarchy (the root is
+/// level 0). The eBPF wall compares the id with the *opening caller's*
+/// ancestors (`bpf_get_current_ancestor_cgroup_id`) to tell the yard's own
+/// insiders — a task at or below the yard, managing its own subtree —
+/// from the outsiders the wall exists for.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Yard {
+    pub cgroup_id: u64,
+    pub level: u32,
+    pub _reserved: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Authorization {
@@ -381,6 +395,7 @@ pub struct Authorization {
 }
 
 const _: () = assert!(size_of::<CgroupKey>() == 8);
+const _: () = assert!(size_of::<Yard>() == 16);
 const _: () = assert!(size_of::<Authorization>() == 40);
 const _: () = assert!(size_of::<PathRuleKey>() == 16);
 
@@ -394,4 +409,5 @@ const _: () = {
     unsafe impl Pod for CgroupKey {}
     unsafe impl Pod for Authorization {}
     unsafe impl Pod for PathRuleKey {}
+    unsafe impl Pod for Yard {}
 };

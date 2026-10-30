@@ -21,7 +21,13 @@
 //!    authorized cgroup, or freeze or kill one, by writing its files —
 //!    or the whole class model is decorative (see
 //!    [`ACTION_BPF_ATTACH`]'s documentation). Lifted by
-//!    [`ACTION_CGROUPFS_WRITE`].
+//!    [`ACTION_CGROUPFS_WRITE`] for outsiders, and by nothing for the
+//!    yard's own insiders: a caller whose cgroup *is* the protected
+//!    cgroup it writes below manages its own subtree (systemd's unit
+//!    children re-attach from inside the unit cgroup PID 1 already moved
+//!    them into; its daemons move their workers into sub-cgroups under
+//!    it), and an insider of one yard is still an outsider of every
+//!    other.
 //!
 //! `security_file_open(struct file *file)` runs after `f_mode` is set, so
 //! a writable open is visible through it — a denied `open(2)` instead of a
@@ -140,8 +146,20 @@ fn file_open_body(
     }
 
     // The protected cgroupfs paths: the cgroup.procs/freeze/kill wall.
-    if paths::under_protected_cgroup(resolved) {
-        let allowed = trust::current_authorized(ACTION_CGROUPFS_WRITE);
+    // An outsider needs `ACTION_CGROUPFS_WRITE` (PID 1's unit management
+    // runs from init.scope, which holds it). The yard itself does not:
+    // its own processes — the unit's children and daemons, already
+    // attached into the unit cgroup by PID 1 — open `cgroup.procs` in
+    // their *own* subtree (their own re-attach, their worker sub-cgroups)
+    // as housekeeping, and denying that kills the unit at EXIT_CGROUP
+    // (systemd's children migrate from inside the unit's cgroup; its
+    // daemons run in worker sub-cgroups under it), which in turn makes
+    // systemd delete and recreate the cgroup with a fresh kernfs id on
+    // every retry. [`trust::inside_yard`] decides which case this open
+    // is; an insider of one yard is still an outsider of every other.
+    if let Some(yard) = paths::under_protected_yard(resolved) {
+        let allowed =
+            trust::current_authorized(ACTION_CGROUPFS_WRITE) || trust::inside_yard(yard);
         return trust::verdict(trust::HOOK_FILE_OPEN, if allowed { 0 } else { EPERM });
     }
 

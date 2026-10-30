@@ -93,7 +93,10 @@ pub fn sb_mount(ctx: LsmContext) -> i32 {
     }
 
     // The cgroupfs: the root and the protected paths, lifted by ACTION_MOUNT.
-    if paths::is_cgroupfs_root(resolved) || paths::under_protected_cgroup(resolved) {
+    // Mounts take no insider allowance: nothing legitimate mounts over a
+    // cgroup path, so the yard rule of the `file_open` wall (its own
+    // processes managing their subtree) has no mount-time analogue.
+    if paths::is_cgroupfs_root(resolved) || paths::under_protected_yard(resolved).is_some() {
         let allowed = trust::current_authorized(ACTION_MOUNT);
         return trust::verdict(trust::HOOK_SB_MOUNT, if allowed { 0 } else { EPERM });
     }
