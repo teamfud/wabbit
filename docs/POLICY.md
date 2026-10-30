@@ -20,11 +20,12 @@ wabbit-policy inspect policy.wspf            # verify + decode, anywhere
 
 ## How the file is structured
 
-Three sections exist today, all optional — an empty policy is a valid
+Four sections exist today, all optional — an empty policy is a valid
 (posture: it grants nothing, and deny-by-default does the rest):
 
 ```toml
 [rootfs]           # mount-time policy: what is writable, what is executable
+[network]          # how far the bind and raw-capture gates reach
 [[class]]          # reusable, named privilege profiles
 [[authorization]]  # per-cgroup grants: the actual rules
 ```
@@ -66,8 +67,8 @@ consult on every relevant syscall, per cgroup:
 | `kmods` | loading kernel modules (`finit_module`/`init_module`) — a cgroup without this bit may not load modules at all, autoloads aside (see the boot-time grants below) |
 | `cgroupfs-write` | writing through the migration wall (`cgroup.procs`/`cgroup.freeze`/`cgroup.kill` under protected cgroup paths) — what lets PID 1 administer the hierarchy |
 | `firewall` | modifying firewall rules, both the nftables netlink socket and the legacy xtables `setsockopt` paths |
-| `raw-capture` | creating raw-capture sockets — `AF_PACKET` (tcpdump's channel) and `SOCK_RAW` at the IP families — packet capture and hand-crafted IP packets |
-| `bind-net` | `bind(2)` on `AF_INET`/`AF_INET6`: acquiring a network endpoint (a listener, a service port). Every other family — local `AF_UNIX` IPC, netlink — is ungated by design |
+| `raw-capture` | creating raw-capture sockets — `AF_PACKET` (tcpdump's channel) and `SOCK_RAW` at the IP families — packet capture and hand-crafted IP packets. Which of those are gated at all is the [`[network]`](#network--how-far-the-network-gates-reach) `raw_capture` posture |
+| `bind-net` | `bind(2)` on `AF_INET`/`AF_INET6`: acquiring a network endpoint (a listener, a service port). Which binds are gated at all — every one, only those naming a port, or none — is the [`[network]`](#network--how-far-the-network-gates-reach) `bind` posture. Every other family — local `AF_UNIX` IPC, netlink — is ungated by design |
 | `signal` | signaling any task other than the sender's own (`kill`/`tgkill`/`pidfd_send_signal`) — **self-signals and `SIGCONT` are always exempt** (`SIGCONT` is the thaw channel every boot-failure rescue broadcasts, and a frozen world must never outlive a failed boot). **Default-allow for unlisted cgroups**: a cgroup no policy names may signal freely; the gate binds only cgroups an entry lists — grant `signal` there where process management is legitimate (PID 1, udev's worker pool, a shell's job control), omit it where cross-task signaling is the thing to contain. The target's *cgroup* cannot be read without the unstable `task_struct` walks the design forbids, so the bit does not distinguish same-cgroup from cross-cgroup targets |
 
 The remaining names — `setns`, `unshare`, `exec`, `credentials`,
@@ -223,6 +224,50 @@ Runs never execute in wabbit's own cgroup (that cgroup is trusted, its
 processes exempt from every gate). The spawned process migrates itself
 into the run cgroup **between fork and exec**, so a run's first syscall
 already runs under its class.
+
+## `[network]` — how far the network gates reach
+
+The `bind-net` and `raw-capture` bits decide *who* may do a gated
+thing; this section decides *what is gated at all*, separately for each
+gate. It is global — it applies to every cgroup, listed or not:
+
+```toml
+[network]
+bind        = "ports"    # "all" | "ports" | "off"
+raw_capture = "icmp"     # "all" | "icmp" | "off"
+```
+
+| `bind` | gated (needs `bind-net`) | passes |
+| --- | --- | --- |
+| `all` | every `AF_INET`/`AF_INET6` `bind(2)` | non-IP families |
+| `ports` | a bind naming a specific port | port-0 binds (the kernel picks an ephemeral port — what clients do before connecting), non-IP families |
+| `off` | nothing | everything |
+
+| `raw_capture` | gated (needs `raw-capture`) | passes |
+| --- | --- | --- |
+| `all` | `AF_PACKET`, and `SOCK_RAW` at the IP families | every other socket |
+| `icmp` | `AF_PACKET`, and `SOCK_RAW` at the IP families for every protocol but ICMP | raw `IPPROTO_ICMP` at `AF_INET` and raw `IPPROTO_ICMPV6` at `AF_INET6` (`ping`, `traceroute -I`, classic `traceroute`'s ICMP receive), every other socket |
+| `off` | nothing | everything |
+
+`all` is the strictest posture and the default: a policy without the
+section, or a key left out of it, gates as much as the gate can.
+Under `all`, any unlisted program that binds an IP socket — even to
+port 0 on the way to an outbound connection — or opens a raw ICMP
+socket is denied; `bind = "ports"` keeps outbound connectivity open
+while still walling off listeners on chosen ports. The `ports`
+residual: a port-0 bind (or `listen(2)` with no bind at all) still
+yields a listener, on a port the kernel picks.
+
+`raw_capture = "icmp"` exempts ICMP alone on purpose: a raw socket of
+any other IP protocol (`IPPROTO_TCP`, `IPPROTO_UDP`) receives a copy of
+every inbound packet of that protocol — tcpdump in all but name. Tools
+that need those stay gated: `traceroute -T` (raw TCP) and the like need
+`raw-capture`, or the UDP default (`traceroute` without flags) instead.
+A raw ICMP socket still sees every inbound ICMP packet, which the
+exception accepts.
+
+The section is read at boot; a reconfigure carrying it replaces the
+stored section but does not re-arm the gates until the next boot.
 
 ## `[rootfs]` — mount-time policy
 

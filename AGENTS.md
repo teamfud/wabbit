@@ -671,7 +671,7 @@ re-export shim; the types live in the crate.
   path encoding.
 
 The file begins with the four-byte `WSPF` magic, a little-endian version
-(currently 5), the key id and the signature, followed by a byte with one bit
+(currently 6), the key id and the signature, followed by a byte with one bit
 per section and then the sections that bit announces, in bit order. Each
 section appears at most once, so a policy has a single encoding. The decoder
 rejects unknown versions, unknown key ids, section bits it does not know
@@ -703,7 +703,11 @@ pattern) replaces id 0, and `gen-key` prints the exact line to paste.
 v3→v4 is one version bump; the v3 single-key format has shipped nowhere.
 v4→v5 widens the path-rule verdict from one open-wide allow/deny bit to
 per-operation bits (read/write/exec, each allow/deny/unspecified); the
-shipped-nowhere rule applies the same.
+shipped-nowhere rule applies the same. v5→v6 adds the `network` section
+(bit 2): two posture bytes, `bind` (`all`/`ports`/`off`) and
+`raw_capture` (`all`/`icmp`/`off`), loaded into the eBPF
+`NET_POSTURE` array; an absent section (or the unpopulated map) is
+`all`/`all`, the pre-v6 behavior.
 
 **Off-box CLI** (`wabbit-policy <subcommand>`):
 
@@ -917,8 +921,8 @@ enforce-flip steps are the next implementation phase:
 | `sb_mount` | `sb_mount` | mounts over module trees/bpffs (never lifted); mounts over the cgroupfs root and protected cgroup paths (`ACTION_MOUNT` lifts) |
 | `firewall_gate` | `socket_setsockopt` | iptables-legacy rule changes (`IPT_SO_SET_REPLACE`/`ADD_COUNTERS` at `SOL_IP`/`SOL_IPV6`) denied outside full trust and `ACTION_FIREWALL` |
 | `netfilter_netlink_gate` | `socket_create` | creating a `NETLINK_NETFILTER` netlink socket — the nftables path: `nft`, `iptables-nft`/`ip6tables-nft`/`ebtables-nft`/`arptables-nft` (the distro defaults), firewalld, ipset, conntrack-tools — denied outside full trust and `ACTION_FIREWALL`; kernel-internal creation (`kern == 1`) exempt |
-| `raw_capture_gate` | `socket_create` | creating raw-capture sockets — `AF_PACKET` (tcpdump's channel) and `SOCK_RAW` at the IP families — denied outside full trust and `ACTION_RAW_CAPTURE`; kernel-internal creation exempt |
-| `bind_gate` | `socket_bind` | network `bind(2)`: `AF_INET`/`AF_INET6` needs `ACTION_BIND_NET` (deny-by-default — the default policy blocks network sockets and nothing else); the sockaddr's `sa_family` (uapi-stable, probe-read) narrows first, so local `AF_UNIX` IPC and netlink binds pass untouched, trusted or not |
+| `raw_capture_gate` | `socket_create` | creating raw-capture sockets — `AF_PACKET` (tcpdump's channel) and `SOCK_RAW` at the IP families — denied outside full trust and `ACTION_RAW_CAPTURE`; kernel-internal creation exempt. Reach is the policy's `network.raw_capture` posture (`NET_POSTURE`): `all`, `icmp` (raw `IPPROTO_ICMP`/`IPPROTO_ICMPV6` pass — ping, traceroute; `AF_PACKET` and other raw IP protocols stay gated), or `off` |
+| `bind_gate` | `socket_bind` | network `bind(2)`: `AF_INET`/`AF_INET6` needs `ACTION_BIND_NET` (deny-by-default); the sockaddr's `sa_family` (uapi-stable, probe-read) narrows first, so local `AF_UNIX` IPC and netlink binds pass untouched, trusted or not. Reach is the policy's `network.bind` posture (`NET_POSTURE`): `all` (every IP bind), `ports` (only a bind naming a port — the port at sockaddr offset 2, same in `sockaddr_in`/`_in6` — so port-0 client binds pass), or `off`; the self-test proves the posture in force (`bind-net` claims a port, `bind-ephemeral` binds port 0 — a deny step under `all`, an always-allowed one otherwise) |
 | `signal_gate` | `task_kill` | `kill(2)`/`tgkill(2)`/`pidfd_send_signal(2)` beyond the caller's own task denied outside full trust and `ACTION_SIGNAL_OTHERS` **on cgroups the policy lists** (default-allow: unlisted cgroups may signal — the boot's own units never lose `kill(2)` to a boundary nobody drew); self-signals and SIGCONT always exempt — the identity is the raw ctx-slot bits against `bpf_get_current_task()` (an integer helper), both scalars, because the verifier prohibits pointer comparisons and the target's cgroup would need the `task_struct` walks this design forbids; SIGCONT is the thaw channel every rescue path broadcasts, and the failure-safety contract outranks signaling containment |
 | `fork_watcher_vanilla`/`_preempt_lazy`, `module_load_logger` | tracepoints | `sched_process_fork` (both record layouts; the loader picks by format file) into `FORK_EVENTS`, `module_load` into `MODULE_LOADS` |
 

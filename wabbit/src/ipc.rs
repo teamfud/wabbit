@@ -687,6 +687,7 @@ mod tests {
             authorization: Some(wabbit_policy::authorization::AuthorizationConfig {
                 entries: vec![entry],
             }),
+            network: None,
         }
     }
 

@@ -26,6 +26,7 @@ use wabbit_policy::{
         AuthorizationConfig, AuthorizationEntry, MAX_PATH_RULES, OpVerdict, PathRule,
         PathRuleVerdict,
     },
+    network::{BindPosture, NetworkConfig, RawCapturePosture},
     rootfs::{PathFlags, PathOverride, RootFSConfig, RootFlags},
     sign,
 };
@@ -143,6 +144,76 @@ struct PolicyToml {
     /// [`ClassToml`]).
     class: Option<Vec<ClassToml>>,
     authorization: Option<Vec<AuthorizationToml>>,
+    network: Option<NetworkToml>,
+}
+
+/// The `[network]` table: how far each network gate reaches. Either key
+/// may be omitted and keeps the strictest posture (`all`).
+///
+/// ```toml
+/// [network]
+/// bind        = "ports"   # "all" | "ports" | "off"
+/// raw_capture = "icmp"    # "all" | "icmp" | "off"
+/// ```
+#[derive(serde::Deserialize, serde::Serialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+struct NetworkToml {
+    #[serde(default)]
+    bind: BindName,
+    #[serde(default)]
+    raw_capture: RawCaptureName,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum BindName {
+    #[default]
+    All,
+    Ports,
+    Off,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum RawCaptureName {
+    #[default]
+    All,
+    Icmp,
+    Off,
+}
+
+impl From<NetworkToml> for NetworkConfig {
+    fn from(network: NetworkToml) -> Self {
+        Self {
+            bind: match network.bind {
+                BindName::All => BindPosture::All,
+                BindName::Ports => BindPosture::Ports,
+                BindName::Off => BindPosture::Off,
+            },
+            raw_capture: match network.raw_capture {
+                RawCaptureName::All => RawCapturePosture::All,
+                RawCaptureName::Icmp => RawCapturePosture::Icmp,
+                RawCaptureName::Off => RawCapturePosture::Off,
+            },
+        }
+    }
+}
+
+impl From<&NetworkConfig> for NetworkToml {
+    fn from(network: &NetworkConfig) -> Self {
+        Self {
+            bind: match network.bind {
+                BindPosture::All => BindName::All,
+                BindPosture::Ports => BindName::Ports,
+                BindPosture::Off => BindName::Off,
+            },
+            raw_capture: match network.raw_capture {
+                RawCapturePosture::All => RawCaptureName::All,
+                RawCapturePosture::Icmp => RawCaptureName::Icmp,
+                RawCapturePosture::Off => RawCaptureName::Off,
+            },
+        }
+    }
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Debug)]
@@ -687,6 +758,7 @@ impl TryFrom<PolicyToml> for Policy {
         let policy = Self {
             rootfs,
             authorization,
+            network: source.network.map(NetworkConfig::from),
         };
         if let Some(authorization) = &policy.authorization {
             authorization.validate()?;
@@ -735,6 +807,7 @@ impl TryFrom<&Policy> for PolicyToml {
             rootfs,
             class: None,
             authorization,
+            network: policy.network.as_ref().map(NetworkToml::from),
         })
     }
 }
@@ -972,6 +1045,10 @@ mod tests {
             }]),
             class: None,
             rootfs: None,
+            network: Some(NetworkToml {
+                bind: BindName::Ports,
+                raw_capture: RawCaptureName::Off,
+            }),
         };
         let policy = Policy::try_from(
             toml::from_str::<PolicyToml>(&toml::to_string(&source).unwrap()).unwrap(),
@@ -1424,5 +1501,27 @@ protect = false
         // Opted out, not walled: the UNPROTECTED bit, and no PROTECT.
         assert_eq!(entry.flags, auth::FLAG_UNPROTECTED);
         config.validate().unwrap();
+    }
+
+    /// `[network]` compiles each gate's reach independently; an omitted
+    /// key keeps the strictest posture, and an unknown name is refused.
+    #[test]
+    fn network_postures_compile() {
+        let policy = parse(
+            r#"
+[network]
+bind = "ports"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            policy.network,
+            Some(NetworkConfig {
+                bind: BindPosture::Ports,
+                raw_capture: RawCapturePosture::All,
+            })
+        );
+        assert_eq!(parse("").unwrap().network, None);
+        assert!(toml::from_str::<PolicyToml>("[network]\nbind = \"listeners\"\n").is_err());
     }
 }
