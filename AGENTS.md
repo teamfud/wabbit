@@ -826,7 +826,15 @@ path) overrides the baked policy, which overrides `Policy::default()` —
 whose authorization section carries exactly one grant, the cgroupfs root
 may signal: every boot-failure rescue (the `FrozenWorld` drop backstop,
 the watchdog) thaws from the root cgroup while guard is enforcing, so a
-default without the grant would freeze out its own failure paths.
+default without the grant would freeze out its own failure paths. The
+floor's `default` section grants the unlisted world `bind-net`,
+`raw-capture`, and `kmods`: a no-policy boot (the bare installer, a
+standalone run) still reaches `default.target` with working networking —
+DHCP, a restarted sshd, loopback DNS — and PID 1's `/boot/efi` mount
+completes (the vfat NLS autoload in its context is boot-critical;
+measured in the lab: the floor without `kmods` failed `local-fs.target`
+and degraded the boot). The gates stay armed; the bits flow through the
+entry that exists for exactly this.
 The runtime re-verifies the embedded bytes, so a tampered binary cannot
 smuggle a policy; the build-time check is for the builder's own mistakes.
 

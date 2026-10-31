@@ -310,7 +310,7 @@ impl Guard {
         // gave them: a gate switched off has nothing to deny, and an
         // ephemeral bind is a deny step only where the posture gates it.
         // (`AF_PACKET` is gated under both `all` and `icmp`.)
-        let mut always_allowed: Vec<&str> = vec![STEP_SIGNAL_SELF];
+        let mut always_allowed: Vec<&str> = vec![STEP_SIGNAL_SELF, STEP_SIGNAL_CONT];
         if self.network.raw_capture != RawCapturePosture::Off {
             reachable.push((STEP_RAW_CAPTURE, String::new()));
         }
@@ -329,9 +329,11 @@ impl Guard {
 
         // The exemptions, allowed in *both* phases (the enforcing round
         // below repeats them): the signal gate's `kill(getpid(), 0)` —
-        // the flip must never cost a process `raise(3)` — and, unless
-        // the bind posture is `all`, the port-0 bind a client makes
-        // before connecting.
+        // the flip must never cost a process `raise(3)` — and its
+        // `kill(getppid(), SIGCONT)`, the thaw channel's exemption,
+        // which pins the signal number per boot (a wrong one fails the
+        // enforcing round loudly) — and, unless the bind posture is
+        // `all`, the port-0 bind a client makes before connecting.
         for step in &always_allowed {
             let pid = self.run_worker(&selftest_cgroup, step, "", false)?;
             self.check_fork_event(pid, step)?;
@@ -948,6 +950,9 @@ const STEP_BIND_EPHEMERAL: &str = "bind-ephemeral";
 const STEP_SIGNAL: &str = "signal";
 const STEP_SIGNAL_SELF: &str = "signal-self";
 const STEP_SIGNAL_WABBIT: &str = "signal-wabbit";
+/// `kill(getppid(), SIGCONT)` — the thaw-channel exemption's per-boot
+/// proof, always allowed in both phases.
+const STEP_SIGNAL_CONT: &str = "signal-cont";
 /// Not a step but a re-exec target: `worker_main` dispatches it before
 /// anything else (it must not read stdin), and only a *successful*
 /// execve of the rules-exec target can reach it — so its exit code is
@@ -1002,6 +1007,7 @@ pub fn worker_main() -> Option<i32> {
         STEP_SIGNAL => Some(worker_step_signal()),
         STEP_SIGNAL_SELF => Some(worker_step_signal_self()),
         STEP_SIGNAL_WABBIT => Some(worker_step_signal_wabbit()),
+        STEP_SIGNAL_CONT => Some(worker_step_signal_cont()),
         other => {
             eprintln!("{NAME} self-test worker: unknown step {other}");
             Some(3)
@@ -1427,6 +1433,26 @@ fn worker_step_signal_self() -> i32 {
         return verdict::ALLOWED;
     }
     errno_verdict("signal-self kill()")
+}
+
+/// `kill(getppid(), SIGCONT)` — the thaw channel's exemption, asserted in
+/// both phases: the real `SIGCONT` must reach wabbit itself, because every
+/// rescue path broadcasts it from whatever cgroup the rescue lands in, and
+/// a frozen wabbit must never be unthawable. Side-effect-free both ways: a
+/// running process ignores it, and this parent is never stopped.
+///
+/// The *number* is what this step pins: `SIGCONT` was once spelled `19`
+/// — `SIGSTOP` — which inverted the exemption (`SIGSTOP` sailed through
+/// at wabbit, the real `SIGCONT` was denied by the self-guard), measured
+/// in the lab when a second run's freeze sweep stopped the first run's
+/// parked wabbit and could not resume it. A wrong number fails this step
+/// loudly in the enforcing round instead of failing a thaw silently.
+fn worker_step_signal_cont() -> i32 {
+    let ret = unsafe { libc::kill(libc::getppid(), libc::SIGCONT) };
+    if ret >= 0 {
+        return verdict::ALLOWED;
+    }
+    errno_verdict("signal-cont kill()")
 }
 
 // -------------------------------------------------------------- helpers
@@ -1952,8 +1978,16 @@ fn attach_tracepoints(ebpf: &mut aya::Ebpf) -> Result<bool> {
         attach_tracepoint(ebpf, variant, "sched", "sched_process_fork")?;
     }
     attach_tracepoint(ebpf, "module_load_logger", "module", "module_load")?;
-    // The load-path scaffold: proves the logger pipe reaches userspace.
-    attach_tracepoint(ebpf, "sys_enter_trace", "raw_syscalls", "sys_enter")?;
+
+    // No `sys_enter` scaffold: a program attached to `raw_syscalls/sys_enter`
+    // runs on *every syscall of every process on the machine*, and the
+    // load-path proof it existed for (the object loads; the logger reaches
+    // userspace) is already carried by the programs above and the yard
+    // keeper's `info!` — at event rates the drain can park between. A
+    // per-syscall `debug!` fed the ringbuf faster than `RUST_LOG` could
+    // matter: the level only gates what userspace *prints*, so the drain
+    // task parsed syscall-rate records just to discard them, and a tokio
+    // worker spun at 100% (measured in the lab on noble).
 
     // The yard keeper: every `cgroup_mkdir` refreshes the live id of the
     // protected path being created, so the wall's insider rule keeps

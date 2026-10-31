@@ -154,20 +154,35 @@ pub struct Policy {
 }
 
 impl Default for Policy {
-    /// The floor — and one grant the boot's own rescue depends on.
+    /// The floor: the boot's own rescue, and the networking a boot needs
+    /// to reach `default.target` with nothing else configured.
     ///
-    /// No rootfs remounts, and one authorization entry: the cgroupfs
-    /// root may signal. The failure-safety contract is served primarily
-    /// by the `task_kill` gate itself (SIGCONT exempt outright — the
-    /// thaw channel every rescue broadcasts — and a default-allow
-    /// posture for unlisted cgroups, so the boot's units never lose
-    /// `kill(2)`); this grant is the belt-and-braces half, covering the
-    /// root cgroup's transients (kernel usermode helpers, the
-    /// initramfs's processes) as a *listed* cgroup with the bit, so the
-    /// rescue stays covered even if the gate's posture is ever
-    /// tightened. Post-boot nothing but kernel threads and transient
-    /// helpers live in the root cgroup, so the grant's reach is exactly
-    /// that machinery.
+    /// No rootfs remounts. Two grants:
+    ///
+    /// * one authorization entry: the cgroupfs root may signal. The
+    ///   failure-safety contract is served primarily by the `task_kill`
+    ///   gate itself (SIGCONT exempt outright — the thaw channel every
+    ///   rescue broadcasts — and a default-allow posture for unlisted
+    ///   cgroups, so the boot's units never lose `kill(2)`); this grant
+    ///   is the belt-and-braces half, covering the root cgroup's
+    ///   transients (kernel usermode helpers, the initramfs's processes)
+    ///   as a *listed* cgroup with the bit, so the rescue stays covered
+    ///   even if the gate's posture is ever tightened. Post-boot nothing
+    ///   but kernel threads and transient helpers live in the root
+    ///   cgroup, so the grant's reach is exactly that machinery.
+    /// * one `default` entry: every unlisted cgroup may bind network
+    ///   sockets (`ACTION_BIND_NET`) and open raw-capture sockets
+    ///   (`ACTION_RAW_CAPTURE` — networkd's DHCPv6 router solicitations,
+    ///   classic `traceroute`), and may load kernel modules
+    ///   (`ACTION_KMODS`). The module bit is the boot-critical one: PID 1
+    ///   mounts `/boot/efi` before any authorization could apply, and the
+    ///   vfat NLS autoload in its context is what lets `local-fs.target`
+    ///   — the parent of `default.target` — complete (measured in the
+    ///   lab: the floor without the bit failed the mount and degraded the
+    ///   boot). The gates stay armed; the bits flow through the entry
+    ///   that exists for exactly this — a signed policy says more by
+    ///   listing cgroups and carrying a `[network]` section; the floor
+    ///   says "a boot may boot."
     fn default() -> Self {
         Self {
             rootfs: None,
@@ -180,7 +195,12 @@ impl Default for Policy {
                 }],
             }),
             network: None,
-            default: None,
+            default: Some(DefaultConfig {
+                action_mask: wabbit_common::authorization::ACTION_BIND_NET
+                    | wabbit_common::authorization::ACTION_RAW_CAPTURE
+                    | wabbit_common::authorization::ACTION_KMODS,
+                path_rules: Vec::new(),
+            }),
             startup: None,
         }
     }
@@ -476,22 +496,33 @@ mod tests {
             sectionless
         );
 
-        // The default itself encodes its one grant: the cgroupfs root
-        // may signal (the boot's failure paths thaw from there).
+        // The default itself encodes both of its grants: the cgroupfs
+        // root may signal (the boot's failure paths thaw from there),
+        // and the `default` entry carries the unlisted network floor
+        // (bind-net + raw-capture — a no-policy boot still reaches
+        // `default.target` with working networking).
         let default = [
             b"WSPF".as_slice(),
             &8u16.to_le_bytes(),
             &[TEST_KEY_ID],
             &[7; SIGNATURE_SIZE],
-            &[0b10], // sections: authorization
+            &[0b1010], // sections: authorization | default
         ]
         .concat();
         let encoded =
             to_signed_bytes(&Policy::default(), TEST_KEY_ID, &[7; SIGNATURE_SIZE]).unwrap();
         assert!(
             encoded.starts_with(&default),
-            "the default policy encodes its authorization section: {encoded:?}"
+            "the default policy encodes its authorization and default sections: {encoded:?}"
         );
+        // And the floor's default entry validates — the generator- and
+        // loader-side contract holds for the built-in floor too.
+        Policy::default()
+            .default
+            .as_ref()
+            .expect("the default policy carries a default entry")
+            .validate()
+            .unwrap();
     }
 
     #[test]

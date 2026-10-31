@@ -316,7 +316,8 @@ const EMBEDDED_POLICY: Option<&[u8]> = None;
 /// Load the configured policy: the file named by
 /// `<prefix>_FILESYSTEM_CONFIGURATION_FILE` if set (the installer's
 /// `--policy`, the IPC rotation path), else the policy baked into this
-/// binary at build time, else the empty default.
+/// binary at build time, else the built-in default — the boot-rescue
+/// grant plus the unlisted network floor (see `Policy::default`).
 fn configured_policy() -> anyhow::Result<Policy> {
     let variable = format!("{}_FILESYSTEM_CONFIGURATION_FILE", brand::ENV_PREFIX);
     if let Some(path) = env::var_os(&variable) {

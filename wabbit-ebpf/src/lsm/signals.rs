@@ -116,9 +116,17 @@ use crate::lsm::trust::{self, EPERM};
 /// Deny signaling any task other than the caller's own (see the module
 /// docs).
 ///
-/// `SIGCONT` (19), from `uapi/linux/signal.h`: the thaw channel, always
+/// `SIGCONT` (18), from `uapi/linux/signal.h`: the thaw channel, always
 /// exempt (see the module docs).
-const SIGCONT: i32 = 19;
+///
+/// The number is load-bearing and was once wrong (`19` — `SIGSTOP`): the
+/// exemption then let `SIGSTOP` through at wabbit and denied the real
+/// `SIGCONT` at it, so a frozen wabbit could never be thawed from
+/// userspace — the exact inversion of the thaw channel, measured in the
+/// lab on noble (a second run's sweep stopped the first run's parked
+/// wabbit and could not resume it, `EPERM`). The `signal-cont` self-test
+/// step pins it per boot: a wrong number fails that step loudly.
+const SIGCONT: i32 = 18;
 
 /// PID 1: the system's own process. The self-guard exempts it — see the
 /// module docs.
