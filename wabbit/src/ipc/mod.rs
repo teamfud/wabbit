@@ -1247,3 +1247,10 @@ mod tests {
         assert!(error.contains("no class"), "{error}");
     }
 }
+
+/// The end-to-end harness: the full off-box → on-box flow against the
+/// real server, with the authorization each run receives recorded whole.
+/// See the module docs for what it proves — and what it deliberately
+/// leaves to the boot self-test.
+#[cfg(test)]
+mod harness;
