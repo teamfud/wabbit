@@ -35,8 +35,9 @@ use aya_ebpf::{
     helpers::{bpf_d_path, bpf_probe_read_kernel},
 };
 use wabbit_common::authorization::{
-    FLAG_PATH_RULES_DEFAULT_DENY, PATH_RULE_EXEC_ALLOW, PATH_RULE_EXEC_DENY, PATH_RULE_READ_ALLOW,
-    PATH_RULE_READ_DENY, PATH_RULE_WRITE_ALLOW, PATH_RULE_WRITE_DENY, PathRuleKey, Yard,
+    ACTION_PATH_BYPASS, FLAG_PATH_RULES_DEFAULT_DENY, PATH_RULE_EXEC_ALLOW, PATH_RULE_EXEC_DENY,
+    PATH_RULE_READ_ALLOW, PATH_RULE_READ_DENY, PATH_RULE_WRITE_ALLOW, PATH_RULE_WRITE_DENY,
+    PathRuleKey, Yard,
 };
 
 use crate::{lsm::trust, maps::PATH_RULES};
@@ -336,6 +337,13 @@ impl PathOp {
 /// opening `resolved`? The gate picks the class (`PathOp`) from the open
 /// itself; this resolves only that class's verdict.
 ///
+/// **The bypass** ([`ACTION_PATH_BYPASS`]): a cgroup holding the bit has
+/// no file profile — path rules decide nothing for it, its own rules
+/// and the `[default]` entry's alike, all three operation classes
+/// alike; the check runs before the governing entry is even resolved.
+/// The *other* `file_open` protections are not path rules and keep
+/// applying: bpffs pins, the module trees, the migration wall.
+///
 /// The rules (see [`PATH_RULES`] and
 /// `wabbit_common::authorization::FLAG_PATH_RULES_DEFAULT_DENY`)
 /// resolve **longest-deciding-prefix-wins, per operation**: one forward
@@ -363,6 +371,18 @@ impl PathOp {
 /// Trusted callers never reach this: `file_open` short-circuits them.
 #[inline(always)]
 pub fn path_rule_denies(resolved: &[u8], op: PathOp) -> bool {
+    // The trusted-user bypass (ACTION_PATH_BYPASS): path rules decide
+    // nothing for a cgroup holding the bit — its own and the default
+    // entry's alike, all three operation classes alike. One
+    // authorization lookup before anything else, the same shape every
+    // gate's own check takes (own entry, or the default's when it has
+    // none — and the default is refused the bit at build, so this is
+    // a listed cgroup's grant or nothing). The *other* `file_open`
+    // protections are not path rules and keep applying after this
+    // returns: bpffs pins, the module trees, the migration wall.
+    if trust::current_authorized(ACTION_PATH_BYPASS) {
+        return false;
+    }
     // The governing entry — the cgroup's own, or the policy default's —
     // and the id its rules are keyed under. Its default: allow, unless
     // the Authorization says otherwise.

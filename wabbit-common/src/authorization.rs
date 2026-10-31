@@ -254,6 +254,41 @@ pub const RAW_CAPTURE_GATE_OFF: u32 = 2;
 /// guard is not the signer's to trade away.
 pub const ACTION_SIGNAL_OTHERS: u64 = 1 << 13;
 
+/// The per-cgroup **path rules decide nothing** for this cgroup: the
+/// `file_open` gate's path-rule resolution is skipped entirely — opens
+/// under it are governed by the *other* `file_open` protections alone.
+///
+/// This is the **trusted-user** grant. A policy that walls machine
+/// configuration off with path rules (`[default]` denies for `/etc`,
+/// an entry's allow-list) still needs a way for a *trusted* principal
+/// to edit those very paths — the operator's shell, an admin session,
+/// a deployment tool. Spelling an `allow` rule for every denied
+/// prefix per operator cgroup is lockstep bookkeeping against the
+/// default section; this bit is the one-line form: grant it to the
+/// operator's cgroup (a listed login or service scope) or an operator
+/// `[[class]]` (a classed run), and path rules stop applying to that
+/// cgroup's opens — read, write, and exec classes alike, its own
+/// rules and the `[default]` entry's alike.
+///
+/// What it does **not** lift — the boundary that keeps it honest:
+///
+/// * **bpffs opens** (wabbit's pins, reads included) — pins are not
+///   path rules;
+/// * **the module-tree write gate** (`ACTION_KMODS`) — planting a
+///   `.ko` is not editing a configuration file;
+/// * **the migration wall** (`cgroup.procs`/`freeze`/`kill` under
+///   protected paths, `ACTION_CGROUPFS_WRITE`) — the wall around every
+///   other bit, this one included;
+/// * every other gate (`bpf`, mounts, firewall, sockets, signals).
+///
+/// And it is a **wall-lifting bit** in the `[default]`'s sense: handed
+/// to every unlisted cgroup it dissolves the per-cgroup file profile
+/// machine-wide, so `wabbit-policy build` refuses it there by name.
+/// The signer who grants it to a *listed* cgroup is choosing that that
+/// cgroup's opens are governed by the structural walls alone — that is
+/// what "trusted" means here, and the signature is what says so.
+pub const ACTION_PATH_BYPASS: u64 = 1 << 14;
+
 /// How deep the eBPF prefix walks may go: 64 bytes.
 ///
 /// A walk over a runtime-known length makes the verifier explore the whole

@@ -66,6 +66,8 @@ enum ActionName {
     BindNet,
     #[value(name = "signal")]
     Signal,
+    #[value(name = "path-bypass")]
+    PathBypass,
 }
 
 impl ActionName {
@@ -87,6 +89,7 @@ impl ActionName {
             Self::RawCapture => auth::ACTION_RAW_CAPTURE,
             Self::BindNet => auth::ACTION_BIND_NET,
             Self::Signal => auth::ACTION_SIGNAL_OTHERS,
+            Self::PathBypass => auth::ACTION_PATH_BYPASS,
         }
     }
 
@@ -108,6 +111,7 @@ impl ActionName {
             auth::ACTION_RAW_CAPTURE => Self::RawCapture,
             auth::ACTION_BIND_NET => Self::BindNet,
             auth::ACTION_SIGNAL_OTHERS => Self::Signal,
+            auth::ACTION_PATH_BYPASS => Self::PathBypass,
             _ => return None,
         })
     }
@@ -133,6 +137,7 @@ impl ActionName {
             Self::RawCapture => "raw-capture",
             Self::BindNet => "bind-net",
             Self::Signal => "signal",
+            Self::PathBypass => "path-bypass",
         }
     }
 }
@@ -1270,6 +1275,7 @@ mod tests {
             (ACTION_RAW_CAPTURE, "raw-capture"),
             (ACTION_BIND_NET, "bind-net"),
             (ACTION_SIGNAL_OTHERS, "signal"),
+            (ACTION_PATH_BYPASS, "path-bypass"),
         ] {
             let parsed = ActionName::from_bit(bit).expect("known action bit");
             assert_eq!(parsed.bit(), bit, "the {name} bit");

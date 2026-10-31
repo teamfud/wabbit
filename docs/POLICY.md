@@ -73,6 +73,7 @@ consult on every relevant syscall, per cgroup:
 | `raw-capture` | creating raw-capture sockets — `AF_PACKET` (tcpdump's channel) and `SOCK_RAW` at the IP families — packet capture and hand-crafted IP packets. Which of those are gated at all is the [`[network]`](#network--how-far-the-network-gates-reach) `raw_capture` posture |
 | `bind-net` | `bind(2)` on `AF_INET`/`AF_INET6`: acquiring a network endpoint (a listener, a service port). Which binds are gated at all — every one, only those naming a port, or none — is the [`[network]`](#network--how-far-the-network-gates-reach) `bind` posture. Every other family — local `AF_UNIX` IPC, netlink — is ungated by design |
 | `signal` | signaling any task other than the sender's own (`kill`/`tgkill`/`pidfd_send_signal`) — **self-signals and `SIGCONT` are always exempt** (`SIGCONT` is the thaw channel every boot-failure rescue broadcasts, and a frozen world must never outlive a failed boot). **Default-allow for unlisted cgroups**: a cgroup no policy names may signal freely; the gate binds only cgroups an entry lists — grant `signal` there where process management is legitimate (PID 1, udev's worker pool, a shell's job control), omit it where cross-task signaling is the thing to contain. The target's *cgroup* cannot be read without the unstable `task_struct` walks the design forbids, so the bit does not distinguish same-cgroup from cross-cgroup targets. **The bit never applies to wabbit itself**: the gate's self-guard denies every signal aimed at the wabbit process — this grant included — unless the system is shutting down (see the note below) |
+| `path-bypass` | **path rules decide nothing for this cgroup** — the `file_open` path-rule resolution (its own rules and the `[default]` entry's alike, read/write/exec classes alike) is skipped entirely. The trusted-user grant: the operator's shell or admin session still gets to *edit* the very paths the policy walls off, without an `allow` rule per prefix kept in lockstep with the default section. It lifts path rules **only** — bpffs pins, the module trees (`kmods`), and the migration wall (`cgroupfs-write`) are structural protections, not path rules, and keep applying, as does every other gate. Refused in `[default]` (see below) |
 
 
 The remaining names — `setns`, `unshare`, `exec`, `credentials`,
@@ -130,7 +131,13 @@ whose prefixes cover the path, the deepest one that *speaks for* the
 open's class decides it. (So an allow-list entry wanting "reads fine,
 but no writing under here" must say `verdict = "allow"` *and*
 `write = "deny"` in one rule — a shallower allow does not cover the
-class a deeper rule left out.) Two loader contracts apply, enforced at
+class a deeper rule left out.)
+
+**The whole profile is skippable**: an entry carrying the
+[`path-bypass`](#actions--the-vocabulary) action resolves no path rules
+at all — its cgroup's opens are governed by the structural protections
+alone. That is the trusted-user form: one action instead of an `allow`
+rule per walled prefix. Two loader contracts apply, enforced at
 build (never silently truncated):
 
 * **prefixes are canonical**: absolute, no trailing `/`;
@@ -371,9 +378,11 @@ exec    = "deny"
   and an allow-list that forgot one of their paths makes the boot
   unusable. Path rules here can only block.
 - **Allowed actions:** `kmods`, `firewall`, `raw-capture`, `bind-net`.
-  `mount`, `cgroupfs-write`, `bpf-attach`, and `bpf-full` are refused —
-  granted to every unlisted cgroup they would hand the whole machine the
-  keys to the walls. `signal` is refused because it would mean nothing:
+  `mount`, `cgroupfs-write`, `bpf-attach`, `bpf-full`, and `path-bypass`
+  are refused — granted to every unlisted cgroup they would hand the
+  whole machine the keys to the walls (`path-bypass` included: it
+  dissolves the per-cgroup file profile machine-wide). `signal` is
+  refused because it would mean nothing:
   unlisted cgroups may already signal, and the signal gate never reads
   the default.
 - Like every section, it is read at boot; a reconfigure stores it but

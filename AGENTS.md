@@ -935,7 +935,9 @@ entry: action bits and path rules alike, one extra map lookup on a miss,
 no struct walks. A *listed* cgroup gets exactly its own entry, never the
 default on top. Three things a default cannot say, rejected by name at
 build and at load: the wall-lifting bits (`mount`, `cgroupfs-write`,
-`bpf-attach` — handed to every unlisted cgroup they dissolve the walls),
+`bpf-attach`, `bpf-full`, `path-bypass` — handed to every unlisted
+cgroup they dissolve the walls; `path-bypass` dissolves the per-cgroup
+file profile machine-wide),
 `signal` (the `task_kill` gate never consults the default: unlisted
 cgroups keep their default-allow posture, the failure-safety contract),
 and an allow-list (the default reaches every unnamed service; a missing
@@ -1014,7 +1016,7 @@ enforce-flip steps are the next implementation phase:
 | --- | --- | --- |
 | `bpf_gate` | `bpf` | the classed `bpf(2)` gate: full trust keeps everything; `ACTION_BPF_FULL` permits every command unfiltered (the fd-by-ID lookups included — the signer who sets the bit is choosing that); `ACTION_BPF_ATTACH` (the systemd class) gets map creates + element ops + cgroup-family program loads/attaches/links + BTF loads; fd-by-ID lookups and LSM/tracing program types never relax below `ACTION_BPF_FULL` |
 | `kmod_gate` | `kernel_read_file` | module loads (`READING_MODULE`) denied outside full trust and `ACTION_KMODS`; identity-keyed (no `bpf_d_path`), so it loads on every target kernel including vanilla 5.15 where the hook is not sleepable |
-| `file_open_modern`/`_legacy` | `file_open` | untrusted opens of bpffs (reads included — with the fd-by-ID gate, wabbit's maps become unreachable); opens the cgroup's path rules deny for the open's operation class — read, write (`f_mode & FMODE_WRITE`), or exec (`f_flags & __FMODE_EXEC` 0x20, the kernel's execve marker: `OPEN_FMODE` never copies it into `f_mode` and `VALID_OPEN_FLAGS` keeps userspace from counterfeiting it) — per-cgroup, per-operation profiles in `PATH_RULES`, longest-deciding-prefix-wins, default-deny via the `Authorization` flag; writable opens under the module trees (`ACTION_KMODS` lifts); writable opens under protected cgroupfs paths — the `cgroup.procs`/`cgroup.freeze`/`cgroup.kill` migration wall (`ACTION_CGROUPFS_WRITE` lifts) |
+| `file_open_modern`/`_legacy` | `file_open` | untrusted opens of bpffs (reads included — with the fd-by-ID gate, wabbit's maps become unreachable); opens the cgroup's path rules deny for the open's operation class — read, write (`f_mode & FMODE_WRITE`), or exec (`f_flags & __FMODE_EXEC` 0x20, the kernel's execve marker: `OPEN_FMODE` never copies it into `f_mode` and `VALID_OPEN_FLAGS` keeps userspace from counterfeiting it) — per-cgroup, per-operation profiles in `PATH_RULES`, longest-deciding-prefix-wins, default-deny via the `Authorization` flag, **skipped entirely for a cgroup holding `ACTION_PATH_BYPASS`** (the trusted-user grant: path rules decide nothing for it — bpffs, the module trees, and the migration wall below are structural protections, not path rules, and keep applying); writable opens under the module trees (`ACTION_KMODS` lifts); writable opens under protected cgroupfs paths — the `cgroup.procs`/`cgroup.freeze`/`cgroup.kill` migration wall (`ACTION_CGROUPFS_WRITE` lifts) |
 | `sb_mount` | `sb_mount` | mounts over module trees/bpffs (never lifted); mounts over the cgroupfs root and protected cgroup paths (`ACTION_MOUNT` lifts) |
 | `firewall_gate` | `socket_setsockopt` | iptables-legacy rule changes (`IPT_SO_SET_REPLACE`/`ADD_COUNTERS` at `SOL_IP`/`SOL_IPV6`) denied outside full trust and `ACTION_FIREWALL` |
 | `netfilter_netlink_gate` | `socket_create` | creating a `NETLINK_NETFILTER` netlink socket — the nftables path: `nft`, `iptables-nft`/`ip6tables-nft`/`ebtables-nft`/`arptables-nft` (the distro defaults), firewalld, ipset, conntrack-tools — denied outside full trust and `ACTION_FIREWALL`; kernel-internal creation (`kern == 1`) exempt |

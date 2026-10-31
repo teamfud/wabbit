@@ -409,6 +409,21 @@ impl Guard {
             let pid =
                 self.run_worker(&selftest_cgroup, STEP_RULES_EXEC, &seeded.exec_arg(), true)?;
             self.check_fork_event(pid, STEP_RULES_EXEC)?;
+
+            // The trusted-user bypass proof: with `ACTION_PATH_BYPASS`
+            // granted to the selftest cgroup, the very same write under
+            // the very same seeded deny prefix must go *through* — the
+            // grant is load-bearing, and a bit the gate ignored would be
+            // a lie with a signature on it. The seed's release restores
+            // the pre-seed prior wholesale (removing the entry entirely
+            // when there was none), so this temporary grant needs no undo
+            // of its own. Enforcing-only: the observing round already
+            // proved the same write allowed, bypass or no bypass.
+            self.grant_path_bypass(seeded.cgroup_id)
+                .context("granting the path bypass for its self-test step")?;
+            let pid =
+                self.run_worker(&selftest_cgroup, STEP_RULES_WRITE, &seeded.data_arg(), false)?;
+            self.check_fork_event(pid, STEP_RULES_WRITE)?;
         }
 
         // The shadowed steps (see the module docs): denied by *either*
@@ -724,6 +739,33 @@ impl Guard {
                 seeded.dir.display()
             );
         }
+    }
+
+    /// Grant [`wabbit_common::authorization::ACTION_PATH_BYPASS`] to the
+    /// selftest cgroup for the bypass proof — the one authorization write
+    /// the seed's release needs no help undoing (it restores the pre-seed
+    /// prior wholesale, removing the entry when there was none). The
+    /// seeded entry is action-less by construction, so the OR is exactly
+    /// the grant, byte for byte.
+    fn grant_path_bypass(&mut self, cgroup_id: u64) -> Result<()> {
+        use wabbit_common::authorization::{ACTION_PATH_BYPASS, Authorization};
+
+        let mut authorizations: HashMap<_, CgroupKey, Authorization> = self
+            .ebpf
+            .map_mut("AUTHORIZATIONS")
+            .context("finding AUTHORIZATIONS")?
+            .try_into()
+            .context("opening AUTHORIZATIONS")?;
+        let key = CgroupKey { cgroup_id };
+        let mut entry = authorizations
+            .get(&key, 0)
+            .context("the selftest cgroup's seeded entry is missing")?;
+        entry.action_mask |= ACTION_PATH_BYPASS;
+        authorizations
+            .insert(key, entry, 0)
+            .context("granting the path bypass to the selftest cgroup")?;
+        debug!("granted the path bypass to the selftest cgroup for its proof");
+        Ok(())
     }
 
     /// Spawn one worker in the sacrificial cgroup and assert its verdict.
