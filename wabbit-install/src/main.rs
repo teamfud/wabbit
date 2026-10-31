@@ -70,6 +70,14 @@ mod brand {
         None => "bnuuy",
     };
 
+    /// The IPC client's *installed* file name — the deployment
+    /// generator's `--name-ipc`, so the box's client and the deployment
+    /// directory's copy answer to the same name.
+    pub const CLIENT_NAME: &str = match option_env!("WABBIT_INSTALL_CLIENT_NAME") {
+        Some(name) => name,
+        None => "wabbit-ipc",
+    };
+
     /// Whether `value` is safe as one path/shell component (the same
     /// compile-time validation `wabbit-common` applies).
     const fn is_safe_component(value: &str) -> bool {
@@ -106,6 +114,14 @@ mod brand {
         assert!(
             is_safe_component(SIGN_NAME),
             "WABBIT_BRAND_SIGN_NAME must be one path- and shell-safe component"
+        );
+        assert!(
+            !CLIENT_NAME.is_empty(),
+            "WABBIT_INSTALL_CLIENT_NAME must not be empty"
+        );
+        assert!(
+            is_safe_component(CLIENT_NAME),
+            "WABBIT_INSTALL_CLIENT_NAME must be one path- and shell-safe component"
         );
     };
 }
@@ -176,8 +192,12 @@ fn image_binary() -> String {
 
 /// Where the IPC client lands: the root filesystem's local bin folder —
 /// site-local software's standard home, in every target distro's PATH.
+/// The file name is the brand's `<name>-ipc`, or the deployment
+/// generator's `--name-ipc` when it renamed the deployment copy (see
+/// [`brand::client_name`]) — the box's client and the deployment
+/// directory's copy answer to the same name.
 fn client_binary() -> String {
-    format!("/usr/local/bin/{}-ipc", brand::NAME)
+    format!("/usr/local/bin/{}", brand::CLIENT_NAME)
 }
 
 /// The launch hook's pidfiles: `/run`, with `/dev` as the pre-`/run`
@@ -463,22 +483,23 @@ fn die(message: &str) -> ! {
 
 fn usage(code: i32) -> ! {
     let name = brand::NAME;
+    let client = brand::CLIENT_NAME;
     print!(
         "\
 usage: {name}-install [options]
   --artifact PATH   install this {name}-initrd binary instead of the one
                     bundled at build time
-  --client PATH     install this {name}-ipc client at /usr/local/bin instead
+  --client PATH     install this {client} client at /usr/local/bin instead
                     of the one bundled at build time
   --policy PATH     install this signed policy file at /etc/{name}/policy.wspf,
                     copy it into the initramfs, and export
-                    <prefix>_FILESYSTEM_CONFIGURATION_FILE to wabbit
+                    <prefix>_FILESYSTEM_CONFIGURATION_FILE to {name}
                     through the launch hook
-  --ipc-socket PATH have wabbit serve signed IPC commands on this Unix
+  --ipc-socket PATH have {name} serve signed IPC commands on this Unix
                     socket (the launch hook exports
-                    <prefix>_IPC_SOCKET=PATH; without it wabbit never
+                    <prefix>_IPC_SOCKET=PATH; without it {name} never
                     listens). The client lands in /usr/local/bin either
-                    way — {name}-ipc run/policy/send need the socket.
+                    way — {client} run/policy/send need the socket.
   --flavor NAME     dracut | initramfs-tools (default: autodetect)
   --no-switch-wait  do not install the pre-switch_root wait hook
   --no-lsm          do not add lsm=bpf to the kernel command line
@@ -532,7 +553,7 @@ fn parse_args() -> Options {
                     .unwrap_or_else(|| die("--ipc-socket needs a path"));
                 if !socket.starts_with('/') {
                     die(
-                        "--ipc-socket needs an absolute path (wabbit runs before / is relative to anything)",
+                        "--ipc-socket needs an absolute path ({name} runs before / is relative to anything)",
                     );
                 }
                 options.ipc_socket = Some(socket);
@@ -835,11 +856,11 @@ fn install(options: &Options, flavor: Flavor) {
     // socket — it reports "no IPC socket" and exits — so installing it
     // unconditionally is safe.
     let client = client_binary();
-    let client_name = options
+    let client_src = options
         .client
         .clone()
-        .unwrap_or_else(|| format!("<bundled {name}-ipc>"));
-    println!("+ install -m 0755 {client_name} {client}");
+        .unwrap_or_else(|| format!("<bundled {}>", brand::CLIENT_NAME));
+    println!("+ install -m 0755 {client_src} {client}");
     if !options.dry_run {
         if let Some(parent) = Path::new(&client).parent() {
             let _ = fs::create_dir_all(parent);
@@ -948,6 +969,7 @@ fn install(options: &Options, flavor: Flavor) {
     stamp_installed_files(options, flavor);
 
     let image = image_binary();
+    let installed_client = brand::CLIENT_NAME;
     let switch_summary = if options.switch_wait {
         format!("waits for {name}-initrd to exit (see the handoff note in --help)")
     } else {
@@ -955,21 +977,21 @@ fn install(options: &Options, flavor: Flavor) {
     };
     let policy_summary = if options.policy.is_some() {
         format!(
-            "installed at {} and exported to wabbit via <prefix>_FILESYSTEM_CONFIGURATION_FILE",
+            "installed at {} and exported to {name} via <prefix>_FILESYSTEM_CONFIGURATION_FILE",
             system_policy()
         )
     } else {
-        "NOT INSTALLED (no --policy; wabbit boots on Policy::default())".to_string()
+        format!("NOT INSTALLED (no --policy; {name} boots on Policy::default())")
     };
     let ipc_summary = match &options.ipc_socket {
-        Some(socket) => format!("{socket} — {name}-ipc on /usr/local/bin talks to it"),
-        None => "NOT LISTENING (no --ipc-socket; wabbit takes no commands)".to_string(),
+        Some(socket) => format!("{socket} — {installed_client} on /usr/local/bin talks to it"),
+        None => format!("NOT LISTENING (no --ipc-socket; {name} takes no commands)"),
     };
     print!(
         "
 installed via {flavor}:
   binary:        {image} in the image (installed from {artifact_name})
-  client:        {client} — command the running {name} with {name}-ipc
+  client:        {client} — command the running {name} with {installed_client}
   launch:        after /proc, /sys, /dev are mounted, before root mounting;
                  holds the init flow until the protector's /sys/fs/bpf/boot/bpf pin
   before

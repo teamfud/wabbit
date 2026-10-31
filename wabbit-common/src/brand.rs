@@ -1,7 +1,7 @@
 //! Compile-time white-labeling: every brand-bearing string in the shipped
 //! binaries derives from these constants.
 //!
-//! A white-label build sets any of four environment variables before
+//! A white-label build sets any of these environment variables before
 //! building the workspace; the defaults reproduce the stock names, so an
 //! ordinary build behaves exactly as it always has.
 //!
@@ -11,6 +11,8 @@
 //! | `WABBIT_BRAND_ENV_PREFIX` | `WABBIT` | the environment variables: `<prefix>_IPC_SOCKET`, `<prefix>_FILESYSTEM_CONFIGURATION_FILE`, `<prefix>_SIGN_DIR` |
 //! | `WABBIT_BRAND_SIGN_NAME` | `bnuuy` | the boot sign's file name (`<name>.bin`) and the wording that names the protections |
 //! | `WABBIT_BRAND_SIGN_MAGIC` | `BNUY` | the sign's magic, exactly four bytes |
+//! | `WABBIT_INSTALL_CLIENT_NAME` | `wabbit-ipc` | the IPC client's *installed* file name: the installer writes it to the box's `/usr/local/bin`, and the deployment generator's `--name-ipc` sets it so the box's client and the deployment directory's copy answer to the same name — and so the client's own help text names itself. The value itself is read by the installer (`wabbit-install`), which — unlike this `no_std` crate — can allocate; this crate only validates it. |
+//! | `WABBIT_POLICY_CLI_NAME` | `wabbit-policy` | the signing/inspection CLI's file name, as the deployment generator's `--name-policy` sets it: other binaries' help text names that tool by it (`<cli> gen-key`, `<cli> inspect`) |
 //!
 //! The values are validated at compile time — each must be a single
 //! path- and shell-safe component (ASCII alphanumerics plus `-`, `_`,
@@ -48,6 +50,24 @@ pub const SIGN_NAME: &str = match option_env!("WABBIT_BRAND_SIGN_NAME") {
 pub const SIGN_MAGIC: &str = match option_env!("WABBIT_BRAND_SIGN_MAGIC") {
     Some(magic) => magic,
     None => "BNUY",
+};
+
+/// The IPC client's *installed* file name: the one the installer writes to
+/// the box's `/usr/local/bin`, and the one the client's own help text
+/// answers to. The deployment generator's `--name-ipc` sets it (through
+/// `WABBIT_INSTALL_CLIENT_NAME`) so the box's client and the deployment
+/// directory's copy answer to the same name.
+pub const CLIENT_NAME: &str = match option_env!("WABBIT_INSTALL_CLIENT_NAME") {
+    Some(name) => name,
+    None => "wabbit-ipc",
+};
+
+/// The signing/inspection CLI's file name, as the deployment generator's
+/// `--name-policy` sets it (through `WABBIT_POLICY_CLI_NAME`): other
+/// binaries' help text names that tool by it.
+pub const POLICY_NAME: &str = match option_env!("WABBIT_POLICY_CLI_NAME") {
+    Some(name) => name,
+    None => "wabbit-policy",
 };
 
 /// Whether `value` consists only of ASCII alphanumerics and `-`, `_`,
@@ -101,4 +121,32 @@ const _: () = {
         is_safe_component(SIGN_MAGIC),
         "WABBIT_BRAND_SIGN_MAGIC must be four printable bytes"
     );
+    match option_env!("WABBIT_INSTALL_CLIENT_NAME") {
+        Some(client_name) => {
+            assert!(
+                !client_name.is_empty(),
+                "WABBIT_INSTALL_CLIENT_NAME must not be empty"
+            );
+            assert!(
+                is_safe_component(client_name),
+                "WABBIT_INSTALL_CLIENT_NAME must be one path- and shell-safe \
+                 component (ASCII alphanumerics, '-', '_', '.')"
+            );
+        }
+        None => {}
+    }
+    match option_env!("WABBIT_POLICY_CLI_NAME") {
+        Some(policy_name) => {
+            assert!(
+                !policy_name.is_empty(),
+                "WABBIT_POLICY_CLI_NAME must not be empty"
+            );
+            assert!(
+                is_safe_component(policy_name),
+                "WABBIT_POLICY_CLI_NAME must be one path- and shell-safe \
+                 component (ASCII alphanumerics, '-', '_', '.')"
+            );
+        }
+        None => {}
+    }
 };

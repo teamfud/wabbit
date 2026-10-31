@@ -1,70 +1,108 @@
-//! `wabbit-ipc` — send a signed command to a running wabbit.
+//! `wabbit-ipc` — mint and deliver signed commands to a running wabbit.
 //!
-//! One command per invocation; the id discipline is the client's half of
-//! the anti-replay: each invocation spends the next id from the counter
-//! file (see `wabbit_ipc`'s docs), signs the command with the
-//! deployment's signing key — the same key that signs policy files —
-//! and delivers it to the IPC socket.
+//! Two halves, one per machine (see `wabbit_ipc`'s docs): **minting**
+//! needs the signing key and happens wherever the key lives — off box,
+//! by design — and **delivery** needs nothing but the socket, because
+//! wabbit itself decodes and validates the command. A client that only
+//! delivers holds no secret and makes no decision; it needs no trust.
 //!
 //! ```text
-//! # run a program in the protected namespace:
-//! wabbit-ipc --key policy.key run sh -c 'uptime'
+//! # mint off box (needs the key; --boot-id names the TARGET's boot):
+//! wabbit-ipc --key policy.key --boot-id "$(ssh box cat /proc/sys/kernel/random/boot_id)" \
+//!           --class ultra-privileged encode-run bash
 //!
-//! # apply a signed policy:
-//! wabbit-ipc --key policy.key policy policy.wspf
+//! # deliver on box (no key, no counter — a dumb pipe):
+//! wabbit-ipc --socket /run/wabbit/wabbit.sock '<base64>'
 //!
-//! # the same, but the command comes as base64:
-//! wabbit-ipc --key policy.key send "$(wabbit-ipc encode-run sh -c uptime)"
+//! # mint and deliver in one step (the machine with the key):
+//! wabbit-ipc --key policy.key --socket /run/wabbit/wabbit.sock run sh -c 'uptime'
 //! ```
 //!
-//! The socket defaults to the `WABBIT_IPC_SOCKET` environment variable;
-//! the counter defaults to `~/.wabbit-ipc-counter`; the boot id to this
-//! machine's current boot. Override any of them when tunneling or
-//! scripting.
+//! (The names above are the stock ones; a branded build's help text —
+//! `--help` — spells this binary's own installed name, the product's,
+//! and the policy CLI's the deployment set.)
 
 use std::{io::Write, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
+use wabbit_common::brand;
 use wabbit_ipc::{CommandClient, CommandOutcome};
 
-const USAGE: &str = "\
-usage: wabbit-ipc [options] VERB [arguments]
+/// The whole help text, every name in it following the brand: the client
+/// names itself by its installed name, the server by the product name,
+/// the environment variable by the prefix, and the key tool by the
+/// policy CLI's name.
+fn usage() -> String {
+    let name = brand::NAME;
+    let client = brand::CLIENT_NAME;
+    let prefix = brand::ENV_PREFIX;
+    let policy = brand::POLICY_NAME;
+    let counter = wabbit_ipc::default_counter_path().display().to_string();
+    format!(
+        "\
+usage: {client} [options] VERB [arguments]
 
 options:
-  --socket PATH     wabbit's IPC socket (default: $WABBIT_IPC_SOCKET)
-  --key PATH        the 32-byte Ed25519 signing seed (wabbit-policy gen-key
-                    writes it); required for run, policy, and send
-  --counter PATH    the command counter file (default: ~/.wabbit-ipc-counter)
-  --boot-id ID      the target boot's UUID (default: this machine's current
-                    boot, from /proc/sys/kernel/random/boot_id)
-  --class NAME      the class the run executes under (run and encode-run
-                    only): the authorization profile this name selects from
-                    the target's policy. A classed run gets its own
-                    ephemeral cgroup with exactly the class's rules; without
-                    it the run is deny-by-default
+  --socket PATH     {name}'s IPC socket (default: ${prefix}_IPC_SOCKET);
+                    needed by run, policy, send, and the bare form
+  --key PATH        the 32-byte Ed25519 signing seed ({policy}
+                    gen-key writes it); required for run, policy,
+                    encode-run, and encode-policy — the minting verbs.
+                    The key never needs to reach the target: mint where
+                    it lives, deliver the base64 anywhere
+  --counter PATH    the command counter file (default: {counter});
+                    the id source when minting, kept by the signer
+  --command-id N    mint with this id instead of the counter file — for
+                    scripted runs that pick their own (the server still
+                    enforces strictly-increasing acceptance)
+  --boot-id ID      the TARGET boot's UUID (default: this machine's
+                    current boot, from /proc/sys/kernel/random/boot_id).
+                    Required in practice when minting off box: a command
+                    minted for the wrong boot is rejected by the server
+  --class NAME      the class the run executes under (run and
+                    encode-run only): the authorization profile this
+                    name selects from the target's policy. A classed run
+                    gets its own ephemeral cgroup with exactly the
+                    class's rules; without it the run is deny-by-default
   -h | --help       this text
 
 verbs:
-  run PROGRAM [ARGS...]  run a program in the protected namespace
-  policy FILE            apply a complete signed policy file
-  send BASE64            send a base64-encoded command blob
+  run PROGRAM [ARGS...]      mint a run here and deliver it (needs
+                             --key and --socket)
+  policy FILE                mint a policy application here and deliver
+                             it (needs --key and --socket)
   encode-run PROGRAM [ARGS...]
-                         print the base64 command blob for a run — no key,
-                         no counter; feed it to send now or elsewhere
+                             mint a run and print it as base64 — no
+                             socket touched, nothing delivered; carry
+                             the output anywhere
+  encode-policy FILE         mint a policy application and print it as
+                             base64
+  send BASE64                deliver a minted command verbatim — no key,
+                             no counter, no validation: {name} decodes
+                             and validates the command itself
+  BASE64                     the bare form of send: just the payload
 
-every command is signed (Ed25519) and travels as base64 in the blob
-verbs above — the blob is the reviewable, relayable artifact: mint it
-with encode-run, inspect or carry it anywhere, deliver it with send.
+every command is signed (Ed25519) and travels as base64 text of the
+complete signed request — one printable, pasteable artifact. Mint it
+with the encode-* verbs wherever the key lives (off box), deliver it
+with send (or bare) wherever the socket lives:
 
-  wabbit-ipc --key policy.key --class ultra-privileged encode-run bash
-  wabbit-ipc --key policy.key send \"$(wabbit-ipc --class ultra-privileged encode-run bash)\"
-";
+  {client} --key policy.key --class ultra-privileged encode-run bash
+  {client} --socket /run/{name}/{name}.sock \\
+    \"$( {client} --key policy.key --class ultra-privileged encode-run bash )\"
+
+minted commands carry strictly-increasing ids — deliver them in mint
+order, or the server rejects the ones that arrive below its last
+accepted id.
+"
+    )
+}
 
 fn main() {
     let code = match run() {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("wabbit-ipc: {error:#}");
+            eprintln!("{}: {error:#}", brand::CLIENT_NAME);
             2
         }
     };
@@ -78,17 +116,23 @@ struct CommandLine {
     socket: Option<PathBuf>,
     key: Option<PathBuf>,
     counter: Option<PathBuf>,
+    command_id: Option<u64>,
     boot_id: Option<String>,
     class: Option<String>,
     verb: String,
     arguments: Vec<String>,
 }
 
+/// The known verbs — anything else in verb position is the bare form:
+/// a base64 command to deliver verbatim.
+const VERBS: &[&str] = &["run", "policy", "encode-run", "encode-policy", "send"];
+
 fn parse_arguments() -> Result<CommandLine> {
     let mut command = CommandLine {
         socket: None,
         key: None,
         counter: None,
+        command_id: None,
         boot_id: None,
         class: None,
         verb: String::new(),
@@ -100,6 +144,14 @@ fn parse_arguments() -> Result<CommandLine> {
             "--socket" => command.socket = Some(value(&mut arguments, "--socket")?.into()),
             "--key" => command.key = Some(value(&mut arguments, "--key")?.into()),
             "--counter" => command.counter = Some(value(&mut arguments, "--counter")?.into()),
+            "--command-id" => {
+                let raw = value(&mut arguments, "--command-id")?;
+                command.command_id = Some(
+                    raw.trim()
+                        .parse()
+                        .with_context(|| format!("--command-id {raw:?} is not a number"))?,
+                );
+            }
             "--boot-id" => {
                 let boot_id = value(&mut arguments, "--boot-id")?;
                 if !wabbit_common::ipc_command::is_canonical_boot_id(boot_id.trim().as_bytes()) {
@@ -121,17 +173,27 @@ fn parse_arguments() -> Result<CommandLine> {
                 command.class = Some(class.trim().to_string());
             }
             "-h" | "--help" => {
-                print!("{USAGE}");
+                print!("{}", usage());
                 std::process::exit(0);
             }
-            verb => {
-                command.verb = verb.to_string();
-                command.arguments = arguments.collect();
+            first => {
+                if VERBS.contains(&first) {
+                    command.verb = first.to_string();
+                    command.arguments = arguments.collect();
+                } else {
+                    // The bare form: the payload is the whole rest of
+                    // the line, delivered verbatim.
+                    command.verb = "send".to_string();
+                    command.arguments = Some(first.to_string())
+                        .into_iter()
+                        .chain(arguments)
+                        .collect();
+                }
                 return Ok(command);
             }
         }
     }
-    bail!("missing verb: run, policy, send, or encode-run")
+    bail!("missing verb: run, policy, encode-run, encode-policy, or send")
 }
 
 fn value(arguments: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
@@ -143,30 +205,47 @@ fn value(arguments: &mut impl Iterator<Item = String>, flag: &str) -> Result<Str
 fn run() -> Result<i32> {
     let command = parse_arguments()?;
     match command.verb.as_str() {
-        // The blob producer: encodes only — no key, no socket, nothing
-        // spent. Print the base64 on one line for shell capture.
+        // The minting-and-printing verbs: no socket, nothing delivered.
+        // The base64 goes to stdout for capture, carrying, and delivery
+        // anywhere — including by hand, into `send` on the target.
         "encode-run" => {
             let Some(program) = command.arguments.first() else {
                 bail!("encode-run needs a program");
             };
-            let blob = wabbit_ipc::encode_run_in_class(
+            let client = minting_client(&command)?;
+            let minted = client.mint_run_in_class(
                 program,
                 &command.arguments[1..],
                 command.class.as_deref(),
             )?;
-            println!("{}", base64(blob.as_slice()));
+            println!("{minted}");
             Ok(0)
         }
+        "encode-policy" => {
+            reject_class(&command, "encode-policy")?;
+            let Some(path) = command.arguments.first() else {
+                bail!("encode-policy needs a signed policy file");
+            };
+            let policy =
+                std::fs::read(path).with_context(|| format!("reading the policy {}", path))?;
+            let client = minting_client(&command)?;
+            let minted = client.mint_policy(&policy)?;
+            println!("{minted}");
+            Ok(0)
+        }
+        // The mint-and-deliver verbs: one step, on the machine that
+        // holds the key and can reach the socket.
         "run" => {
             let Some(program) = command.arguments.first() else {
                 bail!("run needs a program");
             };
-            let blob = wabbit_ipc::encode_run_in_class(
+            let client = minting_client(&command)?;
+            let outcome = client.run_in_class(
                 program,
                 &command.arguments[1..],
                 command.class.as_deref(),
             )?;
-            deliver(&command, &blob)
+            report(outcome)
         }
         "policy" => {
             reject_class(&command, "policy")?;
@@ -175,40 +254,30 @@ fn run() -> Result<i32> {
             };
             let policy =
                 std::fs::read(path).with_context(|| format!("reading the policy {}", path))?;
-            let blob = wabbit_ipc::encode_policy(&policy)?;
-            deliver(&command, &blob)
+            let client = minting_client(&command)?;
+            report(client.reconfigure(&policy)?)
         }
+        // The delivery-only verb (and the bare form): no key, no
+        // counter, no validation — wabbit does all of it. This is the
+        // one that runs on the target.
         "send" => {
             reject_class(&command, "send")?;
             let Some(encoded) = command.arguments.first() else {
                 bail!("send needs a base64-encoded command");
             };
-            deliver_encoded(&command, encoded)
+            let socket = delivery_socket(&command)?;
+            let outcome = wabbit_ipc::deliver(&socket, encoded)?;
+            report(outcome)
         }
-        other => bail!("unknown verb {other:?}: run, policy, send, or encode-run"),
+        other => bail!("unknown verb {other:?}: run, policy, encode-run, encode-policy, or send"),
     }
 }
 
-/// `--class` selects the authorization profile of a *run*; on any other
-/// verb it is a typo, not a silent no-op.
-fn reject_class(command: &CommandLine, verb: &str) -> Result<()> {
-    if let Some(class) = &command.class {
-        bail!("--class {class:?} does nothing with {verb:?}: it selects a run's class");
-    }
-    Ok(())
-}
-
-/// Send a command blob (kind byte plus fields) and report the outcome
-/// the way a human wants it: a run's output goes to our own, its exit
-/// code becomes ours; anything else prints the verdict.
-fn deliver(command: &CommandLine, blob: &[u8]) -> Result<i32> {
-    deliver_encoded(command, &base64(blob))
-}
-
-/// [`deliver`], but the command is already base64.
-fn deliver_encoded(command: &CommandLine, encoded: &str) -> Result<i32> {
-    let client = client(command)?;
-    match client.send_base64(encoded)? {
+/// Report a command's outcome the way a human wants it: a run's output
+/// goes to our own, its exit code becomes ours; anything else prints
+/// the verdict.
+fn report(outcome: CommandOutcome) -> Result<i32> {
+    match outcome {
         CommandOutcome::Completed(output) => {
             std::io::stdout().write_all(&output.stdout)?;
             std::io::stderr().write_all(&output.stderr)?;
@@ -221,52 +290,87 @@ fn deliver_encoded(command: &CommandLine, encoded: &str) -> Result<i32> {
     }
 }
 
-/// Build the client from the resolved options: the socket (flag, or the
-/// environment variable the server also answers to), the key (always
-/// required here — a command is only worth sending signed), the counter
-/// file, and the boot id (flag, or this machine's).
-fn client(command: &CommandLine) -> Result<CommandClient> {
-    let socket = command
-        .socket
-        .clone()
-        .or_else(|| std::env::var_os(wabbit_ipc::socket_var()).map(PathBuf::from))
-        .context("no IPC socket: pass --socket or set WABBIT_IPC_SOCKET")?;
+/// `--class` selects the authorization profile of a *run*; on any other
+/// verb it is a typo, not a silent no-op.
+fn reject_class(command: &CommandLine, verb: &str) -> Result<()> {
+    if let Some(class) = &command.class {
+        bail!("--class {class:?} does nothing with {verb:?}: it selects a run's class");
+    }
+    Ok(())
+}
+
+/// The minting client from the resolved options: the key (always
+/// required — a command is only worth minting signed), the boot id
+/// (flag, or this machine's), and the command id (flag, or the counter
+/// file).
+fn minting_client(command: &CommandLine) -> Result<CommandClient> {
     let key_path = command
         .key
         .clone()
-        .context("--key is required (the 32-byte signing seed)")?;
+        .context("--key is required for minting (the 32-byte signing seed)")?;
     let key = read_seed(&key_path)?;
     let counter = command
         .counter
         .clone()
         .unwrap_or_else(wabbit_ipc::default_counter_path);
-    Ok(match &command.boot_id {
-        // The explicit boot id is for tunneling: the machine the socket
-        // names, not the one this CLI runs on.
+    let client = match &command.boot_id {
+        // The explicit boot id names the machine the command is FOR —
+        // required in practice when minting off box.
         Some(boot_id) => {
             let mut bytes = [0u8; 36];
             bytes.copy_from_slice(boot_id.trim().as_bytes());
-            CommandClient::with_boot_id(socket, &key, counter, bytes)
+            CommandClient::with_boot_id(
+                // The socket is unused for the encode-* verbs, but the
+                // client wants one; any path will do.
+                command
+                    .socket
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("/nonexistent/socket")),
+                &key,
+                counter,
+                bytes,
+            )
         }
-        None => CommandClient::connect(socket, &key, counter)?,
+        None => {
+            let socket = command.socket.clone().unwrap_or_else(|| PathBuf::from(
+                "/nonexistent/socket",
+            ));
+            CommandClient::connect(socket, &key, counter)?
+        }
+    };
+    Ok(match command.command_id {
+        Some(id) => client.command_id(id),
+        None => client,
     })
 }
 
-/// Read the signing seed (the file `wabbit-policy gen-key` writes:
-/// exactly 32 bytes, mode 0600). The read buffer zeroes itself when it
-/// goes out of scope — the seed outlives the call only inside the key.
+/// The delivery socket from the resolved options — the only thing
+/// delivery needs.
+fn delivery_socket(command: &CommandLine) -> Result<PathBuf> {
+    command
+        .socket
+        .clone()
+        .or_else(|| std::env::var_os(wabbit_ipc::socket_var()).map(PathBuf::from))
+        .context(format!(
+            "no IPC socket: pass --socket or set {}_IPC_SOCKET",
+            brand::ENV_PREFIX
+        ))
+}
+
+/// Read the signing seed (the file the policy CLI's `gen-key` writes:
+/// exactly 32 bytes, mode 0600 — the CLI's name follows the brand). The
+/// read buffer zeroes itself when it goes out of scope — the seed
+/// outlives the call only inside the key.
 fn read_seed(path: &std::path::Path) -> Result<zeroize::Zeroizing<Vec<u8>>> {
     let seed = zeroize::Zeroizing::new(
         std::fs::read(path)
             .with_context(|| format!("reading the signing key {}", path.display()))?,
     );
     if seed.len() != 32 {
-        bail!("the signing key must be exactly 32 bytes (wabbit-policy gen-key writes that)");
+        bail!(
+            "the signing key must be exactly 32 bytes ({} gen-key writes that)",
+            brand::POLICY_NAME
+        );
     }
     Ok(seed)
-}
-
-fn base64(bytes: &[u8]) -> String {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-    STANDARD.encode(bytes)
 }

@@ -38,8 +38,10 @@
 # chain, and every nested bundle — the artifact inside the installer, the
 # wabbit inside the artifact — come out branded together. The wabbit
 # cgroup follows the brand name (and the starter policy's class root with
-# it), and so do the box-side names: the /usr/local/bin/<name>-ipc client,
-# the <name>-initrd hook, the <prefix>_* environment variables. The
+# it), and so do the box-side names: the <name>-initrd hook, the
+# <prefix>_* environment variables, and the /usr/local/bin client — whose
+# name follows --name-ipc (default <brand-name>-ipc; see brand.rs's
+# WABBIT_INSTALL_CLIENT_NAME). The
 # artifact file names above are the cargo bin names; the --name-* flags
 # rename the deployment directory's copies.
 #
@@ -62,11 +64,16 @@
 #                       wabbit-initrd)
 #   --name-install NAME the installer's file name in <out> (default:
 #                       wabbit-install)
-#   --name-ipc NAME     the client's file name in <out> (default: wabbit-ipc)
+#   --name-ipc NAME     the client's file name in <out> — and the name the
+#                       installer gives the box's /usr/local/bin copy
+#                       (default: <brand-name>-ipc)
 #
-#   The --name-* renames govern the deployment directory's copies only: the
-#   musl builds under target/release/ keep their cargo bin names, and every
-#   box-side path comes from the brand.
+#   The --name-* renames govern the deployment directory's copies only:
+#   the musl builds under target/release/ keep their cargo bin names,
+#   and every box-side path comes from the brand — except --name-ipc,
+#   which also names the installed client (exported as
+#   WABBIT_INSTALL_CLIENT_NAME into the installer's build) so the
+#   deployment copy and the box's client answer to the same name.
 #
 # example:
 #   vm/generate-deployment.sh --bake deployments/foo
@@ -154,19 +161,31 @@ fi
 # The deployment directory's file names. The musl builds under
 # target/release/ keep their cargo bin names (Cargo.toml fixes them), but
 # nothing keys off the deployment copy's name — no binary reads its own
-# argv[0] as a path, the installer bundles its artifact and client inside
-# itself, and every box-side path comes from the brand — so the four
-# copies in <out> are free to name.
+# argv[0] as a path, and the installer bundles its artifact and client
+# inside itself — so the four copies in <out> are free to name. One
+# exception: the client's name is also the name the installer gives the
+# box's /usr/local/bin copy (the --name-ipc flag is exported as
+# WABBIT_INSTALL_CLIENT_NAME and compiled into the installer), so a
+# renamed deployment copy and the installed client answer to the same
+# name.
 
 name_policy=${name_policy:-wabbit-policy}
 name_initrd=${name_initrd:-wabbit-initrd}
 name_install=${name_install:-wabbit-install}
-name_ipc=${name_ipc:-wabbit-ipc}
+name_ipc=${name_ipc:-${brand_name}-ipc}
 
 safe_component "--name-policy (the signing CLI's file name)" "$name_policy"
 safe_component "--name-initrd (the artifact's file name)" "$name_initrd"
 safe_component "--name-install (the installer's file name)" "$name_install"
 safe_component "--name-ipc (the client's file name)" "$name_ipc"
+
+# The client's installed name, plumbed into the installer's build (see
+# the comment above): exported before the chain builds so the installer
+# the generator ships names the box's client exactly as this deployment
+# directory names its copy. The policy CLI's name rides along too — other
+# binaries' help text names that tool by it.
+export WABBIT_INSTALL_CLIENT_NAME="$name_ipc"
+export WABBIT_POLICY_CLI_NAME="$name_policy"
 
 declare -A name_seen=()
 for n in "$name_policy" "$name_initrd" "$name_install" "$name_ipc"; do
@@ -350,11 +369,11 @@ actions = ["kmods", "signal"]
 # protect = true
 EOF
   # The branded wabbit names its cgroup after the brand, so the starter
-  # class must root there, and the example must name the branded client
-  # the installer writes (/usr/local/bin/<name>-ipc).
+  # class must root there, and the example must name the client the
+  # installer writes (/usr/local/bin/<name-ipc>).
   if [[ $brand_name != wabbit ]]; then
     sed -i -e "s|/sys/fs/cgroup/wabbit|/sys/fs/cgroup/$brand_name|g" \
-           -e "s|wabbit-ipc|${brand_name}-ipc|g" "$source"
+           -e "s|wabbit-ipc|$name_ipc|g" "$source"
   fi
   gum spin --title "wabbit-policy build (validate + sign)" -- \
     "$policy_cli" build "$source" "$policy" --key "$key" --key-id 0
@@ -414,7 +433,7 @@ summary+=("")
 summary+=("$(gum style --bold "goes to the box:")")
 [[ "$bake" != yes && -e $policy ]] && summary+=("  policy.wspf       the signed policy (verified against .pub)")
 summary+=("$(printf '  %-18s the installer — carries the whole chain inside,' "$name_install")")
-summary+=("                    and writes ${brand_name}-ipc to the box's /usr/local/bin")
+summary+=("                    and writes $name_ipc to the box's /usr/local/bin")
 [[ "$bake" == yes ]] && summary+=("  policy baked in   first-install: no filesystem footprint")
 printf '%s\n' "${summary[@]}" | gum style --border rounded --padding "1 2"
 

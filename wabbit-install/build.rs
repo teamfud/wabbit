@@ -30,6 +30,14 @@ fn main() {
     println!("cargo:rerun-if-env-changed=WABBIT_BRAND_ENV_PREFIX");
     println!("cargo:rerun-if-env-changed=WABBIT_BRAND_SIGN_NAME");
     println!("cargo:rerun-if-env-changed=WABBIT_BRAND_SIGN_MAGIC");
+    // The installed client's name (the deployment generator's --name-ipc):
+    // a change must rebuild this crate's strings — rustc fingerprints the
+    // option_env! in wabbit-common, and this declaration keeps the
+    // bundle-building script itself honest about it too. The policy CLI's
+    // name (--name-policy) rides along: this crate's help text names that
+    // tool by it.
+    println!("cargo:rerun-if-env-changed=WABBIT_INSTALL_CLIENT_NAME");
+    println!("cargo:rerun-if-env-changed=WABBIT_POLICY_CLI_NAME");
     // The policy knobs feed the bundled wabbit-initrd through its own nested
     // build (the chain: this script's nested wabbit-initrd build embeds
     // wabbit, which compiles its compiled-in key from

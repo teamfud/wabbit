@@ -1,9 +1,12 @@
 //! The IPC server: how a running wabbit takes orders.
 //!
-//! Every request is a **signed command** (see
-//! [`wabbit_common::ipc_command`] for the wire layout, and `wabbit-ipc`
-//! for the client that produces them). Three gates stand between a
-//! request and its execution, in order:
+//! A request travels as **base64 text of a complete signed command**
+//! (see [`wabbit_common::ipc_command`] for the envelope layout, and
+//! `wabbit-ipc` for the client that mints them) — so a command is one
+//! printable, pasteable artifact, and the *delivery* half of the client
+//! is a dumb pipe: it holds no key and validates nothing. This side
+//! decodes the base64 into the command structure and then runs every
+//! gate itself, in order:
 //!
 //! 1. **the signature** — Ed25519, verified against the compiled-in
 //!    policy keys (the deployment's signing key signs policies *and*
@@ -15,10 +18,11 @@
 //!    rejected by construction: replaying a captured request, or
 //!    double-clicking the client, gets "command id N was already used".
 //!
-//! Unsigned requests are refused outright (the message names the
-//! client to use). The socket itself still decides *who may connect* —
-//! set its ownership and permissions for the operator class you want;
-//! the signature decides what a connected client may make wabbit do.
+//! Undecodable or unsigned requests are refused outright (the message
+//! names the client to use). The socket itself still decides *who may
+//! connect* — set its ownership and permissions for the operator class
+//! you want; the signature decides what a connected client may make
+//! wabbit do.
 //!
 //! Two commands exist:
 //!
@@ -36,6 +40,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -162,8 +167,22 @@ pub async fn run_server(socket_path: PathBuf, state: Arc<IpcState>) -> Result<()
 
 async fn handle_task(stream: UnixStream, state: Arc<IpcState>) -> Result<()> {
     let (mut read_half, mut write_half) = stream.into_split();
-    let mut request = Vec::new();
-    read_half.read_to_end(&mut request).await?;
+    let mut encoded = Vec::new();
+    read_half.read_to_end(&mut encoded).await?;
+    // The transport is base64 text: the client pipes a minted command
+    // verbatim (see `wabbit_ipc::deliver`), so this side does the
+    // decoding — and every gate after it. A client that only delivers
+    // needs no trust: it holds no secret and validates nothing.
+    let request = match decode_transport(&encoded) {
+        Ok(request) => request,
+        Err(error) => {
+            let response = encode_response(&Response::Failed(TaskError {
+                message: format!("{error:#}"),
+            }))?;
+            write_half.write_all(&response).await?;
+            return Ok(());
+        }
+    };
     let response = match decode_signed_command(&request, &state) {
         Ok(RequestOwned::Run(run)) => match execute_run(run, &state).await {
             Ok(output) => encode_response(&Response::Completed(CompletedTask {
@@ -341,6 +360,27 @@ fn resolve_class(
     })
 }
 
+/// Decode the transport: the request arrives as base64 text of a
+/// complete signed request, so the client's delivery half can be a dumb
+/// pipe — no key, no validation, nothing to trust. This side owns the
+/// decoding; everything after it (signature, boot id, command id, the
+/// command's own fields) is validated here too, in
+/// [`decode_signed_command`].
+fn decode_transport(encoded: &[u8]) -> Result<Vec<u8>> {
+    let text = std::str::from_utf8(encoded).with_context(|| {
+        format!(
+            "an IPC request must be base64 text (mint it with the {} client)",
+            wabbit_common::brand::CLIENT_NAME
+        )
+    })?;
+    STANDARD.decode(text.trim()).with_context(|| {
+        format!(
+            "an IPC request must be base64 (mint it with the {} client)",
+            wabbit_common::brand::CLIENT_NAME
+        )
+    })
+}
+
 /// The three gates (see the module docs): signature, boot id, command
 /// id — then the command itself. The id burns only after everything
 /// before it passed.
@@ -350,7 +390,8 @@ fn decode_signed_command(bytes: &[u8], state: &IpcState) -> Result<RequestOwned>
     if kind != ipc_command::SIGNED_REQUEST {
         bail!(
             "unsigned IPC requests are not accepted; commands are signed \
-             (use the wabbit-ipc client)"
+             (use the {} client)",
+            wabbit_common::brand::CLIENT_NAME
         );
     }
     let signature: [u8; SIGNATURE_LEN] = cursor
@@ -366,7 +407,10 @@ fn decode_signed_command(bytes: &[u8], state: &IpcState) -> Result<RequestOwned>
         .iter()
         .any(|key| key.verify(signed, &signature).is_ok());
     if !verified {
-        bail!("the command's signature does not verify against this wabbit's keys");
+        bail!(
+            "the command's signature does not verify against this {}'s keys",
+            wabbit_common::brand::NAME
+        );
     }
 
     // Gate 2: the boot id.
@@ -931,6 +975,42 @@ mod tests {
     }
 
     #[test]
+    fn the_transport_decodes_base64_and_rejects_everything_else() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let signing_key = SigningKey::from_bytes(&[11; 32]);
+        let state = test_state(&[signing_key.verifying_key()], 0);
+        let request = signed_request(
+            &signing_key,
+            KIND_RUN,
+            test_boot_id(),
+            1,
+            &run_blob("true", &[]),
+        );
+
+        // Base64 text decodes to the same request — the client's
+        // delivery half pipes it verbatim, so this is the path a real
+        // request takes.
+        let encoded = STANDARD.encode(&request);
+        assert_eq!(decode_transport(encoded.as_bytes()).unwrap(), request);
+        // Surrounding whitespace (a pasted newline) is tolerated.
+        let padded = format!("\n{encoded}\n");
+        assert_eq!(decode_transport(padded.as_bytes()).unwrap(), request);
+
+        // Anything else on the wire is refused by name, never decoded.
+        // (The empty input is valid base64 — it decodes to no request and
+        // dies in the envelope decode, one gate later.)
+        for garbage in [
+            &request[..],           // raw binary: the wire is base64 now
+            b"not base64!!",         // printable, but not base64
+            b"\xff\xfe garbage",     // not even UTF-8
+        ] {
+            let error = decode_transport(garbage).unwrap_err().to_string();
+            assert!(error.contains("base64"), "{error}");
+        }
+        assert_eq!(decode_transport(b"").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
     fn a_reconfigure_command_carries_a_policy_the_server_re_verifies() {
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let state = test_state(&[signing_key.verifying_key()], 0);
@@ -1046,10 +1126,16 @@ mod tests {
         }
 
         // The exact same request bytes, sent again: the replay gate.
-        let command = wabbit_ipc::encode_run("sh", &["-c".into(), "echo replayed".into()]).unwrap();
-        let request = client.request_bytes(&command).unwrap();
-        client.send_request(&request).unwrap();
-        let replay = client.send_request(&request).unwrap_err().to_string();
+        // Minting burns the counter's id whether or not the minted
+        // command is ever delivered, so mint once and deliver the same
+        // base64 twice — the second delivery is the replay.
+        let minted = client
+            .mint_run("sh", ["-c", "echo replayed"])
+            .unwrap();
+        wabbit_ipc::deliver(&socket_path, &minted).unwrap();
+        let replay = wabbit_ipc::deliver(&socket_path, &minted)
+            .unwrap_err()
+            .to_string();
         assert!(replay.contains("already used"), "{replay}");
 
         // And a fresh command still goes through after the replay: the

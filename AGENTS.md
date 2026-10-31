@@ -417,8 +417,11 @@ private target directory, the same arrangement `wabbit-initrd` uses to
 embed wabbit — so the installer carries its artifact and needs no
 checkout on the target system; `--artifact` overrides the bundle. The
 same build script bundles the `wabbit-ipc` client the same way, and the
-installer writes it to `/usr/local/bin/<name>-ipc` (every target
-distro's PATH) during install — the box gets a working signed-command
+installer writes it to `/usr/local/bin` under the client's installed name
+— the brand's `<name>-ipc`, or the deployment generator's `--name-ipc`
+when it renamed the deployment copy (compiled in via
+`WABBIT_INSTALL_CLIENT_NAME`; every target distro's PATH) during install —
+the box gets a working signed-command
 client with no second upload; `--client` overrides the bundle, and
 `--remove` takes the client back out.
 
@@ -538,10 +541,13 @@ worker's fork, and the `MODULE_LOADS` map must stay empty.
 ## IPC
 
 The namespace process optionally exposes a Unix-domain socket named through
-`WABBIT_IPC_SOCKET`. Every request is a **signed command** — the wire layout
-lives in `wabbit-common/src/ipc_command.rs`, shared byte-for-byte with the
-client — and the server (`wabbit/src/ipc.rs`) gates each one three ways, in
-order:
+`WABBIT_IPC_SOCKET`. The wire is **base64 text of a complete signed
+command** — the envelope layout lives in
+`wabbit-common/src/ipc_command.rs`, shared byte-for-byte with the client —
+so a command is one printable, pasteable artifact, and the *delivery* half
+of the client is a dumb pipe: no key, no counter, no validation, nothing to
+trust. `wabbit` itself decodes the base64 into its command structure
+(`wabbit/src/ipc.rs`) and then gates each request three ways, in order:
 
 1. **the signature**: Ed25519 over the whole envelope, verified against the
    compiled-in policy keys (the deployment's signing key signs policies *and*
@@ -556,10 +562,10 @@ order:
    that already ran (a captured request, a double-sent client) are rejected
    by construction.
 
-Unsigned requests are refused by name (the error tells the caller to use
-`wabbit-ipc`). The socket itself still decides who may *connect*: set its
-ownership and permissions for the operator class; the signature decides what
-a connected client can make wabbit do.
+Undecodable or unsigned requests are refused by name (the error tells the
+caller to use `wabbit-ipc`). The socket itself still decides who may
+*connect*: set its ownership and permissions for the operator class; the
+signature decides what a connected client can make wabbit do.
 
 Two commands exist, both in the envelope: **run** — execute a program in
 the namespace, capturing output, in its own ephemeral cgroup — and
@@ -611,24 +617,36 @@ subtree, so the migration wall (`cgroup.procs`/`cgroup.freeze`/
 outside can move a process into a run, and a compromised "ultra-
 privileged" run cannot pull outside processes in to inherit its bits.
 
-`wabbit-ipc` is the client crate: the library
-(`wabbit_ipc::CommandClient`) manages the counter file, the boot id, the
-envelope, and the signature, and the binary is the human entry point —
+`wabbit-ipc` is the client crate, split in two halves — minting (the
+library, `wabbit_ipc::CommandClient`: the counter file, the boot id, the
+envelope, the signature; the machine the key lives on, by design off box)
+and delivery (`wabbit_ipc::deliver`: a dumb pipe — no key, no counter, no
+validation; wabbit does all of it). The binary is the human entry point —
 
 ```sh
-wabbit-ipc --key policy.key run sh -c 'uptime'    # run in the namespace
-wabbit-ipc --key policy.key --class shell run bash  # classed: the shell
-                                                    # class's rules apply
-wabbit-ipc --key policy.key policy policy.wspf    # apply a signed policy
-wabbit-ipc --key policy.key send "$(wabbit-ipc encode-run sh -c uptime)"
+# mint off box (needs the key; --boot-id names the TARGET's boot):
+wabbit-ipc --key policy.key --class shell encode-run bash
+wabbit-ipc --key policy.key \
+           --boot-id "$(ssh box cat /proc/sys/kernel/random/boot_id)" \
+           --class shell encode-run bash
+
+# deliver on box (no key, no counter — wabbit validates):
+wabbit-ipc --socket /run/wabbit/wabbit.sock '<base64>'
+
+# mint and deliver in one step (the machine holding the key):
+wabbit-ipc --key policy.key --socket /run/wabbit/wabbit.sock run sh -c 'uptime'
+wabbit-ipc --key policy.key --socket /run/wabbit/wabbit.sock policy policy.wspf
 ```
 
-The counter file (default `~/.wabbit-ipc-counter`) is the client's half of
+The counter file (default `~/.wabbit-ipc-counter`) is the minting half of
 the anti-replay: one monotonic `u64` per signing key, read-and-increment
-per command. Everything signing with a given key must share one counter
-(the strictly-increasing check is server-global, not per client). A lost
-or damaged counter restarts from the bottom and fails safe — the server
-refuses any id it has already accepted.
+per minted command. Everything minted with a given key must share one
+counter (the strictly-increasing check is server-global, not per client).
+A lost or damaged counter restarts from the bottom and fails safe — the
+server refuses any id it has already accepted. Minted commands carry
+strictly-increasing ids and must be delivered in mint order: the server
+accepts only ids above its last, so delivering them out of order strands
+the skipped ones until a fresh mint outruns them.
 
 ## Trust helpers
 
@@ -766,10 +784,14 @@ inherits them, so the CLI, the artifact, the installer's bundles, and the
 client all come out branded together, and the starter policy's wabbit cgroup
 follows the brand name (the generator warns when a reused operator policy
 still names the stock one, since its class grants would not resolve). The
-`--name-policy`/`--name-initrd`/`--name-install`/`--name-ipc` flags rename
-the deployment directory's four binaries — cargo bin names stay fixed
+`--name-policy`/`--name-initrd`/`--name-install` flags rename
+the deployment directory's copies — cargo bin names stay fixed
 (`target/release/` keeps them), nothing keys off the copy's name, and every
-box-side path comes from the brand. Builds
+box-side path comes from the brand. The one exception is `--name-ipc`: it
+renames the deployment copy *and* the installed client (exported as
+`WABBIT_INSTALL_CLIENT_NAME` into the installer's build), so the box's
+`/usr/local/bin` client and the deployment directory's copy answer to the
+same name. Builds
 the CLI, generates or reuses the signing
 keypair, signs the TOML source (`<out>/policy.toml`) into
 `<out>/policy.wspf`, verifies the round trip with `wabbit-policy inspect

@@ -887,8 +887,8 @@ impl TryFrom<&Policy> for PolicyToml {
 
 #[derive(Parser)]
 #[command(
-    name = "wabbit-policy",
-    about = "Generate, sign, and audit wabbit policy files",
+    name = wabbit_common::brand::POLICY_NAME,
+    about = "Generate, sign, and audit policy files",
     version
 )]
 struct Cli {
@@ -906,9 +906,10 @@ enum Command {
     /// build time via `WABBIT_POLICY_PUBLIC_KEY`); the private key
     /// never leaves the blue team's machine.
     GenKey {
-        /// Where to write the 32-byte private key seed.
-        #[arg(long, default_value = "wabbit-policy.key")]
-        key: PathBuf,
+        /// Where to write the 32-byte private key seed (default:
+        /// `<this-cli>.key`, following the CLI's deployed name).
+        #[arg(long)]
+        key: Option<PathBuf>,
     },
     /// Compile a TOML policy source into a signed WSPF file.
     Build {
@@ -938,9 +939,22 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
-    let Cli { command } = Cli::parse();
+    // The help text names this CLI by its deployed name (the deployment
+    // generator's `--name-policy`, compiled in through
+    // `WABBIT_POLICY_CLI_NAME`) — the derive metadata cannot format!(),
+    // so the two dynamic pieces are applied to the command here, before
+    // the first --help can print.
+    use clap::CommandFactory;
+    let command = <Cli as CommandFactory>::command()
+        .name(wabbit_common::brand::POLICY_NAME)
+        .about(format!(
+            "Generate, sign, and audit {} policy files",
+            wabbit_common::brand::NAME
+        ));
+    let matches = command.get_matches();
+    let Cli { command } = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)?;
     match command {
-        Command::GenKey { key } => gen_key(&key),
+        Command::GenKey { key } => gen_key(&key.unwrap_or_else(default_key_file)),
         Command::Build {
             source,
             output,
@@ -949,6 +963,12 @@ fn main() -> anyhow::Result<()> {
         } => build(&source, &output, &key, key_id),
         Command::Inspect { policy, public_key } => inspect(&policy, public_key.as_deref()),
     }
+}
+
+/// The `gen-key` output path's default: `<cli>.key`, the CLI's deployed
+/// name following the brand.
+fn default_key_file() -> PathBuf {
+    PathBuf::from(format!("{}.key", wabbit_common::brand::POLICY_NAME))
 }
 
 /// Read a 32-byte private key seed file, zeroized on drop.
@@ -993,10 +1013,16 @@ fn gen_key(key_path: &Path) -> Result<()> {
     println!("wrote the public half to {public_path}");
     println!("keep the seed off every target system; it signs policy they trust.");
     println!();
-    println!("build the wabbit chain with it compiled in:");
+    println!(
+        "build the {} chain with it compiled in:",
+        wabbit_common::brand::NAME
+    );
     println!("WABBIT_POLICY_PUBLIC_KEY={public_hex} ./vm/build-artifact.sh");
     println!("verify a policy against it:");
-    println!("wabbit-policy inspect policy.wspf --public-key {public_hex}");
+    println!(
+        "{} inspect policy.wspf --public-key {public_hex}",
+        wabbit_common::brand::POLICY_NAME
+    );
     Ok(())
 }
 

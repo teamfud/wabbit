@@ -10,26 +10,45 @@
 //! later one (the boot id no longer matches). The wire layout lives in
 //! [`wabbit_common::ipc_command`], shared with the server.
 //!
-//! The client's half of the discipline is the **counter file**: one
-//! small file holding the last id it sent, read and incremented per
-//! command. Crash between sending and persisting re-presents an id the
-//! server rejects, and the next id succeeds — the server is the
-//! authority, the file is just how the signer picks fresh ids.
+//! The wire itself is **base64 text of a complete signed request** —
+//! the request kind byte, the signature, and the signed envelope and
+//! payload — so a command is one printable, pasteable artifact. The
+//! discipline splits in two, one side per machine:
 //!
-//! The command itself travels as the base64 of a *command blob* — the
-//! payload kind byte plus the command's fields (`run`: program and
-//! arguments; `policy`: a signed policy file). This crate encodes the
-//! blob ([`encode_run`], [`encode_policy`]); the CLI's `send` verb takes
-//! the base64 blob and does the rest: counter, envelope, signature,
-//! socket.
+//! * **minting** ([`CommandClient`]) builds and signs the request. It
+//!   needs the signing key, the target boot's id, and the command id
+//!   (the counter file, or an explicit [`CommandClient::command_id`]);
+//!   it holds the only secret and is the only half that needs trusting.
+//!   Minting happens wherever the key lives — off box, by design: the
+//!   key never has to reach the target. [`CommandClient::mint_run`],
+//!   [`CommandClient::mint_policy`] print the base64; the `run` and
+//!   `policy` verbs mint and deliver in one step;
+//! * **delivery** ([`deliver`]) writes minted base64 to the socket
+//!   verbatim and reads the verdict. No key, no counter, no boot id,
+//!   **no validation** — the bytes go to the socket exactly as given,
+//!   and `wabbit` itself decodes the base64 into its command structure
+//!   and validates every gate (signature, boot id, command id, the
+//!   command's own fields). A client that only delivers needs no trust:
+//!   it holds no secret and makes no decision.
+//!
+//! The client's half of the id discipline is the **counter file**: one
+//! small file holding the last id it minted, read and incremented per
+//! command. Crash between minting and persisting re-presents an id the
+//! server rejects, and the next id succeeds — the server is the
+//! authority, the file is just how the signer picks fresh ids. Minted
+//! commands must be delivered in mint order: the server accepts only
+//! ids strictly greater than the last one it accepted, so delivering
+//! them out of order strands the skipped ones until a fresh mint.
 
 use std::{
     io::{Read, Write},
+    net::Shutdown,
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signer, SigningKey};
 use wabbit_common::ipc_command::{
     self, BOOT_ID_LEN, CommandHeader, KIND_RECONFIGURE, KIND_RUN, SIGNATURE_LEN,
@@ -71,17 +90,24 @@ pub struct TaskOutput {
     pub stderr: Vec<u8>,
 }
 
-/// The signing client for one `wabbit` deployment.
+/// The minting half: signs commands for one `wabbit` deployment.
 ///
 /// One client per signing key: the counter file belongs to the key, and
-/// every command the key ever sends to this server must go through it —
+/// every command the key ever mints for this server must go through it —
 /// interleaving two counters against one server strands commands
 /// (strictly-increasing is checked globally, not per client).
+///
+/// The client is for the machine the key lives on — normally *off box*:
+/// pass the target's boot id to [`Self::with_boot_id`] (the default
+/// reads this machine's, which is only right when they are the same
+/// machine). Delivery is the other half and needs none of this — see
+/// [`deliver`].
 pub struct CommandClient {
     socket_path: PathBuf,
     signing_key: SigningKey,
     counter_path: PathBuf,
     boot_id: [u8; BOOT_ID_LEN],
+    command_id: Option<u64>,
 }
 
 impl CommandClient {
@@ -91,7 +117,7 @@ impl CommandClient {
     ///
     /// The boot id is read from `/proc/sys/kernel/random/boot_id` — the
     /// machine's current boot, which is what the socket names; override
-    /// with [`Self::with_boot_id`] when tunneling.
+    /// with [`Self::with_boot_id`] when minting off box.
     pub fn connect(socket_path: PathBuf, seed: &[u8], counter_path: PathBuf) -> Result<Self> {
         let seed: [u8; 32] = seed
             .try_into()
@@ -107,7 +133,8 @@ impl CommandClient {
 
     /// [`Self::connect`] with an explicit boot id — the one
     /// `/proc/sys/kernel/random/boot_id` shows *on the machine wabbit
-    /// runs on*, when the client itself runs elsewhere.
+    /// runs on*, which is required when minting off box (the default
+    /// reads the minting machine's).
     pub fn with_boot_id(
         socket_path: PathBuf,
         seed: &[u8],
@@ -122,10 +149,68 @@ impl CommandClient {
             signing_key: SigningKey::from_bytes(&seed),
             counter_path,
             boot_id,
+            command_id: None,
         }
     }
 
-    /// Run a program in the protected namespace, capturing its output.
+    /// Mint with an explicit command id instead of the counter file —
+    /// for scripted runs that want to pick their own. The server still
+    /// enforces strictly-increasing acceptance, so an id it has already
+    /// seen (or one below its last accepted) is rejected: an explicit id
+    /// that outruns the counter file strands later counter-minted
+    /// commands until the counter catches up.
+    pub fn command_id(mut self, id: u64) -> Self {
+        self.command_id = Some(id);
+        self
+    }
+
+    /// Mint a complete signed `run` command as base64 text — the
+    /// printable, deliverable artifact. No socket is touched: the minted
+    /// command can be carried anywhere and delivered with [`deliver`].
+    pub fn mint_run<I, S>(&self, program: &str, args: I) -> Result<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.mint_run_in_class(program, args, None)
+    }
+
+    /// [`Self::mint_run`], naming the **class** the run executes under:
+    /// the authorization profile the target's policy defines for that
+    /// class. The name travels inside the signature, so the class a
+    /// command runs with is exactly the class its signer chose — and it
+    /// is validated before anything is signed.
+    pub fn mint_run_in_class<I, S>(
+        &self,
+        program: &str,
+        args: I,
+        class: Option<&str>,
+    ) -> Result<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let args: Vec<String> = args.into_iter().map(Into::into).collect();
+        let blob = encode_run_in_class(program, &args, class)?;
+        self.mint(&blob)
+    }
+
+    /// Mint a complete signed `policy` command as base64 text — a
+    /// reconfigure, double-signed by construction (this envelope, plus
+    /// the policy format's own signature).
+    pub fn mint_policy(&self, policy: &[u8]) -> Result<String> {
+        self.mint(&encode_policy(policy)?)
+    }
+
+    /// Sign a command blob and return the complete request as base64:
+    /// request kind, signature, signed envelope + payload.
+    fn mint(&self, command: &[u8]) -> Result<String> {
+        let request = self.request_bytes(command)?;
+        Ok(base64(&request))
+    }
+
+    /// Run a program in the protected namespace, capturing its output:
+    /// mint here, deliver to the socket.
     pub fn run<I, S>(&self, program: &str, args: I) -> Result<CommandOutcome>
     where
         I: IntoIterator<Item = S>,
@@ -152,48 +237,36 @@ impl CommandClient {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let args: Vec<String> = args.into_iter().map(Into::into).collect();
-        let command = encode_run_in_class(program, &args, class)?;
-        self.send_encoded(&command)
+        let minted = self.mint_run_in_class(program, args, class)?;
+        self.deliver(&minted)
     }
 
     /// Apply a complete signed policy file (the bytes
-    /// `wabbit-policy build` writes).
+    /// `wabbit-policy build` writes): mint here, deliver to the socket.
     pub fn reconfigure(&self, policy: &[u8]) -> Result<CommandOutcome> {
-        self.send_encoded(&encode_policy(policy)?)
+        self.deliver(&self.mint_policy(policy)?)
     }
 
-    /// Send a base64-encoded command blob (see [`encode_run`] /
-    /// [`encode_policy`]) — the CLI's `send` verb.
-    pub fn send_base64(&self, encoded: &str) -> Result<CommandOutcome> {
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
-        let command = STANDARD
-            .decode(encoded.trim())
-            .context("the command is not valid base64")?;
-        self.send_encoded(&command)
-    }
-
-    /// Send a command blob, count it, sign it, and deliver it. The blob
-    /// is the payload kind byte plus the command's fields.
-    fn send_encoded(&self, command: &[u8]) -> Result<CommandOutcome> {
-        let request = self.request_bytes(command)?;
-        match self.send_request(&request)? {
-            ServerResponse::Completed(output) => Ok(CommandOutcome::Completed(output)),
-            ServerResponse::Reconfigured => Ok(CommandOutcome::Reconfigured),
-        }
+    /// Deliver a minted command to this client's socket — see [`deliver`].
+    fn deliver(&self, minted: &str) -> Result<CommandOutcome> {
+        deliver(&self.socket_path, minted)
     }
 
     /// Build the complete signed request for `command` — counter,
     /// envelope, signature — without sending it. Increments the counter
-    /// file, exactly like a send: a built request is a spent id.
+    /// file, exactly like a mint: a built request is a spent id.
     pub fn request_bytes(&self, command: &[u8]) -> Result<Vec<u8>> {
         let Some((&kind, payload)) = command.split_first() else {
             bail!("the command blob is empty");
         };
+        let command_id = match self.command_id {
+            Some(id) => id,
+            None => next_command_id(&self.counter_path)?,
+        };
         let header = CommandHeader {
             kind,
             boot_id: self.boot_id,
-            command_id: next_command_id(&self.counter_path)?,
+            command_id,
         };
         let mut signed = vec![0u8; CommandHeader::signed_len(payload.len())];
         header
@@ -207,25 +280,34 @@ impl CommandClient {
         request.extend_from_slice(&signed);
         Ok(request)
     }
+}
 
-    /// Deliver a complete signed request (as built by
-    /// [`Self::request_bytes`]) and read the verdict. Sending the same
-    /// request twice is exactly what the anti-replay exists for: the
-    /// second delivery is rejected by the server.
-    pub fn send_request(&self, request: &[u8]) -> Result<ServerResponse> {
-        let mut stream = UnixStream::connect(&self.socket_path).with_context(|| {
-            format!(
-                "connecting to the IPC socket {}",
-                self.socket_path.display()
-            )
-        })?;
-        stream.write_all(request)?;
-        // Half-close: the server reads to EOF, then answers.
-        use std::net::Shutdown;
-        stream.shutdown(Shutdown::Write)?;
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response)?;
-        decode_response(&response)
+/// The delivery half alone: write `minted` (base64 text of a complete
+/// signed request, as [`CommandClient::mint_run`] prints) to the socket
+/// verbatim, and read the verdict.
+///
+/// This is the whole job of a client on the target machine: no key, no
+/// counter, no boot id, **no validation** — the bytes reach the socket
+/// exactly as given, and the server decodes the base64 into its command
+/// structure and runs every gate itself. A client that only delivers
+/// holds no secret and makes no decision; it needs no trust. (The
+/// verdict is decoded only to display it — the exit code, the output —
+/// and a lying display cheats no one but the one reading it.)
+pub fn deliver(socket_path: &Path, minted: &str) -> Result<CommandOutcome> {
+    let mut stream = UnixStream::connect(socket_path).with_context(|| {
+        format!(
+            "connecting to the IPC socket {}",
+            socket_path.display()
+        )
+    })?;
+    stream.write_all(minted.as_bytes())?;
+    // Half-close: the server reads to EOF, then answers.
+    stream.shutdown(Shutdown::Write)?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    match decode_response(&response)? {
+        ServerResponse::Completed(output) => Ok(CommandOutcome::Completed(output)),
+        ServerResponse::Reconfigured => Ok(CommandOutcome::Reconfigured),
     }
 }
 
@@ -415,9 +497,65 @@ fn put_string(output: &mut Vec<u8>, value: &str) -> Result<()> {
     put_bytes(output, value.as_bytes())
 }
 
+/// Standard base64 — the transport encoding the wire uses, so a command
+/// is one printable, pasteable artifact.
+fn base64(bytes: &[u8]) -> String {
+    STANDARD.encode(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minted_commands_are_base64_of_the_complete_signed_request() {
+        let client = CommandClient::with_boot_id(
+            PathBuf::from("/nonexistent/socket"),
+            &[7; 32],
+            std::env::temp_dir().join(format!("wabbit-ipc-mint-{}", std::process::id())),
+            read_boot_id().unwrap(),
+        );
+        let minted = client.mint_run("sh", ["-c", "uptime"]).unwrap();
+        // Printable, single-line — pasteable and carriable.
+        assert_eq!(minted.lines().count(), 1, "{minted}");
+        assert!(minted.is_ascii());
+        // And it decodes back to the complete request: kind, signature,
+        // signed envelope + payload.
+        let request = STANDARD
+            .decode(minted.as_bytes())
+            .expect("minted output is valid base64");
+        assert_eq!(request[0], ipc_command::SIGNED_REQUEST);
+        let header =
+            ipc_command::decode_header(&request[1 + SIGNATURE_LEN..]).unwrap();
+        assert_eq!(header.kind, KIND_RUN);
+        assert_eq!(header.boot_id, read_boot_id().unwrap());
+        assert_eq!(header.command_id, 1, "the first mint spends id 1");
+    }
+
+    #[test]
+    fn an_explicit_command_id_skips_the_counter_file() {
+        let counter = std::env::temp_dir().join(format!(
+            "wabbit-ipc-explicit-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let client = CommandClient::with_boot_id(
+            PathBuf::from("/nonexistent/socket"),
+            &[8; 32],
+            counter.clone(),
+            read_boot_id().unwrap(),
+        )
+        .command_id(1234);
+        let minted = client
+            .mint_run("true", Vec::<&str>::new())
+            .unwrap();
+        let request = STANDARD.decode(minted.as_bytes()).unwrap();
+        let header =
+            ipc_command::decode_header(&request[1 + SIGNATURE_LEN..]).unwrap();
+        assert_eq!(header.command_id, 1234);
+        // The counter file was never touched.
+        assert!(!counter.exists());
+    }
 
     #[test]
     fn run_blobs_have_the_shape_the_server_decodes() {
