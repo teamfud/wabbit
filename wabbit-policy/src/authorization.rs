@@ -43,8 +43,8 @@ use std::path::{Path, PathBuf};
 
 use binrw::binrw;
 use wabbit_common::authorization::{
-    ACTION_BPF_ATTACH, ACTION_BIND_NET, ACTION_CGROUPFS_WRITE, ACTION_CREDENTIALS, ACTION_EXEC,
-    ACTION_FIREWALL, ACTION_KMODS, ACTION_MOUNT, ACTION_RAW_CAPTURE, ACTION_SETNS,
+    ACTION_BIND_NET, ACTION_BPF_ATTACH, ACTION_BPF_FULL, ACTION_CGROUPFS_WRITE, ACTION_CREDENTIALS,
+    ACTION_EXEC, ACTION_FIREWALL, ACTION_KMODS, ACTION_MOUNT, ACTION_RAW_CAPTURE, ACTION_SETNS,
     ACTION_SIGNAL_OTHERS, ACTION_TAG_CONTROL, ACTION_UNSHARE, FLAG_PATH_RULES_DEFAULT_DENY,
     FLAG_PROTECT, FLAG_UNPROTECTED, PATH_WALK_CAP,
 };
@@ -64,6 +64,7 @@ pub const KNOWN_ACTIONS: u64 = ACTION_SETNS
     | ACTION_CREDENTIALS
     | ACTION_TAG_CONTROL
     | ACTION_BPF_ATTACH
+    | ACTION_BPF_FULL
     | ACTION_KMODS
     | ACTION_CGROUPFS_WRITE
     | ACTION_FIREWALL
@@ -219,7 +220,11 @@ impl PathRule {
         let mut bits = 0;
         for (verdict, allow, deny) in [
             (self.verdict.read, PATH_RULE_READ_ALLOW, PATH_RULE_READ_DENY),
-            (self.verdict.write, PATH_RULE_WRITE_ALLOW, PATH_RULE_WRITE_DENY),
+            (
+                self.verdict.write,
+                PATH_RULE_WRITE_ALLOW,
+                PATH_RULE_WRITE_DENY,
+            ),
             (self.verdict.exec, PATH_RULE_EXEC_ALLOW, PATH_RULE_EXEC_DENY),
         ] {
             bits |= match verdict {
@@ -497,9 +502,7 @@ mod tests {
                 verdict: PathRuleVerdict::allow_all(),
             }
             .verdict_bits(),
-            auth::PATH_RULE_READ_ALLOW
-                | auth::PATH_RULE_WRITE_ALLOW
-                | auth::PATH_RULE_EXEC_ALLOW
+            auth::PATH_RULE_READ_ALLOW | auth::PATH_RULE_WRITE_ALLOW | auth::PATH_RULE_EXEC_ALLOW
         );
         assert_eq!(
             PathRule {
@@ -507,9 +510,7 @@ mod tests {
                 verdict: PathRuleVerdict::deny_all(),
             }
             .verdict_bits(),
-            auth::PATH_RULE_READ_DENY
-                | auth::PATH_RULE_WRITE_DENY
-                | auth::PATH_RULE_EXEC_DENY
+            auth::PATH_RULE_READ_DENY | auth::PATH_RULE_WRITE_DENY | auth::PATH_RULE_EXEC_DENY
         );
         let web = PathRule {
             prefix: "/var/www".into(),

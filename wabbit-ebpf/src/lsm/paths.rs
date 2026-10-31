@@ -39,10 +39,7 @@ use wabbit_common::authorization::{
     PATH_RULE_READ_DENY, PATH_RULE_WRITE_ALLOW, PATH_RULE_WRITE_DENY, PathRuleKey, Yard,
 };
 
-use crate::{
-    lsm::trust,
-    maps::PATH_RULES,
-};
+use crate::{lsm::trust, maps::PATH_RULES};
 
 /// One buffer per hook (see the module docs).
 pub const PATH_BUFFER_SIZE: usize = 256;

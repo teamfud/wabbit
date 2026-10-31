@@ -21,20 +21,22 @@
 //! observing self-test phase of the startup diagram ("i am active but not
 //! enforcing"); the flip to `1` is what turns the denials on.
 
-use aya_ebpf::{
-    helpers::{bpf_get_current_ancestor_cgroup_id, bpf_get_current_cgroup_id,
-              bpf_get_current_pid_tgid},
+use aya_ebpf::helpers::{
+    bpf_get_current_ancestor_cgroup_id, bpf_get_current_cgroup_id, bpf_get_current_pid_tgid,
 };
 #[rustfmt::skip]
 pub use wabbit_common::authorization::{
     CODE_ALLOWED, CODE_WOULD_DENY, CgroupKey, DEFAULT_CGROUP_ID, ENFORCE, HOOK_BPF, HOOK_BIND,
-    HOOK_FILE_OPEN, HOOK_KMOD, HOOK_SB_MOUNT, HOOK_SETSOCKOPT, HOOK_SOCKET_CREATE,
-    HOOK_TASK_KILL, OBSERVE, decision_key, Yard,
+    HOOK_FILE_OPEN, HOOK_KMOD, HOOK_SB_MOUNT, HOOK_SETSOCKOPT, HOOK_SIGNAL_WABBIT,
+    HOOK_SOCKET_CREATE, HOOK_TASK_KILL, OBSERVE, decision_key, Yard,
 };
-use wabbit_common::authorization::Authorization;
+use wabbit_common::authorization::{
+    Authorization, SELF_GUARD_SHUTDOWN, SELF_GUARD_TGID, SELF_GUARD_TGID_OFFSET,
+};
 
 use crate::maps::{
-    AUTHORIZATIONS, DECISIONS, ENFORCING, PROTECTED_PATHS, TRUSTED_CGROUPS, TRUSTED_PIDS,
+    AUTHORIZATIONS, DECISIONS, ENFORCING, PROTECTED_PATHS, SELF_GUARD, TRUSTED_CGROUPS,
+    TRUSTED_PIDS,
 };
 
 /// Deny, as every gate in this crate does: `EPERM`.
@@ -59,6 +61,41 @@ pub fn enforcing() -> bool {
 #[inline(always)]
 pub fn current_pid() -> u32 {
     (bpf_get_current_pid_tgid() >> 32) as u32
+}
+
+/// The current task's **tgid** — `getpid(2)`'s value, the process the
+/// task belongs to (the helper's high half; the low half is the task's
+/// own tid, what [`current_pid`] above names). The self-guard's
+/// PID-1 exemption and every tgid comparison below key on this.
+#[inline(always)]
+pub fn current_tgid() -> u32 {
+    (bpf_get_current_pid_tgid() >> 32) as u32
+}
+
+/// wabbit's own tgid, as the loader wrote it into [`SELF_GUARD`] — the
+/// one process the self-guard protects. `0` when the guard never armed,
+/// and never matched: a real tgid is never zero.
+#[inline(always)]
+pub fn self_guard_tgid() -> u32 {
+    SELF_GUARD.get(SELF_GUARD_TGID).copied().unwrap_or(0)
+}
+
+/// The byte offset of `tgid` in `struct task_struct`, as the userspace
+/// parsed it out of the running kernel's own BTF. `0` means unarmed:
+/// probing at a guessed offset reads silent garbage (the fork-record
+/// lesson), so an unarmed guard decides nothing.
+#[inline(always)]
+pub fn self_guard_tgid_offset() -> u32 {
+    SELF_GUARD.get(SELF_GUARD_TGID_OFFSET).copied().unwrap_or(0)
+}
+
+/// Has the system begun shutting down? The userspace's shutdown watch
+/// sets the flag (PID 1 exiting, the shutdown re-exec, its own
+/// delivered SIGTERM) — from then on the self-guard decides nothing:
+/// the "unless the system is shutting down" of the protection.
+#[inline(always)]
+pub fn self_guard_relaxed() -> bool {
+    SELF_GUARD.get(SELF_GUARD_SHUTDOWN).copied().unwrap_or(0) != 0
 }
 
 /// Is the current task's PID trusted (wabbit itself)?

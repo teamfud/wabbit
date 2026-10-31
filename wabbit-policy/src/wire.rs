@@ -18,6 +18,36 @@ pub(super) fn invalid(pos: u64, message: &str) -> Error {
     }
 }
 
+/// Read a `u32` length followed by that many bytes of UTF-8, as a
+/// [`String`] (the section that needs one — `startup` — carries unit
+/// names, class names and argv entries, none of which are paths).
+pub(super) fn read_string<R: Read + Seek>(
+    reader: &mut R,
+    endian: Endian,
+    (): (),
+) -> BinResult<String> {
+    let pos = reader.stream_position()?;
+    let length = u32::read_options(reader, endian, ())?;
+    let bytes: Vec<u8> = count(length as usize)(reader, endian, ())?;
+    String::from_utf8(bytes).map_err(|_| invalid(pos, "policy string is not UTF-8"))
+}
+
+// `binrw` passes the field as `&String`, so the signature cannot be `&str`.
+#[allow(clippy::ptr_arg)]
+pub(super) fn write_string<W: Write + Seek>(
+    string: &String,
+    writer: &mut W,
+    endian: Endian,
+    (): (),
+) -> BinResult<()> {
+    let pos = writer.stream_position()?;
+    let bytes = string.as_bytes();
+    let length =
+        u32::try_from(bytes.len()).map_err(|_| invalid(pos, "policy field is too large"))?;
+    length.write_options(writer, endian, ())?;
+    bytes.write_options(writer, endian, ())
+}
+
 /// Read a `u32` length followed by that many bytes of UTF-8.
 pub(super) fn read_path<R: Read + Seek>(
     reader: &mut R,

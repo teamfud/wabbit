@@ -15,7 +15,7 @@
 //! | [`mount`] | `sb_mount` | yes — in every matrix kernel's sleepable set | `path` is arg 1, retval arg 5, stable through 6.8 |
 //! | [`firewall`] | `socket_setsockopt`, `socket_create` | needs no sleepable set (no `d_path`) | both hooks stable 5.14→6.8; legacy xtables `setsockopt` and the nftables nfnetlink socket — the two rule paths |
 //! | [`net`] | `socket_create`, `socket_bind` | needs no sleepable set (no `d_path`) | both hooks stable 5.14→6.8; `socket_create`'s scalar arguments key raw capture (`AF_PACKET`, `SOCK_RAW`), `socket_bind` reads only the sockaddr's uapi `sa_family` |
-//! | [`signals`] | `task_kill` | needs no sleepable set (no `d_path`) | arg 0's *identity* alone: raw ctx-slot bits vs `bpf_get_current_task()` (an integer helper), both scalars — the verifier prohibits pointer comparisons, and the target's cgroup would need the `task_struct` walks this design forbids. Self-signals and `SIGCONT` (the thaw channel every rescue broadcasts) always exempt |
+//! | [`signals`] | `task_kill` | needs no sleepable set (no `d_path`) | arg 0's *identity* plus one BTF-derived field: raw ctx-slot bits vs `bpf_get_current_task()` (an integer helper), both scalars — the verifier prohibits pointer comparisons — and, for the self-guard, `->tgid` read through a scalar probe at the offset the userspace parsed from the running kernel's own BTF (ground truth, never a compile-time guess). Self-signals and `SIGCONT` (the thaw channel every rescue broadcasts) always exempt; the self-guard denies every signal aimed at wabbit itself unless the system is shutting down |
 //!
 //! The distinction matters: a path-resolving gate (`bpf_d_path`) can only
 //! load where its hook is in the kernel's `sleepable_lsm_hooks` set, and
@@ -59,14 +59,19 @@
 //! * **signals (`kill(2)`) toward wabbit's processes** — the
 //!   [`signals`] gate denies every cross-task signal without
 //!   [`crate::maps::AUTHORIZATIONS`]' `signal` bit (self-signals
-//!   exempt), so wabbit is killable only by cgroups the policy granted
-//!   the bit — the same signer-owned trade every bit here carries. The
+//!   exempt), and its **self-guard** denies every signal aimed at
+//!   wabbit itself — the bit buys no path to the process that owns
+//!   every wall — unless the system is shutting down (PID 1 always
+//!   exempt; `SIGINT` is *not* exempt — the operator's stop channel is
+//!   the signed `stop` IPC command, an authenticated request instead
+//!   of a signal any process could send; see [`signals`]' docs). The
 //!   *cgroup* distinction the sketch wanted (same- vs cross-cgroup
 //!   targets) remains out of reach: the target's cgroup cannot be read
-//!   without deep `task_struct` walks (the exact class of unstable
-//!   offsets this crate refuses); the cgroupfs walls
-//!   (`cgroup.procs`, `cgroup.freeze`, `cgroup.kill`) still cover the
-//!   cgroup-level kill path.
+//!   without deep `task_struct` walks (the class of *compile-time*
+//!   offsets this crate refuses — the self-guard's `->tgid` is read at
+//!   an offset parsed from the running kernel's own BTF, ground
+//!   truth); the cgroupfs walls (`cgroup.procs`, `cgroup.freeze`,
+//!   `cgroup.kill`) still cover the cgroup-level kill path.
 //! * **`file_permission`** — not sleepable anywhere in the matrix; a
 //!   write-by-write gate cannot resolve a path, and the open-time
 //!   `f_mode` gate covers the writable-open case.

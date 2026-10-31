@@ -20,9 +20,9 @@
 //!
 //! # What a default cannot say
 //!
-//! * **wall-lifting bits** — `mount`, `cgroupfs-write`, `bpf-attach`:
-//!   handed to every unlisted cgroup, they would dissolve the migration
-//!   and bpf walls the class model leans on. Rejected by name.
+//! * **wall-lifting bits** — `mount`, `cgroupfs-write`, `bpf-attach`,
+//!   `bpf-full`: handed to every unlisted cgroup, they would dissolve the
+//!   migration and bpf walls the class model leans on. Rejected by name.
 //! * **`signal`** — the `task_kill` gate never consults the default
 //!   (unlisted cgroups keep their default-allow signal posture, the
 //!   failure-safety contract), so the grant would mean nothing. Rejected
@@ -34,7 +34,7 @@
 
 use binrw::binrw;
 use wabbit_common::authorization::{
-    ACTION_BPF_ATTACH, ACTION_CGROUPFS_WRITE, ACTION_MOUNT, ACTION_SIGNAL_OTHERS,
+    ACTION_BPF_ATTACH, ACTION_BPF_FULL, ACTION_CGROUPFS_WRITE, ACTION_MOUNT, ACTION_SIGNAL_OTHERS,
     DEFAULT_ALLOWED_ACTIONS,
 };
 
@@ -67,9 +67,12 @@ impl DefaultConfig {
                 self.action_mask
             ));
         }
-        if self.action_mask & (ACTION_MOUNT | ACTION_CGROUPFS_WRITE | ACTION_BPF_ATTACH) != 0 {
+        if self.action_mask
+            & (ACTION_MOUNT | ACTION_CGROUPFS_WRITE | ACTION_BPF_ATTACH | ACTION_BPF_FULL)
+            != 0
+        {
             return Err(
-                "the default may not grant mount, cgroupfs-write, or bpf-attach: \
+                "the default may not grant mount, cgroupfs-write, bpf-attach, or bpf-full: \
                  every unlisted cgroup would hold the walls' keys"
                     .into(),
             );
@@ -127,6 +130,7 @@ mod tests {
             ACTION_MOUNT,
             ACTION_CGROUPFS_WRITE,
             ACTION_BPF_ATTACH,
+            ACTION_BPF_FULL,
             ACTION_SIGNAL_OTHERS,
         ] {
             let config = DefaultConfig {

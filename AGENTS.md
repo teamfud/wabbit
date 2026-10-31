@@ -228,11 +228,18 @@ starve a live systemd: full trust (wabbit, its trusted-PID maps) keeps
 everything; the `ACTION_BPF_ATTACH` class (`wabbit-common`) grants cgroups
 whose bpf use PID 1 orchestrates — init.scope, and udevd only if it proves
 to need it — the restricted command set systemd actually uses, per
-`ACTION_BPF_ATTACH`'s documentation; everyone else keeps the deny-all. The
-critical denials never relax with class: the fd-by-ID lookup commands
+`ACTION_BPF_ATTACH`'s documentation; the `ACTION_BPF_FULL` class grants
+unfiltered `bpf(2)` — every command, program type, and attach type — for
+the rare tool that genuinely needs it (see its documentation for what that
+costs); everyone else keeps the deny-all. The
+critical denials never relax with the `ACTION_BPF_ATTACH` class: the
+fd-by-ID lookup commands
 (`BPF_MAP_GET_FD_BY_ID`, `BPF_PROG_GET_FD_BY_ID`) are the only route to
-wabbit's maps that bypasses bpffs, so they stay wabbit-only; so do LSM and
-tracing program types, which would shadow enforcement or read kernel
+wabbit's maps that bypasses bpffs, so they stay out of the systemd class
+(`ACTION_BPF_FULL` grants them by definition — that is what "unfiltered"
+means, and the policy signer who sets the bit is choosing it); so do LSM and
+tracing program types within the systemd class, which would shadow
+enforcement or read kernel
 memory. `security_bpf`'s first two arguments (`cmd`, kernel-copied `attr`)
 are stable across every target kernel's hook layout, so the gate can read
 the command, program type, and attach type without layout variants. The
@@ -567,7 +574,7 @@ caller to use `wabbit-ipc`). The socket itself still decides who may
 *connect*: set its ownership and permissions for the operator class; the
 signature decides what a connected client can make wabbit do.
 
-Two commands exist, both in the envelope: **run** — execute a program in
+Three commands exist, all in the envelope: **run** — execute a program in
 the namespace, capturing output, in its own ephemeral cgroup — and
 **reconfigure** — apply a complete *signed policy file*, which the server
 verifies *again*, against the same keys, before applying anything. A
@@ -577,7 +584,17 @@ section with `inner = true`) while holding a mutex, and merges the new
 policy into its stored policy only after that succeeds; omitted sections
 are left unchanged, and a policy that fails verification or application
 touches no mounts and burns its command id (a failed command cannot come
-back — the signer mints a fresh one).
+back — the signer mints a fresh one). The third is the operator's stop
+channel: **stop** (kind 3, empty payload). The signal gate's self-guard
+denies every signal aimed at wabbit — `SIGINT` included — outside
+shutdown, so asking wabbit for its graceful park-exit is an
+*authenticated request* instead of a signal any process on the box could
+send: the `stop` command carries the envelope's signature, boot id, and
+burned counter like every other command, and the server answers its
+client *before* raising the park loop's stop signal (the `Notify` the
+loop selects on), so the operator always gets the verdict. The
+`wabbit-ipc` verbs are `stop` (mint and deliver) and `encode-stop`
+(mint and print).
 
 ### Runs, classes, and ephemeral cgroups
 
@@ -616,6 +633,37 @@ subtree, so the migration wall (`cgroup.procs`/`cgroup.freeze`/
 `cgroup.kill`) protects every run cgroup by construction — nothing
 outside can move a process into a run, and a compromised "ultra-
 privileged" run cannot pull outside processes in to inherit its bits.
+
+### `[[startup]]` — runs the boot itself launches
+
+The policy's `startup` section (bit 4, v8) is the same trust spent at
+boot instead of over the socket: one entry per program, each naming a
+**point** in system startup (`initrd`/`systemd`/`unit`), the **class**
+it runs under, and its **argv** (`wabbit/src/startup.rs`). Each entry
+gets exactly the ephemeral-cgroup treatment a signed run gets —
+`run-<ID_BASE + index>` (the id base sits far above the IPC counter's
+reachable space, so a startup cgroup can never collide with an IPC
+run's), created under its class's cgroup (or wabbit's own, classless),
+migrated into between fork and exec, released when it ends — and the
+same class resolution (`wabbit/src/runs.rs::class_entry`, the one
+convention path against this boot's policy). A `[[startup]]` entry may
+name *any* class, `bpf-full`-carrying ones included: the signature on
+the policy is the authorization, the same trust a signed run command
+carries.
+
+The points: `initrd` runs after the guard enforces and before
+`switch_root`, blocking on the main thread (before the tokio runtime
+exists) — short one-shots, because a program still running at the
+crossing is killed by a systemd initrd's sweep and runs on a deleted
+ramfs under a busybox one; `systemd` runs at the crossing's completion;
+`unit` polls `systemctl is-active <unit>` (the name is charset-validated
+at build *and* decode — it reaches a command's argument list) and
+launches on active, bounded by the entry's `timeout_secs` (0 = forever).
+Entries launch in policy order, one at a time per point; failures are
+per-entry and fail-open (a broken entry warns and the next one runs —
+it never takes the boot's enforcement or its IPC server down), and the
+whole section skips with a warning when it fails `validate` (an invalid
+*signed* section is a generator bug).
 
 `wabbit-ipc` is the client crate, split in two halves — minting (the
 library, `wabbit_ipc::CommandClient`: the counter file, the boot id, the
@@ -690,7 +738,7 @@ re-export shim; the types live in the crate.
   path encoding.
 
 The file begins with the four-byte `WSPF` magic, a little-endian version
-(currently 7), the key id and the signature, followed by a byte with one bit
+(currently 8), the key id and the signature, followed by a byte with one bit
 per section and then the sections that bit announces, in bit order. Each
 section appears at most once, so a policy has a single encoding. The decoder
 rejects unknown versions, unknown key ids, section bits it does not know
@@ -729,7 +777,14 @@ shipped-nowhere rule applies the same. v5→v6 adds the `network` section
 `all`/`all`, the pre-v6 behavior. v6→v7 adds the `default` section
 (bit 3): an action mask and a path-rule list (no flags — a deny-list by
 construction), what every cgroup *without* an `authorization` entry
-gets (see the loader semantics below).
+gets (see the loader semantics below). v7→v8 adds the `startup` section
+(bit 4): one entry per program the boot itself launches — the point in
+startup (`initrd`/`systemd`/`unit`), the class it runs under, and its
+argv (`wabbit-policy/src/startup.rs`; `wabbit/src/startup.rs` launches
+them, each through the same ephemeral-cgroup path a signed IPC run
+takes). The same bump adds the `bpf-full` action bit (`ACTION_BPF_FULL`)
+to the vocabulary: unfiltered `bpf(2)`, what the `bpf-attach` "systemd
+class" deliberately is not.
 
 **Off-box CLI** (`wabbit-policy <subcommand>`):
 
@@ -957,7 +1012,7 @@ enforce-flip steps are the next implementation phase:
 
 | Gate | Hook | Enforces |
 | --- | --- | --- |
-| `bpf_gate` | `bpf` | the classed `bpf(2)` gate: full trust keeps everything; `ACTION_BPF_ATTACH` (the systemd class) gets map creates + element ops + cgroup-family program loads/attaches/links + BTF loads; fd-by-ID lookups and LSM/tracing program types never relax below full trust |
+| `bpf_gate` | `bpf` | the classed `bpf(2)` gate: full trust keeps everything; `ACTION_BPF_FULL` permits every command unfiltered (the fd-by-ID lookups included — the signer who sets the bit is choosing that); `ACTION_BPF_ATTACH` (the systemd class) gets map creates + element ops + cgroup-family program loads/attaches/links + BTF loads; fd-by-ID lookups and LSM/tracing program types never relax below `ACTION_BPF_FULL` |
 | `kmod_gate` | `kernel_read_file` | module loads (`READING_MODULE`) denied outside full trust and `ACTION_KMODS`; identity-keyed (no `bpf_d_path`), so it loads on every target kernel including vanilla 5.15 where the hook is not sleepable |
 | `file_open_modern`/`_legacy` | `file_open` | untrusted opens of bpffs (reads included — with the fd-by-ID gate, wabbit's maps become unreachable); opens the cgroup's path rules deny for the open's operation class — read, write (`f_mode & FMODE_WRITE`), or exec (`f_flags & __FMODE_EXEC` 0x20, the kernel's execve marker: `OPEN_FMODE` never copies it into `f_mode` and `VALID_OPEN_FLAGS` keeps userspace from counterfeiting it) — per-cgroup, per-operation profiles in `PATH_RULES`, longest-deciding-prefix-wins, default-deny via the `Authorization` flag; writable opens under the module trees (`ACTION_KMODS` lifts); writable opens under protected cgroupfs paths — the `cgroup.procs`/`cgroup.freeze`/`cgroup.kill` migration wall (`ACTION_CGROUPFS_WRITE` lifts) |
 | `sb_mount` | `sb_mount` | mounts over module trees/bpffs (never lifted); mounts over the cgroupfs root and protected cgroup paths (`ACTION_MOUNT` lifts) |
@@ -965,7 +1020,7 @@ enforce-flip steps are the next implementation phase:
 | `netfilter_netlink_gate` | `socket_create` | creating a `NETLINK_NETFILTER` netlink socket — the nftables path: `nft`, `iptables-nft`/`ip6tables-nft`/`ebtables-nft`/`arptables-nft` (the distro defaults), firewalld, ipset, conntrack-tools — denied outside full trust and `ACTION_FIREWALL`; kernel-internal creation (`kern == 1`) exempt |
 | `raw_capture_gate` | `socket_create` | creating raw-capture sockets — `AF_PACKET` (tcpdump's channel) and `SOCK_RAW` at the IP families — denied outside full trust and `ACTION_RAW_CAPTURE`; kernel-internal creation exempt. Reach is the policy's `network.raw_capture` posture (`NET_POSTURE`): `all`, `icmp` (raw `IPPROTO_ICMP`/`IPPROTO_ICMPV6` pass — ping, traceroute; `AF_PACKET` and other raw IP protocols stay gated), or `off` |
 | `bind_gate` | `socket_bind` | network `bind(2)`: `AF_INET`/`AF_INET6` needs `ACTION_BIND_NET` (deny-by-default); the sockaddr's `sa_family` (uapi-stable, probe-read) narrows first, so local `AF_UNIX` IPC and netlink binds pass untouched, trusted or not. Reach is the policy's `network.bind` posture (`NET_POSTURE`): `all` (every IP bind), `ports` (only a bind naming a port — the port at sockaddr offset 2, same in `sockaddr_in`/`_in6` — so port-0 client binds pass), or `off`; the self-test proves the posture in force (`bind-net` claims a port, `bind-ephemeral` binds port 0 — a deny step under `all`, an always-allowed one otherwise) |
-| `signal_gate` | `task_kill` | `kill(2)`/`tgkill(2)`/`pidfd_send_signal(2)` beyond the caller's own task denied outside full trust and `ACTION_SIGNAL_OTHERS` **on cgroups the policy lists** (default-allow: unlisted cgroups may signal — the boot's own units never lose `kill(2)` to a boundary nobody drew); self-signals and SIGCONT always exempt — the identity is the raw ctx-slot bits against `bpf_get_current_task()` (an integer helper), both scalars, because the verifier prohibits pointer comparisons and the target's cgroup would need the `task_struct` walks this design forbids; SIGCONT is the thaw channel every rescue path broadcasts, and the failure-safety contract outranks signaling containment |
+| `signal_gate` | `task_kill` | `kill(2)`/`tgkill(2)`/`pidfd_send_signal(2)` beyond the caller's own task denied outside full trust and `ACTION_SIGNAL_OTHERS` **on cgroups the policy lists** (default-allow: unlisted cgroups may signal — the boot's own units never lose `kill(2)` to a boundary nobody drew); self-signals and SIGCONT always exempt — the identity is the raw ctx-slot bits against `bpf_get_current_task()` (an integer helper), both scalars, because the verifier prohibits pointer comparisons and the target's cgroup would need the `task_struct` walks this design forbids; SIGCONT is the thaw channel every rescue path broadcasts, and the failure-safety contract outranks signaling containment. **The self-guard**: every signal aimed at wabbit's own tgid is denied for every caller — bit or no bit, listed or unlisted — because an enforcement process killed by an outside process is every protection gone at once; the target is named by reading `->tgid` through a scalar probe at the offset the userspace parsed from the running kernel's own BTF (`wabbit/src/btf.rs`, ground truth the same way the fork watcher's format-file offset is — never a compile-time guess, which is the class of silent-garbage walk this design forbids). It yields only to: the trusted, SIGCONT, PID 1 (the system, not an outside process — its one directed use of `kill(2)` toward wabbit is the shutdown sweep, which must work on every policy), and the `SELF_GUARD` shutdown flag — flipped by wabbit's shutdown watch (PID 1 exiting or re-executed into the shutdown process, or a SIGTERM only an exempt sender could have delivered) so the "unless the system is shutting down" holds for non-PID-1 sweepers too. `SIGINT` is **not** exempt: the operator's stop channel is the signed `stop` IPC command (kind 3, below), which asks for the same graceful park-exit but carries the signature, the boot id, and the burned counter — an authenticated request where `SIGINT` was a signal any process on the box could send. The self-test proves it per boot (`signal-wabbit`, a `kill(getppid(), 0)` probe from the sacrificial cgroup); a kernel whose BTF yields no `tgid` offset disarms the guard with a warning and skips the step — the not-sleepable precedent |
 | `fork_watcher_vanilla`/`_preempt_lazy`, `module_load_logger` | tracepoints | `sched_process_fork` (both record layouts; the loader picks by format file) into `FORK_EVENTS`, `module_load` into `MODULE_LOADS` |
 
 Every gate short-circuits trusted callers (wabbit's PID and cgroup), then
@@ -1017,7 +1072,15 @@ design forbids, so the bit cannot distinguish same- from cross-cgroup
 targets; the cgroupfs walls still cover the
 cgroup-level kill paths. SIGCONT is exempt outright: the thaw channel —
 every rescue path broadcasts it, from whatever cgroup the rescue lands
-in — and a frozen world must never outlive a failed boot). The
+in — and a frozen world must never outlive a failed boot. The self-guard
+closes the wabbit-shaped hole in that posture — a `signal`-bit cgroup
+can no longer reach the process that owns every wall — and carries its
+own honest residuals: kernel-internal kills bypass the LSM hook by
+design, and a wabbit launched inside a pid namespace would
+read the target's initial-namespace tgid against a namespace-local
+`getpid(2)` and disarm — the launches this design defines never do
+that, and the enforcing self-test step turns the mismatch into a loud
+boot failure). The
 firewall gates close both rule paths on every target kernel: the legacy
 xtables `setsockopt` and the nftables nfnetlink socket
 (`netfilter_netlink_gate` on `socket_create`, exempting kernel-internal

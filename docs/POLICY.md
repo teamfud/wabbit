@@ -20,8 +20,8 @@ wabbit-policy inspect policy.wspf            # verify + decode, anywhere
 
 ## How the file is structured
 
-Five sections exist today, all optional — an empty policy is a valid
-(posture: it grants nothing, and deny-by-default does the rest):
+Six sections exist today, all optional — an empty policy is a valid
+posture (it grants nothing, and deny-by-default does the rest):
 
 ```toml
 [rootfs]           # mount-time policy: what is writable, what is executable
@@ -29,6 +29,7 @@ Five sections exist today, all optional — an empty policy is a valid
 [default]          # what every cgroup no [[authorization]] entry names gets
 [[class]]          # reusable, named privilege profiles
 [[authorization]]  # per-cgroup grants: the actual rules
+[[startup]]        # programs the boot itself launches, in a named class
 ```
 
 The compile step (`wabbit-policy build`) validates everything and folds
@@ -65,12 +66,14 @@ consult on every relevant syscall, per cgroup:
 | --- | --- |
 | `mount` | mounts over the cgroupfs root and protected cgroup paths |
 | `bpf-attach` | the restricted `bpf(2)` set system daemons need — cgroup-family program loads/attaches, map creates and element ops, BTF loads. Never LSM/tracing programs, never fd-by-ID lookups; full `bpf(2)` stays wabbit-only |
+| `bpf-full` | **unfiltered `bpf(2)`** — every command, every program type, every attach type, the fd-by-ID lookups included: what [`bpf-attach`](#bpf-attach) deliberately is not. A cgroup holding it can reach anything `bpf(2)` reaches, wabbit's own maps included; the bpffs *open* gate still holds (pins are path-shaped), so the fd-by-ID lookups are the sanctioned route. Grant it where a tool genuinely needs the full syscall — an observability agent loading its own tracing programs, a bpffs power-user — and nowhere else. The default entry may not carry it (see [`[default]`](#default--what-unlisted-cgroups-get)) |
 | `kmods` | loading kernel modules (`finit_module`/`init_module`) — a cgroup without this bit may not load modules at all, autoloads aside (see the boot-time grants below) |
 | `cgroupfs-write` | writing through the migration wall (`cgroup.procs`/`cgroup.freeze`/`cgroup.kill` under protected cgroup paths) — what lets PID 1 administer the hierarchy |
 | `firewall` | modifying firewall rules, both the nftables netlink socket and the legacy xtables `setsockopt` paths |
 | `raw-capture` | creating raw-capture sockets — `AF_PACKET` (tcpdump's channel) and `SOCK_RAW` at the IP families — packet capture and hand-crafted IP packets. Which of those are gated at all is the [`[network]`](#network--how-far-the-network-gates-reach) `raw_capture` posture |
 | `bind-net` | `bind(2)` on `AF_INET`/`AF_INET6`: acquiring a network endpoint (a listener, a service port). Which binds are gated at all — every one, only those naming a port, or none — is the [`[network]`](#network--how-far-the-network-gates-reach) `bind` posture. Every other family — local `AF_UNIX` IPC, netlink — is ungated by design |
-| `signal` | signaling any task other than the sender's own (`kill`/`tgkill`/`pidfd_send_signal`) — **self-signals and `SIGCONT` are always exempt** (`SIGCONT` is the thaw channel every boot-failure rescue broadcasts, and a frozen world must never outlive a failed boot). **Default-allow for unlisted cgroups**: a cgroup no policy names may signal freely; the gate binds only cgroups an entry lists — grant `signal` there where process management is legitimate (PID 1, udev's worker pool, a shell's job control), omit it where cross-task signaling is the thing to contain. The target's *cgroup* cannot be read without the unstable `task_struct` walks the design forbids, so the bit does not distinguish same-cgroup from cross-cgroup targets |
+| `signal` | signaling any task other than the sender's own (`kill`/`tgkill`/`pidfd_send_signal`) — **self-signals and `SIGCONT` are always exempt** (`SIGCONT` is the thaw channel every boot-failure rescue broadcasts, and a frozen world must never outlive a failed boot). **Default-allow for unlisted cgroups**: a cgroup no policy names may signal freely; the gate binds only cgroups an entry lists — grant `signal` there where process management is legitimate (PID 1, udev's worker pool, a shell's job control), omit it where cross-task signaling is the thing to contain. The target's *cgroup* cannot be read without the unstable `task_struct` walks the design forbids, so the bit does not distinguish same-cgroup from cross-cgroup targets. **The bit never applies to wabbit itself**: the gate's self-guard denies every signal aimed at the wabbit process — this grant included — unless the system is shutting down (see the note below) |
+
 
 The remaining names — `setns`, `unshare`, `exec`, `credentials`,
 `tag-control` — are part of the wire vocabulary for the gates the
@@ -81,6 +84,19 @@ deny-by-default for every enforced bit — with one deliberate exception:
 **the signal gate binds only cgroups an entry lists** (see the `signal`
 row), so the unlisted world of a boot never loses `kill(2)` to a
 boundary nobody drew.
+
+One target is outside the `signal` bit's reach entirely: **wabbit
+itself is not signalable by outside processes while the system is up**.
+The signal gate carries a *self-guard* that outranks every
+authorization — no class, no bit, no default grants a path to the
+process that owns all the walls — and it yields only to the system
+shutting down (PID 1's sweep, and the shutdown relaxation wabbit sets
+when it observes the machine going down) and the thaw channel
+(`SIGCONT`). `SIGINT` is denied like every other signal; the operator's
+stop channel is the **signed `stop` IPC command** the client mints
+with the deployment's key (see the IPC documentation). There is no
+policy knob for the self-guard: an enforcement process that any process
+on the box could kill would be a containment tool only by courtesy.
 
 ### `path_rules` and `default_deny` — the per-cgroup file profile
 
@@ -226,6 +242,59 @@ processes exempt from every gate). The spawned process migrates itself
 into the run cgroup **between fork and exec**, so a run's first syscall
 already runs under its class.
 
+## `[[startup]]` — programs the boot itself launches
+
+One block per program, launched by wabbit at its chosen point in system
+startup — signed policy spending the same trust a signed run command
+does, at boot instead of over the socket:
+
+```toml
+[[startup]]
+point = "unit"                            # when to launch (see below)
+unit  = "multi-user.target"              # the unit the "unit" point waits for
+class = "network-daemon"                 # the class it runs under
+timeout_secs = 300                       # unit point only, 0 = wait forever
+argv  = ["/usr/local/bin/announce"]      # argv[0] is the program
+
+[[startup]]
+point = "initrd"
+argv  = ["/bin/load-secrets"]
+```
+
+Each entry names the **point** it launches at:
+
+| `point` | launches when | notes |
+| --- | --- | --- |
+| `initrd` | the guard is enforcing and the boot is still in the initramfs — before `switch_root` | short one-shots: a program still running at the crossing is killed by a systemd initrd's sweep and runs on a deleted ramfs under a busybox one. The entry runs *blocking*, so a hung program hangs the crossing — that is the honest cost |
+| `systemd` | wabbit has crossed into the booted system and systemd is up | |
+| `unit` | the named `unit` reaches **active** (`systemctl is-active`) | `timeout_secs` bounds the wait (default 300; `0` waits forever) |
+
+* `unit` is the systemd unit name — `multi-user.target`,
+  `systemd-networkd-wait-online.service` ("wait-online succeeded"), any
+  unit a deployment waits on. Only the `unit` point takes it.
+* `class` is the same named profile a signed run command resolves
+  (`wabbit` resolves the convention path against this boot's policy), so
+  a `[[startup]]` program runs under exactly the class the signer named
+  — **including classes carrying `bpf-full` or any other
+  wall-adjacent bit**: the signature is the authorization. Absent, the
+  entry runs classless — the policy default when there is one, the
+  deny-by-default floor otherwise.
+* `argv` is the program and its arguments, launched like every run:
+  its own ephemeral cgroup (`run-<id>`), migrated in **between fork and
+  exec**, released when it ends, the migration wall covering it by
+  prefix. Nothing a policy launches ever runs in wabbit's own cgroup.
+* Entries launch **in policy order**, one at a time per point, and each
+  runs exactly once per boot. A failed entry warns and the next one
+  runs — a broken `[[startup]]` entry never takes the boot's
+  enforcement or its IPC server down.
+* A daemon is a legitimate `[[startup]]` argv: the launcher awaits each
+  program, and a program that keeps running keeps its cgroup and its
+  class until the process (or the boot) ends.
+
+Like every section it is read at boot; a reconfigure stores a new
+startup section but launches nothing from it — the entries already
+launched this boot ran, and the next boot reads the new one.
+
 ## `[network]` — how far the network gates reach
 
 The `bind-net` and `raw-capture` bits decide *who* may do a gated
@@ -302,9 +371,9 @@ exec    = "deny"
   and an allow-list that forgot one of their paths makes the boot
   unusable. Path rules here can only block.
 - **Allowed actions:** `kmods`, `firewall`, `raw-capture`, `bind-net`.
-  `mount`, `cgroupfs-write`, and `bpf-attach` are refused — granted to
-  every unlisted cgroup they would hand the whole machine the keys to
-  the walls. `signal` is refused because it would mean nothing:
+  `mount`, `cgroupfs-write`, `bpf-attach`, and `bpf-full` are refused —
+  granted to every unlisted cgroup they would hand the whole machine the
+  keys to the walls. `signal` is refused because it would mean nothing:
   unlisted cgroups may already signal, and the signal gate never reads
   the default.
 - Like every section, it is read at boot; a reconfigure stores it but
@@ -409,6 +478,13 @@ The compile step is the one place bad policy is refused with names:
   twice, a class reference that does not exist, a class and an entry
   disagreeing about the same path prefix, and a concrete class whose
   compiled path would exceed the walk cap;
+* a `[[startup]]` entry whose `point` is not one of the three, a `unit`
+  on a point that takes none, a timeout on a point that launches
+  immediately, a `unit` that is not a systemd unit name (1–255 bytes of
+  `[A-Za-z0-9:.@_-]`, no leading `-` — the name reaches a poll command's
+  argument list, so the charset is a boundary), a `class` that is not
+  a class name, an empty `argv`, an `argv` entry with a NUL or past
+  4096 bytes, and more than 64 entries or 64 `argv` slots;
 * and the wire-level decoder additionally rejects unknown versions,
   unknown key ids, unknown section bits, truncated input, invalid
   UTF-8, and trailing bytes — a tampered or foreign-signed file is

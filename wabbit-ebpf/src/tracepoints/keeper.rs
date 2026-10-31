@@ -48,7 +48,6 @@
 
 use aya_ebpf::{macros::tracepoint, programs::TracePointContext};
 use aya_log_ebpf::info;
-
 use wabbit_common::authorization::path_hash;
 
 use crate::{

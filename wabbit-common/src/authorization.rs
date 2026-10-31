@@ -117,6 +117,38 @@ pub const ACTION_RAW_CAPTURE: u64 = 1 << 10;
 /// connective tissue and is deliberately ungated.
 pub const ACTION_BIND_NET: u64 = 1 << 11;
 
+/// Use the `bpf(2)` syscall **unfiltered**: every command, every program
+/// type, every attach type — what the [`ACTION_BPF_ATTACH`] "systemd
+/// class" deliberately is not.
+///
+/// The restricted class exists because `bpf(2)` below full trust is
+/// sharp at both ends: the fd-by-ID lookup commands
+/// (`BPF_MAP_GET_FD_BY_ID`, `BPF_PROG_GET_FD_BY_ID`) are the one route to
+/// wabbit's maps that bypasses bpffs — an LSM program loaded from a
+/// lesser cgroup would shadow enforcement, a tracing program is an
+/// arbitrary-kernel-read primitive, and `BPF_PROG_LOAD` of either type
+/// is the same `bpf(2)` the class already grants. This bit grants
+/// exactly that: a cgroup holding it can do anything with `bpf(2)`
+/// short of nothing. It is deliberately **not** an upgrade path the
+/// default entry may carry (see [`DEFAULT_ALLOWED_ACTIONS`]) — handed to
+/// every unlisted cgroup it hands the whole machine the keys.
+///
+/// **The bit lifts the `bpf(2)` gate alone.** The bpffs open gate
+/// (`file_open`, `cgroupfs.rs`) still denies this cgroup's opens of
+/// wabbit's pins — reads included — because pins are path-shaped and
+/// the fd-by-ID lookups are the sanctioned route; the pins' parent
+/// directory's permissions are the operator's to set. A cgroup holding
+/// this bit can therefore reach wabbit's maps by ID if it goes looking —
+/// that is what "unfiltered" means, and the policy signer who grants it
+/// is choosing that.
+///
+/// Grant it where a tool genuinely needs the full syscall (an
+/// observability agent loading its own tracing programs, a bpffs
+/// power-user) and nowhere else: the walls around the cgroup holding it
+/// must hold, or the machine is anyone's — see [`ACTION_BPF_ATTACH`]'s
+/// closing paragraph, which applies double here.
+pub const ACTION_BPF_FULL: u64 = 1 << 12;
+
 /// The reserved [`CgroupKey`] id of the policy's **default** entry: the
 /// `Authorization` (and the `PATH_RULES`) a cgroup with no entry of its
 /// own falls back to. kernfs ids start at 1 — the cgroupfs root's — so
@@ -146,6 +178,25 @@ pub const NET_POSTURE_BIND: u32 = 0;
 /// `NET_POSTURE` index: how far the `raw_capture_gate` reaches — one of
 /// the `RAW_CAPTURE_GATE_*` values.
 pub const NET_POSTURE_RAW_CAPTURE: u32 = 1;
+
+/// `SELF_GUARD` index: wabbit's own tgid — the one process the
+/// self-guard protects from outside signals (see the `signal_gate`
+/// docs). The loader writes it at startup; `0` means unarmed and the
+/// eBPF side never matches it (a real tgid is never `0`).
+pub const SELF_GUARD_TGID: u32 = 0;
+/// `SELF_GUARD` index: the byte offset of `tgid` in `struct task_struct`,
+/// parsed at load out of the *running* kernel's own BTF
+/// (`wabbit/src/btf.rs`) — never a compile-time guess, because
+/// `task_struct` is exactly the struct distros patch and a wrong offset
+/// reads silent garbage (the fork-record lesson). `0` means unarmed: the
+/// gate fail-opens rather than probing at a guessed offset.
+pub const SELF_GUARD_TGID_OFFSET: u32 = 1;
+/// `SELF_GUARD` index: the shutdown relaxation. The userspace sets it
+/// when its shutdown watch observes the system going down (PID 1
+/// exiting, the shutdown re-exec, or the SIGTERM only an exempt sender
+/// could have delivered) — from then on the self-guard decides nothing,
+/// which is the "unless the system is shutting down" of the protection.
+pub const SELF_GUARD_SHUTDOWN: u32 = 2;
 
 /// Every `AF_INET`/`AF_INET6` `bind(2)` needs [`ACTION_BIND_NET`] — the
 /// ephemeral port-0 binds clients make included.
@@ -194,6 +245,13 @@ pub const RAW_CAPTURE_GATE_OFF: u32 = 2;
 /// cgroup does process management legitimately (PID 1's unit
 /// management, udev's worker pool, a shell's job control); omit it
 /// where cross-task signaling is the thing to contain.
+///
+/// **The bit never reaches wabbit itself**: the `signal_gate` carries a
+/// *self-guard* — signals toward wabbit's own tgid are denied for every
+/// caller (bit or no bit, listed or unlisted) unless the system is
+/// shutting down (see `HOOK_SIGNAL_WABBIT` and the `SELF_GUARD_*`
+/// indexes). The bit governs the rest of the machine's signaling; the
+/// guard is not the signer's to trade away.
 pub const ACTION_SIGNAL_OTHERS: u64 = 1 << 13;
 
 /// How deep the eBPF prefix walks may go: 64 bytes.
@@ -314,6 +372,11 @@ pub const HOOK_SETSOCKOPT: u32 = 5;
 pub const HOOK_SOCKET_CREATE: u32 = 6;
 pub const HOOK_BIND: u32 = 7;
 pub const HOOK_TASK_KILL: u32 = 8;
+/// The self-guard's decision point: a signal was aimed at wabbit's own
+/// tgid and denied (or, in the observing phase, traced as a would-deny).
+/// Distinct from [`HOOK_TASK_KILL`] so the self-test can assert the
+/// protection fired *as itself*, not as the listed-cgroup posture.
+pub const HOOK_SIGNAL_WABBIT: u32 = 9;
 
 /// Decision codes: the low half of a `DECISIONS` key. Every gate traces
 /// what its rules decided — allow or would-deny — regardless of mode, so

@@ -29,14 +29,17 @@
 //! * **reachable steps** — a mount over the protected cgroup paths, a
 //!   netfilter netlink socket, a writable cgroupfs open, a legacy firewall
 //!   `setsockopt`, the sketch's gates (a raw-capture socket, a network
-//!   bind, a cross-task signal), and the per-operation path-rule steps
+//!   bind, a cross-task signal), the self-guard (a probe aimed at
+//!   wabbit itself, denied where the `signal` bit grants nothing and
+//!   everything), and the per-operation path-rule steps
 //!   (a seeded rule denies write and exec under one prefix; read stays
-//!   open) — hooks bnuuy does not wall (`PATH_RULES` and the sketch's
-//!   gates are guard's alone) — run in *both* phases with full
-//!   assertions: observing = allowed + `DECISIONS` trace, enforcing =
-//!   `EPERM`. Two steps assert the *default allows* instead, in both
-//!   phases: the rule-prefix read and the self-signal — the flip must
-//!   never cost a process its opens' unruled classes or `raise(3)`.
+//!   open) — hooks bnuuy does not wall (`PATH_RULES`, the sketch's
+//!   gates, and the self-guard are guard's alone) — run in *both* phases
+//!   with full assertions: observing = allowed + `DECISIONS` trace,
+//!   enforcing = `EPERM`. Two steps assert the *default allows*
+//!   instead, in both phases: the rule-prefix read and the self-signal
+//!   — the flip must never cost a process its opens' unruled classes or
+//!   `raise(3)`.
 //! * **shadowed steps** — `bpf(2)`, `finit_module(2)`, a module-tree
 //!   writable open — run in the *enforcing* phase only, expecting `EPERM`
 //!   from *either* layer, with no `DECISIONS` assertion: under bnuuy the
@@ -90,11 +93,11 @@ use rustix::{
 use wabbit_common::{
     authorization::{
         CODE_WOULD_DENY, CgroupKey, ENFORCE, HOOK_BIND, HOOK_FILE_OPEN, HOOK_SB_MOUNT,
-        HOOK_SETSOCKOPT, HOOK_SOCKET_CREATE, HOOK_TASK_KILL, Yard, decision_key, path_hash,
+        HOOK_SETSOCKOPT, HOOK_SIGNAL_WABBIT, HOOK_SOCKET_CREATE, HOOK_TASK_KILL, Yard,
+        decision_key, path_hash,
     },
     brand::NAME,
 };
-
 use wabbit_policy::network::{BindPosture, NetworkConfig, RawCapturePosture};
 
 use crate::policy::Policy;
@@ -138,6 +141,13 @@ pub struct Guard {
     /// The network gates' reach as loaded into `NET_POSTURE`: the
     /// self-test proves exactly the postures in force.
     network: NetworkConfig,
+    /// Is the self-guard armed? It is armed when the running kernel's
+    /// own BTF yielded `task_struct`'s `tgid` offset (see
+    /// [`populate_self_guard`]): an unarmed guard fail-opens, and the
+    /// self-test skips its step with a warning — a protection that
+    /// cannot exist on a kernel is not proven there (the not-sleepable
+    /// precedent).
+    self_guard_armed: bool,
 }
 
 /// What [`Guard::seed_path_rule_steps`] seeded, for
@@ -193,6 +203,7 @@ impl Guard {
         let (cgroup, cgroup_id) =
             self_cgroup().context("finding this process's cgroup in cgroup v2")?;
         trust_self(&mut ebpf, &cgroup, cgroup_id)?;
+        let self_guard_armed = populate_self_guard(&mut ebpf)?;
         populate_authorizations(&mut ebpf, policy, &cgroup)
             .context("populating the authorization maps")?;
         populate_default(&mut ebpf, policy).context("populating the default entry")?;
@@ -233,6 +244,7 @@ impl Guard {
             cgroup,
             cgroup_id,
             network,
+            self_guard_armed,
         })
     }
 
@@ -266,13 +278,34 @@ impl Guard {
                 selftest_cgroup.join("cgroup.procs").display().to_string(),
             ),
             (STEP_FIREWALL, String::new()),
-            // kill(getppid(), 0): signal 0 performs the whole permission
-            // walk — LSM hook included — without delivering anything, so
-            // the step is side-effect-free even when it passes. Denied
-            // in the enforcing round exactly because the selftest cgroup
-            // is a *listed* boundary without the `signal` bit.
+            // kill(1, 0): the *posture* proof — signal 0 performs the
+            // whole permission walk — LSM hook included — without
+            // delivering anything, so the step is side-effect-free even
+            // when it passes. PID 1 is the probe target precisely
+            // because it is not wabbit: the self-guard owns every
+            // wabbit-directed denial now, and this step must keep
+            // proving the listed-cgroup posture (the selftest cgroup
+            // carries no `signal` bit) on a target only that posture
+            // governs.
             (STEP_SIGNAL, String::new()),
         ];
+        // kill(getppid(), 0): the *self-guard* proof — the target is
+        // wabbit itself, and the probe must be denied in the enforcing
+        // round no matter what the policy grants, because the guard
+        // outranks the `signal` bit. Signal 0 keeps the observing round
+        // side-effect-free (the whole permission walk, no delivery).
+        // Skipped with a warning when the guard could not arm: a
+        // protection that cannot exist on this kernel is not proven
+        // there (the not-sleepable precedent), and the warning — not a
+        // skip — is what keeps it honest.
+        if self.self_guard_armed {
+            reachable.push((STEP_SIGNAL_WABBIT, String::new()));
+        } else {
+            warn!(
+                "skipping the signal-wabbit step: the self-guard could not \
+                 arm, so wabbit remains signalable by outside processes"
+            );
+        }
         // The network gates are tested at exactly the reach the policy
         // gave them: a gate switched off has nothing to deny, and an
         // ephemeral bind is a deny step only where the posture gates it.
@@ -367,14 +400,14 @@ impl Guard {
         // blocking two classes under a prefix cannot cost the third its
         // openings.
         if let Some(seeded) = &seeded {
-            let pid = self
-                .run_worker(&selftest_cgroup, STEP_RULES_READ, &seeded.data_arg(), false)?;
+            let pid =
+                self.run_worker(&selftest_cgroup, STEP_RULES_READ, &seeded.data_arg(), false)?;
             self.check_fork_event(pid, STEP_RULES_READ)?;
-            let pid = self
-                .run_worker(&selftest_cgroup, STEP_RULES_WRITE, &seeded.data_arg(), true)?;
+            let pid =
+                self.run_worker(&selftest_cgroup, STEP_RULES_WRITE, &seeded.data_arg(), true)?;
             self.check_fork_event(pid, STEP_RULES_WRITE)?;
-            let pid = self
-                .run_worker(&selftest_cgroup, STEP_RULES_EXEC, &seeded.exec_arg(), true)?;
+            let pid =
+                self.run_worker(&selftest_cgroup, STEP_RULES_EXEC, &seeded.exec_arg(), true)?;
             self.check_fork_event(pid, STEP_RULES_EXEC)?;
         }
 
@@ -439,6 +472,35 @@ impl Guard {
         enforcing.set(0, value, 0).context("writing ENFORCING")
     }
 
+    /// The system has begun shutting down — the "unless" of the
+    /// self-guard: from here on the signal gate decides nothing about
+    /// signals aimed at this process, so the shutdown sweep (PID 1's,
+    /// already exempt by sender, and everything else still alive) can
+    /// reach it again. Called once by the shutdown watch
+    /// (`crate::main`'s park loop), idempotent, and best-effort: a
+    /// relaxation that cannot be written leaves the machine *more*
+    /// protected through its own shutdown, never less.
+    pub fn note_shutdown(&mut self) {
+        use wabbit_common::authorization::SELF_GUARD_SHUTDOWN;
+
+        let relaxed = (|| -> Result<()> {
+            let mut self_guard: Array<_, u32> = self
+                .ebpf
+                .map_mut("SELF_GUARD")
+                .context("finding SELF_GUARD")?
+                .try_into()
+                .context("opening SELF_GUARD")?;
+            self_guard
+                .set(SELF_GUARD_SHUTDOWN, 1, 0)
+                .context("writing the SELF_GUARD shutdown flag")?;
+            Ok(())
+        })();
+        match relaxed {
+            Ok(()) => info!("shutdown observed: the self-guard is relaxed"),
+            Err(error) => warn!("could not relax the self-guard for the shutdown: {error:#}"),
+        }
+    }
+
     /// The sacrificial cgroup the self-test workers run in: a child of
     /// wabbit's own, so a fresh kernfs id (outside wabbit's trust) without
     /// polluting the root of the hierarchy.
@@ -490,7 +552,10 @@ impl Guard {
         }
         let cgroup_id = fs::metadata(selftest_cgroup)
             .with_context(|| {
-                format!("stat(2) on the selftest cgroup {}", selftest_cgroup.display())
+                format!(
+                    "stat(2) on the selftest cgroup {}",
+                    selftest_cgroup.display()
+                )
             })?
             .ino();
         if let Err(error) = fs::create_dir_all(&dir) {
@@ -537,9 +602,7 @@ impl Guard {
             );
             return Ok(None);
         }
-        if let Err(error) =
-            fs::set_permissions(&exec_target, fs::Permissions::from_mode(0o755))
-        {
+        if let Err(error) = fs::set_permissions(&exec_target, fs::Permissions::from_mode(0o755)) {
             warn!(
                 "could not make the path-rule self-test exec target executable: {error}; \
                  skipping the path-rule steps"
@@ -619,9 +682,8 @@ impl Guard {
             .map_mut("PATH_RULES")
             .context("finding PATH_RULES")
             .and_then(|map| {
-                let mut rules: HashMap<_, wabbit_common::authorization::PathRuleKey, u32> = map
-                    .try_into()
-                    .context("opening PATH_RULES")?;
+                let mut rules: HashMap<_, wabbit_common::authorization::PathRuleKey, u32> =
+                    map.try_into().context("opening PATH_RULES")?;
                 Ok(match seeded.prior_rule {
                     Some(prior) => rules.insert(seeded.rule_key, prior, 0),
                     None => rules.remove(&seeded.rule_key),
@@ -641,9 +703,8 @@ impl Guard {
             .map_mut("AUTHORIZATIONS")
             .context("finding AUTHORIZATIONS")
             .and_then(|map| {
-                let mut authorizations: HashMap<_, CgroupKey, Authorization> = map
-                    .try_into()
-                    .context("opening AUTHORIZATIONS")?;
+                let mut authorizations: HashMap<_, CgroupKey, Authorization> =
+                    map.try_into().context("opening AUTHORIZATIONS")?;
                 Ok(match seeded.prior_authorization {
                     Some(prior) => authorizations.insert(auth_key, prior, 0),
                     None => authorizations.remove(&auth_key),
@@ -785,7 +846,8 @@ impl Guard {
             .context("reading DECISIONS keys")?;
         let mut missing: Vec<u32> = Vec::new();
         // A bind gate switched off decides nothing; `socket_create` is
-        // traced by the netfilter step whatever the raw-capture posture.
+        // traced by the netfilter step whatever the raw-capture
+        // posture; and an unarmed self-guard decides nothing.
         let mut hooks = vec![
             HOOK_SB_MOUNT,
             HOOK_SOCKET_CREATE,
@@ -793,6 +855,9 @@ impl Guard {
             HOOK_SETSOCKOPT,
             HOOK_TASK_KILL,
         ];
+        if self.self_guard_armed {
+            hooks.push(HOOK_SIGNAL_WABBIT);
+        }
         if self.network.bind != BindPosture::Off {
             hooks.push(HOOK_BIND);
         }
@@ -840,6 +905,7 @@ const STEP_BIND_NET: &str = "bind-net";
 const STEP_BIND_EPHEMERAL: &str = "bind-ephemeral";
 const STEP_SIGNAL: &str = "signal";
 const STEP_SIGNAL_SELF: &str = "signal-self";
+const STEP_SIGNAL_WABBIT: &str = "signal-wabbit";
 /// Not a step but a re-exec target: `worker_main` dispatches it before
 /// anything else (it must not read stdin), and only a *successful*
 /// execve of the rules-exec target can reach it — so its exit code is
@@ -893,6 +959,7 @@ pub fn worker_main() -> Option<i32> {
         STEP_BIND_EPHEMERAL => Some(worker_step_bind(0)),
         STEP_SIGNAL => Some(worker_step_signal()),
         STEP_SIGNAL_SELF => Some(worker_step_signal_self()),
+        STEP_SIGNAL_WABBIT => Some(worker_step_signal_wabbit()),
         other => {
             eprintln!("{NAME} self-test worker: unknown step {other}");
             Some(3)
@@ -1140,7 +1207,10 @@ fn worker_step_rules_read(path: Option<&str>) -> i32 {
         Err(error) => match error.raw_os_error() {
             Some(errno) if errno == EPERM_ERRNO => verdict::BLOCKED,
             Some(_) => {
-                eprintln!("{NAME} self-test path-rules-read: errno {:?} (not EPERM)", error);
+                eprintln!(
+                    "{NAME} self-test path-rules-read: errno {:?} (not EPERM)",
+                    error
+                );
                 verdict::ALLOWED
             }
             None => verdict::SETUP_FAILED,
@@ -1164,7 +1234,10 @@ fn worker_step_rules_write(path: Option<&str>) -> i32 {
         Err(error) => match error.raw_os_error() {
             Some(errno) if errno == EPERM_ERRNO => verdict::BLOCKED,
             Some(_) => {
-                eprintln!("{NAME} self-test path-rules-write: errno {:?} (not EPERM)", error);
+                eprintln!(
+                    "{NAME} self-test path-rules-write: errno {:?} (not EPERM)",
+                    error
+                );
                 verdict::ALLOWED
             }
             None => verdict::SETUP_FAILED,
@@ -1273,18 +1346,35 @@ fn worker_step_bind(port: u16) -> i32 {
     errno_verdict("bind()")
 }
 
-/// `kill(getppid(), 0)` — a signal *permission probe* at the parent,
-/// which is wabbit itself. Signal 0 performs the whole permission walk —
-/// the `task_kill` LSM hook included — without delivering anything, so
-/// the step is side-effect-free in both phases: observing passes,
-/// enforcing is denied before anything is sent.
+/// `kill(1, 0)` — a signal *permission probe* at PID 1, proving the
+/// listed-cgroup posture on a target the self-guard does not own.
+/// Signal 0 performs the whole permission walk — the `task_kill` LSM
+/// hook included — without delivering anything, so the step is
+/// side-effect-free in both phases: observing passes, enforcing is
+/// denied by the selftest cgroup's missing `signal` bit before anything
+/// is sent.
 fn worker_step_signal() -> i32 {
+    let ret = unsafe { libc::kill(1, 0) };
+    if ret >= 0 {
+        eprintln!("{NAME} self-test signal: kill(1, 0) went through");
+        return verdict::ALLOWED;
+    }
+    errno_verdict("signal kill()")
+}
+
+/// `kill(getppid(), 0)` — the self-guard's proof: the target is wabbit
+/// itself, and the probe must be denied in the enforcing round no matter
+/// what the policy grants — the guard outranks the `signal` bit, and
+/// this worker runs outside every trust (a fresh PID in the sacrificial
+/// selftest cgroup). Signal 0 keeps the observing phase
+/// side-effect-free: the whole permission walk, no delivery.
+fn worker_step_signal_wabbit() -> i32 {
     let ret = unsafe { libc::kill(libc::getppid(), 0) };
     if ret >= 0 {
         eprintln!("{NAME} self-test signal: kill(getppid(), 0) went through");
         return verdict::ALLOWED;
     }
-    errno_verdict("signal kill()")
+    errno_verdict("signal-wabbit kill()")
 }
 
 /// `kill(getpid(), 0)` — the signal gate's self-exemption, asserted in
@@ -1353,9 +1443,66 @@ fn trust_self(ebpf: &mut aya::Ebpf, cgroup: &Path, cgroup_id: u64) -> Result<()>
         .context("opening PROTECTED_PATHS")?;
     let canonical = cgroup.display().to_string();
     protected
-        .insert(path_hash(canonical.as_bytes()), yard_for(&canonical, cgroup_id), 0)
+        .insert(
+            path_hash(canonical.as_bytes()),
+            yard_for(&canonical, cgroup_id),
+            0,
+        )
         .with_context(|| format!("protecting the cgroup path {canonical}"))?;
     Ok(())
+}
+
+/// Arm the self-guard: wabbit's own tgid (the process the signal gate's
+/// self-guard protects from outside signals), the byte offset of
+/// `tgid` in `struct task_struct` parsed out of the *running kernel's
+/// own BTF* (`crate::btf`), and the shutdown relaxation flag (clear).
+///
+/// The offset is ground truth or nothing: a parse failure disarms the
+/// guard — which fail-opens, skips its self-test step with a warning,
+/// and says so loudly — because probing `task_struct` at a guessed
+/// offset is the silent-garbage lesson this workspace already paid once
+/// (the distro-patched fork record). Returns whether the guard armed.
+fn populate_self_guard(ebpf: &mut aya::Ebpf) -> Result<bool> {
+    use wabbit_common::authorization::{
+        SELF_GUARD_SHUTDOWN, SELF_GUARD_TGID, SELF_GUARD_TGID_OFFSET,
+    };
+
+    let offset = match crate::btf::task_struct_member_offset("task_struct", "tgid") {
+        Ok(offset) => offset as u32,
+        Err(error) => {
+            warn!(
+                "the self-guard cannot arm: no `tgid` offset from the running \
+                 kernel's BTF ({error:#}); {NAME} stays signalable by outside \
+                 processes and its self-test step is skipped"
+            );
+            0
+        }
+    };
+    let mut self_guard: Array<_, u32> = ebpf
+        .map_mut("SELF_GUARD")
+        .context("finding SELF_GUARD")?
+        .try_into()
+        .context("opening SELF_GUARD")?;
+    // `getpid(2)` is the tgid in the initial pid namespace — the same
+    // value the gate reads out of the target `task_struct` — for every
+    // launch this design defines (the initrd, the lab runner, init).
+    self_guard
+        .set(SELF_GUARD_TGID, std::process::id(), 0)
+        .context("writing the self-guard tgid")?;
+    self_guard
+        .set(SELF_GUARD_TGID_OFFSET, offset, 0)
+        .context("writing the self-guard tgid offset")?;
+    self_guard
+        .set(SELF_GUARD_SHUTDOWN, 0, 0)
+        .context("clearing the self-guard shutdown flag")?;
+    if offset != 0 {
+        info!(
+            "self-guard armed: tgid {}, task_struct.tgid at byte offset {offset} \
+             (from the running kernel's own BTF)",
+            std::process::id()
+        );
+    }
+    Ok(offset != 0)
 }
 
 /// Write the network gates' reach (the policy's `network` section, or
@@ -1534,10 +1681,7 @@ fn populate_authorizations(ebpf: &mut aya::Ebpf, policy: &Policy, own_cgroup: &P
             protected
                 .insert(path_hash(cgroup.as_bytes()), yard_for(cgroup, *ino), 0)
                 .with_context(|| format!("protecting the cgroup path {cgroup}"))?;
-            info!(
-                "the cgroup path {cgroup} is protected (yard id {})",
-                ino
-            );
+            info!("the cgroup path {cgroup} is protected (yard id {})", ino);
         }
     }
 
@@ -1585,7 +1729,9 @@ fn populate_authorizations(ebpf: &mut aya::Ebpf, policy: &Policy, own_cgroup: &P
 ///
 /// [`DEFAULT_CGROUP_ID`]: wabbit_common::authorization::DEFAULT_CGROUP_ID
 fn populate_default(ebpf: &mut aya::Ebpf, policy: &Policy) -> Result<()> {
-    use wabbit_common::authorization::{AUTH_VERSION, Authorization, DEFAULT_CGROUP_ID, PathRuleKey};
+    use wabbit_common::authorization::{
+        AUTH_VERSION, Authorization, DEFAULT_CGROUP_ID, PathRuleKey,
+    };
 
     let Some(default) = &policy.default else {
         debug!("the policy carries no default section: unlisted cgroups stay at the floor");
@@ -1647,7 +1793,11 @@ fn populate_default(ebpf: &mut aya::Ebpf, policy: &Policy) -> Result<()> {
         "populated the default entry: actions {:#x}, {} path rule{}",
         default.action_mask,
         default.path_rules.len(),
-        if default.path_rules.len() == 1 { "" } else { "s" }
+        if default.path_rules.len() == 1 {
+            ""
+        } else {
+            "s"
+        }
     );
     Ok(())
 }
@@ -1675,8 +1825,10 @@ fn entry_is_protected(action_mask: u64, flags: u64) -> bool {
 /// past the cgroupfs root, spelled the same way on both sides (see
 /// `paths::ROOT_SLASHES`).
 fn yard_for(canonical: &str, cgroup_id: u64) -> Yard {
-    let root_slashes =
-        wabbit_common::cgroup_types::CGROUPFS_ROOT.bytes().filter(|&b| b == b'/').count();
+    let root_slashes = wabbit_common::cgroup_types::CGROUPFS_ROOT
+        .bytes()
+        .filter(|&b| b == b'/')
+        .count();
     let level = canonical
         .bytes()
         .filter(|&b| b == b'/')
@@ -1787,7 +1939,10 @@ fn attach_tracepoints(ebpf: &mut aya::Ebpf) -> Result<bool> {
                      may go stale without the right one",
                     other
                 );
-                &["yard_keeper_mkdir_vanilla", "yard_keeper_mkdir_preempt_lazy"]
+                &[
+                    "yard_keeper_mkdir_vanilla",
+                    "yard_keeper_mkdir_preempt_lazy",
+                ]
             }
         },
         Err(error) => {
@@ -1795,7 +1950,10 @@ fn attach_tracepoints(ebpf: &mut aya::Ebpf) -> Result<bool> {
                 "reading {format_path} failed ({error}); attaching both yard keeper \
                  layouts — the migration wall's ids may go stale without the keeper"
             );
-            &["yard_keeper_mkdir_vanilla", "yard_keeper_mkdir_preempt_lazy"]
+            &[
+                "yard_keeper_mkdir_vanilla",
+                "yard_keeper_mkdir_preempt_lazy",
+            ]
         }
     };
     for variant in yard_variants {

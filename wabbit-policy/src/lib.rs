@@ -3,16 +3,17 @@
 //! A [`Policy`] is a set of optional sections, one per kind of configuration:
 //! [`rootfs`] (how the root filesystem and individual paths are mounted),
 //! [`authorization`] (per-cgroup classes for the steady-state gates),
-//! [`network`] (how far the network gates reach), and [`default`] (what
-//! a cgroup with no authorization entry gets). Each
-//! future kind (for example initrd modification or a kernel module allowlist)
-//! is another section in its own submodule.
+//! [`network`] (how far the network gates reach), [`default`] (what
+//! a cgroup with no authorization entry gets), and [`startup`] (programs
+//! the boot itself launches, each in its named class at its chosen point
+//! in startup). Each future kind (for example initrd modification or a
+//! kernel module allowlist) is another section in its own submodule.
 //!
 //! Wire layout, all integers little endian:
 //!
 //! ```text
 //! magic       "WSPF"
-//! version     u16, currently 7
+//! version     u16, currently 8
 //! key_id      u8, an index into POLICY_PUBLIC_KEYS naming the signing key
 //! signature   [u8; 64], Ed25519 over (magic || version || key_id || sections)
 //! sections    u8, one bit per section that follows; unknown bits must be 0
@@ -20,11 +21,13 @@
 //!               bit 1: authorization
 //!               bit 2: network
 //!               bit 3: default
+//!               bit 4: startup
 //! rootfs      a `rootfs::RootFSConfig`, present only if bit 0 is set
 //! authorization an `authorization::AuthorizationConfig`, present only if
 //!             bit 1 is set
 //! network     a `network::NetworkConfig`, present only if bit 2 is set
 //! default     a `default::DefaultConfig`, present only if bit 3 is set
+//! startup     a `startup::StartupConfig`, present only if bit 4 is set
 //! ```
 //!
 //! Sections appear in bit order and each appears at most once, so every policy
@@ -67,19 +70,21 @@ pub mod authorization;
 pub mod default;
 pub mod network;
 pub mod rootfs;
+pub mod startup;
 mod wire;
 
 use authorization::{AuthorizationConfig, AuthorizationEntry};
 use default::DefaultConfig;
 use network::NetworkConfig;
 use rootfs::RootFSConfig;
+use startup::StartupConfig;
 
 /// WSPF / "Wabbit Signed Policy File"
 pub const MAGIC: &[u8; 4] = b"WSPF";
 /// Every trusted policy-signing public key, as `(id, key)` pairs: the
 /// header names the signing key, verification looks it up here.
 pub const POLICY_PUBLIC_KEYS: &[(u8, &str)] = wabbit_common::keys::POLICY_PUBLIC_KEYS;
-const VERSION: u16 = 7;
+const VERSION: u16 = 8;
 const SIGNATURE_SIZE: usize = 64;
 /// Size of an Ed25519 private key: the 32-byte secret seed.
 pub const PRIVATE_KEY_SIZE: usize = 32;
@@ -88,25 +93,26 @@ const PREFIX_SIZE: usize = MAGIC.len() + size_of::<u16>() + size_of::<u8>();
 const MAX_POLICY_SIZE: usize = 16 * 1024 * 1024;
 
 /// Which sections a policy contains, one bit each, in wire order.
-#[bitsize(4)]
+#[bitsize(5)]
 #[derive(FromBits, Clone, Copy)]
 struct Sections {
     rootfs: bool,
     authorization: bool,
     network: bool,
     default: bool,
+    startup: bool,
 }
 
 impl Sections {
     /// Decode the sections byte, rejecting bits for sections this version doesn't know about.
     fn from_byte(byte: u8) -> Result<Self, &'static str> {
-        u4::try_new(byte)
+        u5::try_new(byte)
             .map(Self::from)
             .map_err(|_| "policy contains unsupported sections")
     }
 
     fn to_byte(self) -> u8 {
-        u4::from(self).value()
+        u5::from(self).value()
     }
 }
 
@@ -122,6 +128,7 @@ pub struct Policy {
             authorization.is_some(),
             network.is_some(),
             default.is_some(),
+            startup.is_some(),
         ),
         map = Sections::to_byte
     )]
@@ -140,6 +147,10 @@ pub struct Policy {
     /// Absent, the unlisted floor: no action bits, no path rules.
     #[br(if(sections.default()))]
     pub default: Option<DefaultConfig>,
+    /// Programs the boot itself launches, each in the class it names at
+    /// its chosen point in startup. Absent, no program launches.
+    #[br(if(sections.startup()))]
+    pub startup: Option<StartupConfig>,
 }
 
 impl Default for Policy {
@@ -170,6 +181,7 @@ impl Default for Policy {
             }),
             network: None,
             default: None,
+            startup: None,
         }
     }
 }
@@ -181,6 +193,7 @@ impl Policy {
         self.authorization = newer.authorization.or(self.authorization.take());
         self.network = newer.network.or(self.network.take());
         self.default = newer.default.or(self.default.take());
+        self.startup = newer.startup.or(self.startup.take());
     }
 }
 
@@ -369,6 +382,17 @@ mod tests {
                 action_mask: wabbit_common::authorization::ACTION_BIND_NET,
                 path_rules: Vec::new(),
             }),
+            startup: Some(startup::StartupConfig {
+                entries: vec![startup::StartupEntry {
+                    kind: startup::StartupKind::Systemd,
+                    unit: String::new(),
+                    class: "shell".into(),
+                    timeout_secs: 0,
+                    argv: vec![startup::WireString {
+                        value: "/usr/local/bin/probe".into(),
+                    }],
+                }],
+            }),
         }
     }
 
@@ -405,10 +429,11 @@ mod tests {
             authorization: None,
             network: None,
             default: None,
+            startup: None,
         };
         let expected = [
             b"WSPF".as_slice(),
-            &7u16.to_le_bytes(),
+            &8u16.to_le_bytes(),
             // key id
             &[TEST_KEY_ID],
             &[7; SIGNATURE_SIZE],
@@ -429,7 +454,7 @@ mod tests {
         // (see `Policy::default`), proven by the section byte below.
         let sectionless = [
             b"WSPF".as_slice(),
-            &7u16.to_le_bytes(),
+            &8u16.to_le_bytes(),
             &[TEST_KEY_ID],
             &[7; SIGNATURE_SIZE],
             &[0b0],
@@ -442,6 +467,7 @@ mod tests {
                     authorization: None,
                     network: None,
                     default: None,
+                    startup: None,
                 },
                 TEST_KEY_ID,
                 &[7; SIGNATURE_SIZE],
@@ -454,7 +480,7 @@ mod tests {
         // may signal (the boot's failure paths thaw from there).
         let default = [
             b"WSPF".as_slice(),
-            &7u16.to_le_bytes(),
+            &8u16.to_le_bytes(),
             &[TEST_KEY_ID],
             &[7; SIGNATURE_SIZE],
             &[0b10], // sections: authorization
@@ -539,7 +565,7 @@ mod tests {
     fn rejects_unknown_sections() {
         // A section bit this version doesn't know about must not be silently ignored.
         let mut bytes = signed_sample();
-        bytes[BODY_START] |= 0b1_0000;
+        bytes[BODY_START] |= 0b10_0000;
         resign(&mut bytes);
         assert!(parse(&bytes).is_err());
     }
@@ -569,6 +595,7 @@ mod tests {
             authorization: None,
             network: None,
             default: None,
+            startup: None,
         });
         assert_eq!(current, sample());
 
@@ -577,6 +604,7 @@ mod tests {
             authorization: None,
             network: None,
             default: None,
+            startup: None,
         };
         current.merge(replacement.clone());
         assert_eq!(current.rootfs, replacement.rootfs);
@@ -592,6 +620,7 @@ mod tests {
             authorization: None,
             network: None,
             default: None,
+            startup: None,
         };
         current.merge(Policy::default());
         assert_eq!(current, Policy::default());

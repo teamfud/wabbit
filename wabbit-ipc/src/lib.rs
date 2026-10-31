@@ -21,8 +21,9 @@
 //!   it holds the only secret and is the only half that needs trusting.
 //!   Minting happens wherever the key lives — off box, by design: the
 //!   key never has to reach the target. [`CommandClient::mint_run`],
-//!   [`CommandClient::mint_policy`] print the base64; the `run` and
-//!   `policy` verbs mint and deliver in one step;
+//!   [`CommandClient::mint_policy`], [`CommandClient::mint_stop`] print
+//!   the base64; the `run`, `policy`, and `stop` verbs mint and deliver
+//!   in one step;
 //! * **delivery** ([`deliver`]) writes minted base64 to the socket
 //!   verbatim and reads the verdict. No key, no counter, no boot id,
 //!   **no validation** — the bytes go to the socket exactly as given,
@@ -51,7 +52,7 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signer, SigningKey};
 use wabbit_common::ipc_command::{
-    self, BOOT_ID_LEN, CommandHeader, KIND_RECONFIGURE, KIND_RUN, SIGNATURE_LEN,
+    self, BOOT_ID_LEN, CommandHeader, KIND_RECONFIGURE, KIND_RUN, KIND_STOP, SIGNATURE_LEN,
 };
 
 /// The environment variable naming `wabbit`'s IPC socket — the same one
@@ -80,6 +81,8 @@ pub enum CommandOutcome {
     Completed(TaskOutput),
     /// A `policy` was applied.
     Reconfigured,
+    /// A `stop` was accepted: the server is taking its graceful exit.
+    Stopped,
 }
 
 /// A completed task's captured output.
@@ -202,6 +205,12 @@ impl CommandClient {
         self.mint(&encode_policy(policy)?)
     }
 
+    /// Mint a complete signed `stop` command as base64 text — the
+    /// authenticated operator's stop channel (see [`Self::stop`]).
+    pub fn mint_stop(&self) -> Result<String> {
+        self.mint(&encode_stop()?)
+    }
+
     /// Sign a command blob and return the complete request as base64:
     /// request kind, signature, signed envelope + payload.
     fn mint(&self, command: &[u8]) -> Result<String> {
@@ -245,6 +254,17 @@ impl CommandClient {
     /// `wabbit-policy build` writes): mint here, deliver to the socket.
     pub fn reconfigure(&self, policy: &[u8]) -> Result<CommandOutcome> {
         self.deliver(&self.mint_policy(policy)?)
+    }
+
+    /// Ask wabbit for its graceful park-exit: the replacement for the
+    /// `SIGINT` the signal gate's self-guard no longer accepts from
+    /// outside processes. The command is signed by the deployment's
+    /// key, bound to the target's boot, and burned on acceptance — a
+    /// captured `stop` replayed is worth exactly nothing, and no
+    /// process on the box can mint one. Enforcement ends with the
+    /// process, exactly as it would on `Ctrl-C` before enforcement.
+    pub fn stop(&self) -> Result<CommandOutcome> {
+        self.deliver(&self.mint_stop()?)
     }
 
     /// Deliver a minted command to this client's socket — see [`deliver`].
@@ -294,12 +314,8 @@ impl CommandClient {
 /// verdict is decoded only to display it — the exit code, the output —
 /// and a lying display cheats no one but the one reading it.)
 pub fn deliver(socket_path: &Path, minted: &str) -> Result<CommandOutcome> {
-    let mut stream = UnixStream::connect(socket_path).with_context(|| {
-        format!(
-            "connecting to the IPC socket {}",
-            socket_path.display()
-        )
-    })?;
+    let mut stream = UnixStream::connect(socket_path)
+        .with_context(|| format!("connecting to the IPC socket {}", socket_path.display()))?;
     stream.write_all(minted.as_bytes())?;
     // Half-close: the server reads to EOF, then answers.
     stream.shutdown(Shutdown::Write)?;
@@ -308,6 +324,7 @@ pub fn deliver(socket_path: &Path, minted: &str) -> Result<CommandOutcome> {
     match decode_response(&response)? {
         ServerResponse::Completed(output) => Ok(CommandOutcome::Completed(output)),
         ServerResponse::Reconfigured => Ok(CommandOutcome::Reconfigured),
+        ServerResponse::Stopped => Ok(CommandOutcome::Stopped),
     }
 }
 
@@ -318,6 +335,7 @@ pub fn deliver(socket_path: &Path, minted: &str) -> Result<CommandOutcome> {
 pub enum ServerResponse {
     Completed(TaskOutput),
     Reconfigured,
+    Stopped,
 }
 
 /// Encode a `run` command blob: program and its arguments.
@@ -365,6 +383,12 @@ pub fn encode_policy(policy: &[u8]) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+/// Encode a `stop` command blob: nothing but the kind — the request
+/// itself (signature, boot, burned id) is the whole command.
+pub fn encode_stop() -> Result<Vec<u8>> {
+    Ok(vec![KIND_STOP])
+}
+
 /// This machine's boot id, as `/proc/sys/kernel/random/boot_id` spells
 /// it: the canonical 36-byte ASCII UUID, no trailing newline.
 pub fn read_boot_id() -> Result<[u8; BOOT_ID_LEN]> {
@@ -405,6 +429,7 @@ fn next_command_id(path: &Path) -> Result<u64> {
 const COMPLETED_RESPONSE: u8 = 0b01;
 const FAILED_RESPONSE: u8 = 0b10;
 const RECONFIGURED_RESPONSE: u8 = 0b11;
+const STOPPED_RESPONSE: u8 = 0b100;
 
 /// One `u32` little-endian length-prefixed field, the framing the IPC
 /// protocol has always used.
@@ -474,6 +499,10 @@ fn decode_response(bytes: &[u8]) -> Result<ServerResponse> {
             fields.finish()?;
             Ok(ServerResponse::Reconfigured)
         }
+        STOPPED_RESPONSE => {
+            fields.finish()?;
+            Ok(ServerResponse::Stopped)
+        }
         _ => bail!("unknown IPC response"),
     }
 }
@@ -525,8 +554,7 @@ mod tests {
             .decode(minted.as_bytes())
             .expect("minted output is valid base64");
         assert_eq!(request[0], ipc_command::SIGNED_REQUEST);
-        let header =
-            ipc_command::decode_header(&request[1 + SIGNATURE_LEN..]).unwrap();
+        let header = ipc_command::decode_header(&request[1 + SIGNATURE_LEN..]).unwrap();
         assert_eq!(header.kind, KIND_RUN);
         assert_eq!(header.boot_id, read_boot_id().unwrap());
         assert_eq!(header.command_id, 1, "the first mint spends id 1");
@@ -546,12 +574,9 @@ mod tests {
             read_boot_id().unwrap(),
         )
         .command_id(1234);
-        let minted = client
-            .mint_run("true", Vec::<&str>::new())
-            .unwrap();
+        let minted = client.mint_run("true", Vec::<&str>::new()).unwrap();
         let request = STANDARD.decode(minted.as_bytes()).unwrap();
-        let header =
-            ipc_command::decode_header(&request[1 + SIGNATURE_LEN..]).unwrap();
+        let header = ipc_command::decode_header(&request[1 + SIGNATURE_LEN..]).unwrap();
         assert_eq!(header.command_id, 1234);
         // The counter file was never touched.
         assert!(!counter.exists());

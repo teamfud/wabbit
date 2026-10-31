@@ -24,15 +24,20 @@
 //! you want; the signature decides what a connected client may make
 //! wabbit do.
 //!
-//! Two commands exist:
+//! Three commands exist:
 //!
 //! * **run** — execute a program in this namespace, capturing output;
 //! * **reconfigure** — apply a complete *signed policy file*, which the
 //!   server verifies *again*, against the same keys, before applying
-//!   any of it. A reconfigure is double-signed by construction.
+//!   any of it. A reconfigure is double-signed by construction;
+//! * **stop** — the authenticated operator's stop channel: the graceful
+//!   park-exit that ends enforcement, asked for by the deployment's key
+//!   instead of a `SIGINT` any process on the box could once send (the
+//!   signal gate's self-guard denies signals toward wabbit outside
+//!   shutdown, and this is the replacement stop path).
 
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -45,10 +50,10 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
-    process::Command,
+    sync::Notify,
 };
 use wabbit_common::ipc_command::{
-    self, BOOT_ID_LEN, HEADER_LEN, KIND_RECONFIGURE, KIND_RUN, SIGNATURE_LEN,
+    self, BOOT_ID_LEN, HEADER_LEN, KIND_RECONFIGURE, KIND_RUN, KIND_STOP, SIGNATURE_LEN,
 };
 
 use crate::{
@@ -61,6 +66,7 @@ use crate::{
 const COMPLETED_RESPONSE: u8 = 0b01;
 const FAILED_RESPONSE: u8 = 0b10;
 const RECONFIGURED_RESPONSE: u8 = 0b11;
+const STOPPED_RESPONSE: u8 = 0b100;
 
 /// Everything a command has to pass, kept for the server's whole life.
 pub struct IpcState {
@@ -82,18 +88,28 @@ pub struct IpcState {
     /// The guard's run-cgroup half: creates and authorizes the
     /// ephemeral cgroup each run executes in (`crate::runs`).
     authorizer: Arc<dyn RunAuthorizer>,
+    /// The park loop's stop signal: a `stop` command answers its client
+    /// and then raises this, and the process takes its graceful exit.
+    /// `Notify::notify_one` stores its permit, so a stop arriving
+    /// between the loop's polls is never lost.
+    stop: Arc<Notify>,
 }
 
 /// The server's state for a real run: the compiled-in policy keys, this
-/// boot's id, the given starting policy, and the guard's run
-/// authorizer. Call once at startup.
-pub fn server_state(policy: Policy, authorizer: Arc<dyn RunAuthorizer>) -> Result<Arc<IpcState>> {
+/// boot's id, the given starting policy, the guard's run authorizer,
+/// and the stop signal the park loop waits on. Call once at startup.
+pub fn server_state(
+    policy: Policy,
+    authorizer: Arc<dyn RunAuthorizer>,
+    stop: Arc<Notify>,
+) -> Result<Arc<IpcState>> {
     Ok(Arc::new(IpcState {
         active_policy: Mutex::new(policy),
         boot_id: read_boot_id()?,
         last_command_id: AtomicU64::new(0),
         public_keys: crate::trust::compiled_public_keys()?,
         authorizer,
+        stop,
     }))
 }
 
@@ -113,6 +129,7 @@ fn read_boot_id() -> Result<[u8; BOOT_ID_LEN]> {
 enum RequestOwned {
     Run(RunTaskOwned),
     Reconfigure(ReconfigureOwned),
+    Stop(StopOwned),
 }
 
 #[derive(Debug)]
@@ -135,6 +152,12 @@ struct RunTaskOwned {
 struct ReconfigureOwned {
     policy: Policy,
 }
+
+/// A `stop` command carries nothing: the request itself — signature,
+/// boot, burned id — is the whole authorization. See the module docs
+/// for why the stop channel is a command and not a signal.
+#[derive(Debug)]
+struct StopOwned;
 
 /// Run the IPC server on `socket_path` until the process exits.
 pub async fn run_server(socket_path: PathBuf, state: Arc<IpcState>) -> Result<()> {
@@ -216,6 +239,17 @@ async fn handle_task(stream: UnixStream, state: Arc<IpcState>) -> Result<()> {
                 }))?,
             }
         }
+        // The graceful stop: answer the client *first* — it deserves
+        // its verdict, not a socket dying mid-write — then raise the
+        // park loop's stop signal. The id already burned in decoding,
+        // so a captured `stop` replayed later is worth exactly nothing.
+        Ok(RequestOwned::Stop(_)) => {
+            let response = encode_response(&Response::Stopped)?;
+            write_half.write_all(&response).await?;
+            log::info!("a signed stop command arrived: taking the graceful exit");
+            state.stop.notify_one();
+            return Ok(());
+        }
         Err(error) => encode_response(&Response::Failed(TaskError {
             message: format!("{error:#}"),
         }))?,
@@ -248,67 +282,18 @@ async fn execute_run(run: RunTaskOwned, state: &Arc<IpcState>) -> Result<std::pr
         .prepare_run(class.as_ref(), run.command_id)
         .context("preparing the run cgroup")?;
 
-    // **Self-migration before exec**: the child writes its own pid into
-    // the run cgroup's `cgroup.procs` from `pre_exec`, which runs
-    // between fork and exec — so the program's first instruction after
-    // exec executes *inside* the run cgroup, with no window at all. A
-    // rendezvous the parent could win (the self-test's held-stdin
-    // trick) only works for programs that block on stdin; `modprobe`
-    // does not, and a run that finished in wabbit's own, trusted
-    // cgroup was measured doing exactly that (a module loaded,
-    // unclassified). The pre_exec closure runs after fork in a
-    // multithreaded process: only async-signal-safe calls (open,
-    // write, close, getpid) and no allocation — the path is a ready
-    // CString built before the fork, the pid formats into a stack
-    // buffer.
-    let procs = std::ffi::CString::new(
-        prepared
-            .cgroup
-            .join("cgroup.procs")
-            .to_str()
-            .context("the run cgroup path is UTF-8")?,
-    )
-    .map_err(|_| anyhow::anyhow!("the cgroup.procs path is not C-stringable"))?;
-    let mut command = Command::new(&run.program);
-    command
-        .args(&run.args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    unsafe {
-        command.pre_exec(move || {
-            let fd = libc::open(procs.as_ptr(), libc::O_WRONLY);
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let mut digits = [0u8; 20];
-            let pid = libc::getpid() as u64;
-            let mut length = digits.len();
-            let mut rest = pid;
-            loop {
-                length -= 1;
-                digits[length] = b'0' + (rest % 10) as u8;
-                rest /= 10;
-                if rest == 0 {
-                    break;
-                }
-            }
-            let written = libc::write(
-                fd,
-                digits[length..].as_ptr().cast::<libc::c_void>(),
-                digits.len() - length,
-            );
-            let written = if written < 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            };
-            libc::close(fd);
-            written
-        });
-    }
-    let child = command.spawn();
-    let mut child = match child {
+    // **Self-migration before exec** (`crate::runs::migrate_command`):
+    // the child writes its own pid into the run cgroup's `cgroup.procs`
+    // from `pre_exec`, which runs between fork and exec — so the
+    // program's first instruction after exec executes *inside* the run
+    // cgroup, with no window at all. A rendezvous the parent could win
+    // (the self-test's held-stdin trick) only works for programs that
+    // block on stdin; `modprobe` does not, and a run that finished in
+    // wabbit's own, trusted cgroup was measured doing exactly that (a
+    // module loaded, unclassified).
+    let argv: Vec<String> = run.args.clone();
+    let program = run.program.clone();
+    let mut child = match runs::spawn_migrated(&program, &argv, &prepared) {
         Ok(child) => child,
         Err(error) => {
             state.authorizer.release_run(&prepared);
@@ -325,39 +310,23 @@ async fn execute_run(run: RunTaskOwned, state: &Arc<IpcState>) -> Result<std::pr
     output.context("waiting for the run")
 }
 
-/// Resolve a class name to its compiled entry in the active policy: a
-/// path lookup, nothing more. The name is validated before any path is
-/// built (it came off the wire, signature notwithstanding — the
-/// signature authorizes the name, the charset keeps it a name), and the
-/// entry is cloned out of the policy lock so a long run never holds it.
+/// Resolve a class name to its compiled entry in the active policy:
+/// `crate::runs::class_entry` — the convention path against the
+/// authorizer's own cgroup, looked up under the policy lock (the entry
+/// is cloned out so a long run never holds it). The name is validated
+/// before any path is built (it came off the wire, signature
+/// notwithstanding — the signature authorizes the name, the charset
+/// keeps it a name).
 fn resolve_class(
     policy: &Mutex<Policy>,
     authorizer: &Arc<dyn RunAuthorizer>,
     name: &str,
 ) -> Result<wabbit_policy::authorization::AuthorizationEntry> {
-    use wabbit_policy::authorization::AuthorizationConfig;
-
     let own = authorizer.own_cgroup();
-    let path = runs::class_cgroup_path(&own, name)?;
     let policy = policy
         .lock()
         .map_err(|_| anyhow::anyhow!("the policy lock is poisoned"))?;
-    let config = policy.authorization.as_ref();
-    let entry = config
-        .and_then(|config: &AuthorizationConfig| {
-            config
-                .entries
-                .iter()
-                .find(|entry| entry.cgroup == Path::new(&path))
-        })
-        .cloned();
-    entry.ok_or_else(|| {
-        anyhow::anyhow!(
-            "the active policy defines no class {name:?}: classes compile to \
-             <wabbit-cgroup>/{}/<name> entries, and no entry sits at {path:?}",
-            wabbit_common::cgroup_types::CLASS_SEGMENT
-        )
-    })
+    runs::class_entry(&policy, &own, name)
 }
 
 /// Decode the transport: the request arrives as base64 text of a
@@ -471,6 +440,13 @@ fn decode_signed_command(bytes: &[u8], state: &IpcState) -> Result<RequestOwned>
             fields.finish()?;
             RequestOwned::Reconfigure(ReconfigureOwned { policy })
         }
+        // The stop carries no payload: anything trailing would be a
+        // different blob shape this decoder does not know.
+        KIND_STOP => {
+            let mut fields = Cursor::new(payload);
+            fields.finish()?;
+            RequestOwned::Stop(StopOwned)
+        }
         other => bail!("unknown command kind {other}"),
     };
 
@@ -497,6 +473,7 @@ enum Response {
     Completed(CompletedTask),
     Failed(TaskError),
     Reconfigured,
+    Stopped,
 }
 
 #[derive(Debug)]
@@ -536,6 +513,7 @@ fn encode_response(response: &Response) -> Result<Vec<u8>> {
             put_string(&mut output, &error.message)?;
         }
         Response::Reconfigured => output.push(RECONFIGURED_RESPONSE),
+        Response::Stopped => output.push(STOPPED_RESPONSE),
     }
     Ok(output)
 }
@@ -624,7 +602,7 @@ impl<'a> Cursor<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::fs::MetadataExt, sync::Mutex as StdMutex};
+    use std::{os::unix::fs::MetadataExt, path::Path, sync::Mutex as StdMutex};
 
     use ed25519_dalek::{Signer, SigningKey};
     use wabbit_common::ipc_command::CommandHeader;
@@ -733,6 +711,7 @@ mod tests {
             }),
             network: None,
             default: None,
+            startup: None,
         }
     }
 
@@ -757,6 +736,7 @@ mod tests {
             last_command_id: AtomicU64::new(last_command_id),
             public_keys: keys.to_vec(),
             authorizer,
+            stop: Arc::new(Notify::new()),
         })
     }
 
@@ -826,7 +806,9 @@ mod tests {
                 assert_eq!(task.class, None);
                 assert_eq!(task.command_id, 1);
             }
-            RequestOwned::Reconfigure(_) => panic!("expected a run command"),
+            RequestOwned::Reconfigure(_) | RequestOwned::Stop(_) => {
+                panic!("expected a run command")
+            }
         }
         assert_eq!(state.last_command_id.load(Ordering::SeqCst), 1);
     }
@@ -847,8 +829,37 @@ mod tests {
                 assert_eq!(task.class.as_deref(), Some("ultra-privileged"));
                 assert_eq!(task.command_id, 7);
             }
-            RequestOwned::Reconfigure(_) => panic!("expected a run command"),
+            RequestOwned::Reconfigure(_) | RequestOwned::Stop(_) => {
+                panic!("expected a run command")
+            }
         }
+    }
+
+    /// A `stop` decodes like any command — signature, boot, burned id —
+    /// and its payload must be exactly empty: the request itself is the
+    /// whole command, so anything trailing is a blob shape this
+    /// decoder refuses rather than guesses.
+    #[test]
+    fn a_signed_stop_decodes_and_carries_nothing() {
+        let signing_key = SigningKey::from_bytes(&[1; 32]);
+        let state = test_state(&[signing_key.verifying_key()], 0);
+        let blob = wabbit_ipc::encode_stop().unwrap();
+        let request = signed_request(&signing_key, KIND_STOP, test_boot_id(), 3, &blob);
+        match decode_signed_command(&request, &state).unwrap() {
+            RequestOwned::Stop(_) => {}
+            _ => panic!("expected a stop command"),
+        }
+        // The id burned like every command's: a replayed stop is worth
+        // nothing even before the process goes away.
+        assert_eq!(state.last_command_id.load(Ordering::SeqCst), 3);
+
+        let mut trailing = wabbit_ipc::encode_stop().unwrap();
+        put_string(&mut trailing, "why is this here").unwrap();
+        let request = signed_request(&signing_key, KIND_STOP, test_boot_id(), 4, &trailing);
+        let error = decode_signed_command(&request, &state)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("trailing bytes"), "{error}");
     }
 
     /// The class name off the wire is validated at decode, before the
@@ -1000,9 +1011,9 @@ mod tests {
         // (The empty input is valid base64 — it decodes to no request and
         // dies in the envelope decode, one gate later.)
         for garbage in [
-            &request[..],           // raw binary: the wire is base64 now
-            b"not base64!!",         // printable, but not base64
-            b"\xff\xfe garbage",     // not even UTF-8
+            &request[..],        // raw binary: the wire is base64 now
+            b"not base64!!",     // printable, but not base64
+            b"\xff\xfe garbage", // not even UTF-8
         ] {
             let error = decode_transport(garbage).unwrap_err().to_string();
             assert!(error.contains("base64"), "{error}");
@@ -1084,7 +1095,9 @@ mod tests {
                 assert_eq!(output.status, Some(0));
                 assert_eq!(output.stdout, b"through-the-wire\n");
             }
-            wabbit_ipc::CommandOutcome::Reconfigured => panic!("expected a run"),
+            wabbit_ipc::CommandOutcome::Reconfigured | wabbit_ipc::CommandOutcome::Stopped => {
+                panic!("expected a run")
+            }
         }
 
         // A classed run: the class resolves to the compiled entry (the
@@ -1099,7 +1112,9 @@ mod tests {
                 assert_eq!(output.status, Some(0));
                 assert_eq!(output.stdout, b"classed\n");
             }
-            wabbit_ipc::CommandOutcome::Reconfigured => panic!("expected a run"),
+            wabbit_ipc::CommandOutcome::Reconfigured | wabbit_ipc::CommandOutcome::Stopped => {
+                panic!("expected a run")
+            }
         }
 
         // A class the policy does not define: refused by name.
@@ -1129,9 +1144,7 @@ mod tests {
         // Minting burns the counter's id whether or not the minted
         // command is ever delivered, so mint once and deliver the same
         // base64 twice — the second delivery is the replay.
-        let minted = client
-            .mint_run("sh", ["-c", "echo replayed"])
-            .unwrap();
+        let minted = client.mint_run("sh", ["-c", "echo replayed"]).unwrap();
         wabbit_ipc::deliver(&socket_path, &minted).unwrap();
         let replay = wabbit_ipc::deliver(&socket_path, &minted)
             .unwrap_err()
@@ -1142,6 +1155,55 @@ mod tests {
         // server is alive and the counter moved on.
         let outcome = client.run("true", std::iter::empty::<&str>()).unwrap();
         assert!(matches!(outcome, wabbit_ipc::CommandOutcome::Completed(_)));
+
+        server.abort();
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// The end-to-end stop: the real client's `stop` against the real
+    /// server answers `Stopped` and raises the stop signal the park
+    /// loop waits on — the authenticated channel that replaced
+    /// `SIGINT`. `notify_one` stores its permit, so `notified()`
+    /// registered after the fact still observes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_real_server_takes_a_stop_command() {
+        let signing_key = SigningKey::from_bytes(&[10; 32]);
+        let authorizer = FakeAuthorizer::new();
+        let authorizer_for_server: Arc<dyn RunAuthorizer> = Arc::clone(&authorizer) as _;
+        let stop = Arc::new(Notify::new());
+        let state = Arc::new(IpcState {
+            active_policy: Mutex::new(Policy::default()),
+            boot_id: read_boot_id().expect("the test host has a boot id"),
+            last_command_id: AtomicU64::new(0),
+            public_keys: vec![signing_key.verifying_key()],
+            authorizer,
+            stop: Arc::clone(&stop),
+        });
+
+        let directory =
+            std::env::temp_dir().join(format!("wabbit-ipc-e2e-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let socket_path = directory.join("socket");
+        let counter_path = directory.join("counter");
+        let server = tokio::spawn(run_server(socket_path.clone(), state));
+
+        let client =
+            wabbit_ipc::CommandClient::connect(socket_path.clone(), &[10; 32], counter_path)
+                .unwrap();
+        for _ in 0..100 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let outcome = client.stop().unwrap();
+        assert_eq!(outcome, wabbit_ipc::CommandOutcome::Stopped);
+        // The park loop's signal: the process would now take its
+        // graceful exit.
+        tokio::time::timeout(std::time::Duration::from_secs(2), stop.notified())
+            .await
+            .expect("the stop command raises the park loop's stop signal");
 
         server.abort();
         std::fs::remove_dir_all(&directory).ok();

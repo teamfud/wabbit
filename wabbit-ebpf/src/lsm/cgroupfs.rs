@@ -158,8 +158,7 @@ fn file_open_body(
     // every retry. [`trust::inside_yard`] decides which case this open
     // is; an insider of one yard is still an outsider of every other.
     if let Some(yard) = paths::under_protected_yard(resolved) {
-        let allowed =
-            trust::current_authorized(ACTION_CGROUPFS_WRITE) || trust::inside_yard(yard);
+        let allowed = trust::current_authorized(ACTION_CGROUPFS_WRITE) || trust::inside_yard(yard);
         return trust::verdict(trust::HOOK_FILE_OPEN, if allowed { 0 } else { EPERM });
     }
 

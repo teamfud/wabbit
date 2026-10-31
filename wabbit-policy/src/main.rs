@@ -30,6 +30,7 @@ use wabbit_policy::{
     network::{BindPosture, NetworkConfig, RawCapturePosture},
     rootfs::{PathFlags, PathOverride, RootFSConfig, RootFlags},
     sign,
+    startup::{StartupConfig, StartupEntry, StartupKind, WireString},
 };
 use zeroize::Zeroizing;
 
@@ -51,6 +52,8 @@ enum ActionName {
     TagControl,
     #[value(name = "bpf-attach")]
     BpfAttach,
+    #[value(name = "bpf-full")]
+    BpfFull,
     #[value(name = "kmods")]
     Kmods,
     #[value(name = "cgroupfs-write")]
@@ -77,6 +80,7 @@ impl ActionName {
             Self::Credentials => auth::ACTION_CREDENTIALS,
             Self::TagControl => auth::ACTION_TAG_CONTROL,
             Self::BpfAttach => auth::ACTION_BPF_ATTACH,
+            Self::BpfFull => auth::ACTION_BPF_FULL,
             Self::Kmods => auth::ACTION_KMODS,
             Self::CgroupfsWrite => auth::ACTION_CGROUPFS_WRITE,
             Self::Firewall => auth::ACTION_FIREWALL,
@@ -97,6 +101,7 @@ impl ActionName {
             auth::ACTION_CREDENTIALS => Self::Credentials,
             auth::ACTION_TAG_CONTROL => Self::TagControl,
             auth::ACTION_BPF_ATTACH => Self::BpfAttach,
+            auth::ACTION_BPF_FULL => Self::BpfFull,
             auth::ACTION_KMODS => Self::Kmods,
             auth::ACTION_CGROUPFS_WRITE => Self::CgroupfsWrite,
             auth::ACTION_FIREWALL => Self::Firewall,
@@ -121,6 +126,7 @@ impl ActionName {
             Self::Credentials => "credentials",
             Self::TagControl => "tag-control",
             Self::BpfAttach => "bpf-attach",
+            Self::BpfFull => "bpf-full",
             Self::Kmods => "kmods",
             Self::CgroupfsWrite => "cgroupfs-write",
             Self::Firewall => "firewall",
@@ -147,6 +153,10 @@ struct PolicyToml {
     authorization: Option<Vec<AuthorizationToml>>,
     network: Option<NetworkToml>,
     default: Option<DefaultToml>,
+    /// Programs the boot itself launches: one `[[startup]]` block per
+    /// program, each naming the point in startup (and, for the unit
+    /// point, the unit), the class it runs under, and its argv.
+    startup: Option<Vec<StartupToml>>,
 }
 
 /// The `[default]` table: what every cgroup *no* `[[authorization]]`
@@ -278,6 +288,128 @@ impl From<&NetworkConfig> for NetworkToml {
                 RawCapturePosture::Icmp => RawCaptureName::Icmp,
                 RawCapturePosture::Off => RawCaptureName::Off,
             },
+        }
+    }
+}
+
+/// One `[[startup]]` program: when in the boot it launches (`point`),
+/// what it runs (`argv`), and the class it runs under (`class`).
+///
+/// ```toml
+/// [[startup]]
+/// point = "unit"                        # "initrd" | "systemd" | "unit"
+/// unit  = "multi-user.target"            # the unit the unit point waits for
+/// class = "shell"                        # optional: empty = the classless floor
+/// timeout_secs = 300                    # unit point only, 0 = wait forever
+/// argv  = ["/usr/local/bin/probe", "--online"]
+/// ```
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+struct StartupToml {
+    /// The point in system startup this program launches at.
+    point: StartupPointName,
+    /// The systemd unit the [`StartupPointName::Unit`] point waits for.
+    /// Other points launch immediately and name no unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unit: Option<String>,
+    /// The class this run executes under — the same named profile a
+    /// signed IPC run may name. Absent: the classless floor (no
+    /// authorization of its own).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    class: Option<String>,
+    /// How long the unit point may wait for its unit, in seconds.
+    /// `0` waits forever. Unit point only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeout_secs: Option<u32>,
+    /// The program and its arguments: `argv[0]` is the program.
+    argv: Vec<String>,
+}
+
+/// The TOML spelling of a [`StartupKind`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum StartupPointName {
+    /// The initramfs phase: after the guard enforces, before
+    /// `switch_root`. Short one-shots only — a program still running at
+    /// `switch_root` is killed by a systemd initrd's sweep and runs on
+    /// a deleted ramfs under a busybox one.
+    Initrd,
+    /// systemd is up and wabbit has crossed into the booted system.
+    Systemd,
+    /// The named unit has reached active: `multi-user.target`,
+    /// `systemd-networkd-wait-online.service`, or any other unit.
+    Unit,
+}
+
+impl From<StartupKind> for StartupPointName {
+    fn from(kind: StartupKind) -> Self {
+        match kind {
+            StartupKind::Initrd => Self::Initrd,
+            StartupKind::Systemd => Self::Systemd,
+            StartupKind::Unit => Self::Unit,
+        }
+    }
+}
+
+impl From<StartupPointName> for StartupKind {
+    fn from(point: StartupPointName) -> Self {
+        match point {
+            StartupPointName::Initrd => Self::Initrd,
+            StartupPointName::Systemd => Self::Systemd,
+            StartupPointName::Unit => Self::Unit,
+        }
+    }
+}
+
+impl TryFrom<&StartupEntry> for StartupToml {
+    type Error = String;
+
+    fn try_from(entry: &StartupEntry) -> Result<Self, Self::Error> {
+        if entry.argv.iter().any(|arg| arg.value.contains('\0')) {
+            return Err("an argv entry contains a NUL".to_string());
+        }
+        Ok(Self {
+            point: entry.kind.into(),
+            unit: (!entry.unit.is_empty()).then(|| entry.unit.clone()),
+            class: (!entry.class.is_empty()).then(|| entry.class.clone()),
+            // Always spelled on the unit point — `0` (wait forever)
+            // must survive the round trip, not read back as the
+            // default; the immediate points launch with no timeout
+            // and spell nothing.
+            timeout_secs: if matches!(entry.kind, StartupKind::Unit) {
+                Some(entry.timeout_secs)
+            } else {
+                None
+            },
+            argv: entry.argv.iter().map(|arg| arg.value.clone()).collect(),
+        })
+    }
+}
+
+impl From<StartupToml> for StartupEntry {
+    fn from(startup: StartupToml) -> Self {
+        // An authored timeout is preserved verbatim — the entry's own
+        // `validate` rejects it by name on the immediate points. The
+        // *absent* key becomes the finite default on the unit point
+        // (the authored and wire shapes agree); `Some(0)` opts out and
+        // waits forever.
+        let timeout = match startup.timeout_secs {
+            Some(seconds) => seconds,
+            None if matches!(startup.point, StartupPointName::Unit) => {
+                wabbit_policy::startup::DEFAULT_TIMEOUT_SECS
+            }
+            None => 0,
+        };
+        Self {
+            kind: startup.point.into(),
+            unit: startup.unit.unwrap_or_default(),
+            class: startup.class.unwrap_or_default(),
+            timeout_secs: timeout,
+            argv: startup
+                .argv
+                .into_iter()
+                .map(|value| WireString { value })
+                .collect(),
         }
     }
 }
@@ -826,12 +958,18 @@ impl TryFrom<PolicyToml> for Policy {
             authorization,
             network: source.network.map(NetworkConfig::from),
             default: source.default.map(DefaultConfig::from),
+            startup: source.startup.map(|entries| StartupConfig {
+                entries: entries.into_iter().map(StartupEntry::from).collect(),
+            }),
         };
         if let Some(authorization) = &policy.authorization {
             authorization.validate()?;
         }
         if let Some(default) = &policy.default {
             default.validate()?;
+        }
+        if let Some(startup) = &policy.startup {
+            startup.validate()?;
         }
         Ok(policy)
     }
@@ -873,12 +1011,28 @@ impl TryFrom<&Policy> for PolicyToml {
         };
         // Classes do not survive the compile: the decoded policy holds
         // only the cgroup rules they became.
+        let startup = policy
+            .startup
+            .as_ref()
+            .map(|startup| {
+                startup
+                    .entries
+                    .iter()
+                    .map(StartupToml::try_from)
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
         Ok(Self {
             rootfs,
             class: None,
             authorization,
             network: policy.network.as_ref().map(NetworkToml::from),
-            default: policy.default.as_ref().map(DefaultToml::try_from).transpose()?,
+            default: policy
+                .default
+                .as_ref()
+                .map(DefaultToml::try_from)
+                .transpose()?,
+            startup,
         })
     }
 }
@@ -1109,6 +1263,7 @@ mod tests {
             (ACTION_CREDENTIALS, "credentials"),
             (ACTION_TAG_CONTROL, "tag-control"),
             (ACTION_BPF_ATTACH, "bpf-attach"),
+            (ACTION_BPF_FULL, "bpf-full"),
             (ACTION_KMODS, "kmods"),
             (ACTION_CGROUPFS_WRITE, "cgroupfs-write"),
             (ACTION_FIREWALL, "firewall"),
@@ -1156,6 +1311,13 @@ mod tests {
                     exec: None,
                 }],
             }),
+            startup: Some(vec![StartupToml {
+                point: StartupPointName::Unit,
+                unit: Some("multi-user.target".into()),
+                class: Some("shell".into()),
+                timeout_secs: Some(600),
+                argv: vec!["/usr/local/bin/probe".into(), "--online".into()],
+            }]),
         };
         let policy = Policy::try_from(
             toml::from_str::<PolicyToml>(&toml::to_string(&source).unwrap()).unwrap(),
@@ -1394,9 +1556,7 @@ exec    = "deny"
         assert_eq!(rule.verdict.exec, OpVerdict::Deny);
         assert_eq!(
             rule.verdict_bits(),
-            auth::PATH_RULE_READ_ALLOW
-                | auth::PATH_RULE_WRITE_DENY
-                | auth::PATH_RULE_EXEC_DENY
+            auth::PATH_RULE_READ_ALLOW | auth::PATH_RULE_WRITE_DENY | auth::PATH_RULE_EXEC_DENY
         );
 
         // Inspect spells mixed operations per operation, never as the
@@ -1657,5 +1817,111 @@ verdict = "deny"
             assert!(error.contains("default may not"), "{action}: {error}");
         }
         assert!(toml::from_str::<PolicyToml>("[default]\ndefault_deny = true\n").is_err());
+    }
+
+    /// `[[startup]]` compiles each point, and the absent timeout becomes
+    /// the finite default on the unit point only.
+    #[test]
+    fn startup_points_compile() {
+        let policy = parse(
+            r#"
+[[startup]]
+point = "initrd"
+argv  = ["/bin/load-secrets"]
+
+[[startup]]
+point = "systemd"
+class = "shell"
+argv  = ["/usr/local/bin/probe", "--online"]
+
+[[startup]]
+point = "unit"
+unit  = "systemd-networkd-wait-online.service"
+class = "network-daemon"
+argv  = ["/usr/local/bin/announce"]
+"#,
+        )
+        .unwrap();
+        let startup = policy.startup.expect("the startup compiled");
+        assert_eq!(startup.entries.len(), 3);
+        assert_eq!(startup.entries[0].kind, StartupKind::Initrd);
+        assert_eq!(startup.entries[0].argv.len(), 1);
+        assert_eq!(startup.entries[1].kind, StartupKind::Systemd);
+        assert_eq!(startup.entries[1].class, "shell");
+        let unit = &startup.entries[2];
+        assert_eq!(unit.kind, StartupKind::Unit);
+        assert_eq!(unit.unit, "systemd-networkd-wait-online.service");
+        // The absent timeout became the finite default, not "forever".
+        assert_eq!(
+            unit.timeout_secs,
+            wabbit_policy::startup::DEFAULT_TIMEOUT_SECS
+        );
+        startup.validate().unwrap();
+
+        // A policy without the section launches nothing.
+        assert_eq!(parse("").unwrap().startup, None);
+    }
+
+    /// The authored-shape contracts: a unit only on the unit point, a
+    /// timeout only on the unit point (with `0` = forever surviving),
+    /// a valid class name or none, and a non-empty argv.
+    #[test]
+    fn startup_validation_refuses_by_name() {
+        let unit = "unit = \"multi-user.target\"\n";
+        let base = |extra: &str| {
+            format!("[[startup]]\npoint = \"systemd\"\n{extra}argv = [\"/bin/true\"]\n")
+        };
+
+        // A unit on an immediate point, and a timeout on one.
+        let error = parse(&base(unit)).unwrap_err();
+        assert!(error.contains("takes no unit"), "{error}");
+        let error = parse(&base("timeout_secs = 10\n")).unwrap_err();
+        assert!(error.contains("launches immediately"), "{error}");
+
+        // The unit point round-trips `timeout_secs = 0` (wait forever):
+        // inspect spells it, and the absent key is the finite default.
+        let policy = parse(&format!(
+            "[[startup]]\npoint = \"unit\"\n{unit}timeout_secs = 0\nargv = [\"/bin/true\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(policy.startup.as_ref().unwrap().entries[0].timeout_secs, 0);
+        let inspected = PolicyToml::try_from(&policy).unwrap();
+        assert_eq!(
+            inspected.startup.as_ref().unwrap()[0].timeout_secs,
+            Some(0),
+            "inspect spells wait-forever as 0, not as an absent key"
+        );
+
+        // A unit point that is not a unit name, and a class that is not
+        // a class name — both refused by name.
+        for bad in [
+            "[[startup]]\npoint = \"unit\"\nunit = \"-v\"\nargv = [\"/bin/true\"]\n",
+            "[[startup]]\npoint = \"unit\"\nunit = \"has/slash\"\nargv = [\"/bin/true\"]\n",
+            "[[startup]]\npoint = \"unit\"\nargv = [\"/bin/true\"]\n",
+        ] {
+            let error = parse(bad).unwrap_err();
+            assert!(error.contains("unit name"), "{error}");
+        }
+        for bad in [
+            "[[startup]]\npoint = \"systemd\"\nclass = \"UPPER\"\nargv = [\"/bin/true\"]\n",
+            "[[startup]]\npoint = \"systemd\"\nclass = \"../escape\"\nargv = [\"/bin/true\"]\n",
+        ] {
+            let error = parse(bad).unwrap_err();
+            assert!(error.contains("class name"), "{error}");
+        }
+
+        // An empty argv names no program.
+        let error = parse("[[startup]]\npoint = \"systemd\"\nargv = []\n").unwrap_err();
+        assert!(error.contains("argv"), "{error}");
+
+        // Unknown keys and points never parse at all.
+        assert!(
+            toml::from_str::<PolicyToml>("[[startup]]\npoint = \"boot\"\nargv = [\"/bin/true\"]\n")
+                .is_err()
+        );
+        assert!(
+            toml::from_str::<PolicyToml>("[[startup]]\npoint = \"systemd\"\nrun = \"/bin/true\"\n")
+                .is_err()
+        );
     }
 }

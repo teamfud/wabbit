@@ -44,10 +44,11 @@ usage: {client} [options] VERB [arguments]
 
 options:
   --socket PATH     {name}'s IPC socket (default: ${prefix}_IPC_SOCKET);
-                    needed by run, policy, send, and the bare form
+                    needed by run, policy, stop, send, and the bare form
   --key PATH        the 32-byte Ed25519 signing seed ({policy}
-                    gen-key writes it); required for run, policy,
-                    encode-run, and encode-policy — the minting verbs.
+                    gen-key writes it); required for run, policy, stop,
+                    encode-run, encode-policy, and encode-stop — the
+                    minting verbs.
                     The key never needs to reach the target: mint where
                     it lives, deliver the base64 anywhere
   --counter PATH    the command counter file (default: {counter});
@@ -71,12 +72,19 @@ verbs:
                              --key and --socket)
   policy FILE                mint a policy application here and deliver
                              it (needs --key and --socket)
+  stop                       mint a graceful stop here and deliver it
+                             (needs --key and --socket): the
+                             authenticated way to ask {name} to end
+                             its enforcement and exit — what Ctrl-C
+                             was before the self-guard stopped
+                             accepting signals from outside processes
   encode-run PROGRAM [ARGS...]
                              mint a run and print it as base64 — no
                              socket touched, nothing delivered; carry
                              the output anywhere
   encode-policy FILE         mint a policy application and print it as
                              base64
+  encode-stop                mint a stop and print it as base64
   send BASE64                deliver a minted command verbatim — no key,
                              no counter, no validation: {name} decodes
                              and validates the command itself
@@ -125,7 +133,15 @@ struct CommandLine {
 
 /// The known verbs — anything else in verb position is the bare form:
 /// a base64 command to deliver verbatim.
-const VERBS: &[&str] = &["run", "policy", "encode-run", "encode-policy", "send"];
+const VERBS: &[&str] = &[
+    "run",
+    "policy",
+    "stop",
+    "encode-run",
+    "encode-policy",
+    "encode-stop",
+    "send",
+];
 
 fn parse_arguments() -> Result<CommandLine> {
     let mut command = CommandLine {
@@ -193,7 +209,7 @@ fn parse_arguments() -> Result<CommandLine> {
             }
         }
     }
-    bail!("missing verb: run, policy, encode-run, encode-policy, or send")
+    bail!("missing verb: run, policy, stop, encode-run, encode-policy, encode-stop, or send")
 }
 
 fn value(arguments: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
@@ -240,11 +256,8 @@ fn run() -> Result<i32> {
                 bail!("run needs a program");
             };
             let client = minting_client(&command)?;
-            let outcome = client.run_in_class(
-                program,
-                &command.arguments[1..],
-                command.class.as_deref(),
-            )?;
+            let outcome =
+                client.run_in_class(program, &command.arguments[1..], command.class.as_deref())?;
             report(outcome)
         }
         "policy" => {
@@ -256,6 +269,24 @@ fn run() -> Result<i32> {
                 std::fs::read(path).with_context(|| format!("reading the policy {}", path))?;
             let client = minting_client(&command)?;
             report(client.reconfigure(&policy)?)
+        }
+        // The authenticated stop: mint and deliver in one step, on the
+        // machine that holds the key. `stop` takes no arguments — the
+        // signature, the boot id, and the burned counter are the whole
+        // command.
+        "stop" => {
+            reject_class(&command, "stop")?;
+            reject_arguments(&command, "stop")?;
+            let client = minting_client(&command)?;
+            report(client.stop()?)
+        }
+        "encode-stop" => {
+            reject_class(&command, "encode-stop")?;
+            reject_arguments(&command, "encode-stop")?;
+            let client = minting_client(&command)?;
+            let minted = client.mint_stop()?;
+            println!("{minted}");
+            Ok(0)
         }
         // The delivery-only verb (and the bare form): no key, no
         // counter, no validation — wabbit does all of it. This is the
@@ -269,8 +300,20 @@ fn run() -> Result<i32> {
             let outcome = wabbit_ipc::deliver(&socket, encoded)?;
             report(outcome)
         }
-        other => bail!("unknown verb {other:?}: run, policy, encode-run, encode-policy, or send"),
+        other => bail!(
+            "unknown verb {other:?}: run, policy, stop, encode-run, encode-policy, \
+             encode-stop, or send"
+        ),
     }
+}
+
+/// `stop` (and its encode form) carry no arguments — anything trailing
+/// is a typo, not a silent no-op.
+fn reject_arguments(command: &CommandLine, verb: &str) -> Result<()> {
+    if !command.arguments.is_empty() {
+        bail!("{verb} carries no arguments: the stop request is the whole command");
+    }
+    Ok(())
 }
 
 /// Report a command's outcome the way a human wants it: a run's output
@@ -285,6 +328,10 @@ fn report(outcome: CommandOutcome) -> Result<i32> {
         }
         CommandOutcome::Reconfigured => {
             println!("policy applied");
+            Ok(0)
+        }
+        CommandOutcome::Stopped => {
+            println!("stopping: the graceful exit is taken");
             Ok(0)
         }
     }
@@ -332,9 +379,10 @@ fn minting_client(command: &CommandLine) -> Result<CommandClient> {
             )
         }
         None => {
-            let socket = command.socket.clone().unwrap_or_else(|| PathBuf::from(
-                "/nonexistent/socket",
-            ));
+            let socket = command
+                .socket
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("/nonexistent/socket"));
             CommandClient::connect(socket, &key, counter)?
         }
     };

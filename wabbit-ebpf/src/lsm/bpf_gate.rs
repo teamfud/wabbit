@@ -2,17 +2,23 @@
 //!
 //! `security_bpf(int cmd, union bpf_attr *attr, unsigned int size)` runs
 //! for every `bpf(2)` syscall — before the command executes, whatever the
-//! command. The gate is *classed* (see `ACTION_BPF_ATTACH` in
-//! `wabbit-common`, the design documented there):
+//! command. The gate is *classed* (see `ACTION_BPF_ATTACH` and
+//! `ACTION_BPF_FULL` in `wabbit-common`, the design documented there):
 //!
 //! * **trusted** (wabbit's PID or cgroup): everything allowed. wabbit must
 //!   never be gated by its own protections — it loads these programs.
+//! * **the full class** ([`ACTION_BPF_FULL`] on the cgroup): every
+//!   command, every program type, every attach type — unfiltered. The
+//!   policy signer who grants it is choosing that the cgroup can reach
+//!   anything `bpf(2)` reaches, wabbit's own maps included (the
+//!   fd-by-ID lookups); the bpffs *open* gate still holds, because
+//!   `file_open` is a separate hook and pins are path-shaped.
 //! * **the systemd class** ([`ACTION_BPF_ATTACH`] on the cgroup): the
 //!   restricted command set a system-management daemon needs — map creates
 //!   and element operations (a process can only ever hold fds to maps it
 //!   created or inherited), program loads for the cgroup family, program
 //!   attaches and link creates with cgroup-family attach types, and BTF
-//!   loads. The dangerous things *never* relax below full trust: the
+//!   loads. The dangerous things never relax below the full class: the
 //!   fd-by-ID lookups (`BPF_MAP_GET_FD_BY_ID`, `BPF_PROG_GET_FD_BY_ID`) are
 //!   the only route to wabbit's maps that bypasses bpffs, and LSM and
 //!   tracing program types would shadow enforcement or read kernel memory.
@@ -32,7 +38,7 @@
 //! both the attach and link-create structs.
 
 use aya_ebpf::{helpers::bpf_probe_read_kernel, macros::lsm, programs::LsmContext};
-use wabbit_common::authorization::ACTION_BPF_ATTACH;
+use wabbit_common::authorization::{ACTION_BPF_ATTACH, ACTION_BPF_FULL};
 
 use crate::lsm::trust::{self, EPERM};
 
@@ -60,7 +66,8 @@ const ATTR_ATTACH_TYPE: usize = 8;
 /// `ACTION_BPF_ATTACH`'s documentation names. `BPF_PROG_TYPE_LSM`,
 /// `TRACING`, kprobe, raw-tracepoint and tracepoint types are *not* here:
 /// an LSM program would shadow enforcement, a tracing program is an
-/// arbitrary-kernel-read primitive, and both stay wabbit-only.
+/// arbitrary-kernel-read primitive, and both stay out of the systemd class
+/// (`ACTION_BPF_FULL` grants them by definition — "unfiltered").
 const CLASS_PROG_TYPES: &[u32] = &[
     1,  // SOCKET_FILTER
     8,  // CGROUP_SKB
@@ -76,7 +83,8 @@ const CLASS_PROG_TYPES: &[u32] = &[
 /// bind/connect/post-bind for v4 and v6, udp sendmsg/recvmsg, sysctl,
 /// getsockopt/setsockopt, getpeername/getsockname, sock release). The
 /// `BPF_TRACE_*`, `BPF_MODIFY_RETURN`, `BPF_LSM_*` and sockmap values are
-/// *not* here — LSM link creation stays wabbit-only.
+/// *not* here — LSM link creation stays out of the systemd class
+/// (`ACTION_BPF_FULL` grants it).
 #[inline(always)]
 fn is_class_attach_type(attach_type: u32) -> bool {
     matches!(
@@ -108,11 +116,15 @@ pub fn bpf_gate(ctx: LsmContext) -> i32 {
     }
     let cmd = ctx.arg::<u32>(0);
     let attr = ctx.arg::<*mut u8>(1);
-    let allowed = class_allows(cmd, attr);
+    // The full class first: ACTION_BPF_FULL permits every command,
+    // unfiltered — the class check below is the systemd class's.
+    let allowed = trust::current_authorized(ACTION_BPF_FULL) || class_allows(cmd, attr);
     trust::verdict(trust::HOOK_BPF, if allowed { 0 } else { EPERM })
 }
 
 /// Does the current cgroup's [`ACTION_BPF_ATTACH`] class permit `cmd`?
+/// (The `ACTION_BPF_FULL` class permits every command and never reaches
+/// here — the gate checks it first.)
 #[inline(always)]
 fn class_allows(cmd: u32, attr: *mut u8) -> bool {
     if !trust::current_authorized(ACTION_BPF_ATTACH) {
@@ -142,7 +154,8 @@ fn class_allows(cmd: u32, attr: *mut u8) -> bool {
             .map(is_class_attach_type)
             .unwrap_or(false),
         // Everything else — pins, fd-by-ID lookups, freezes, raw
-        // tracepoints, iteration, stats — is full trust only.
+        // tracepoints, iteration, stats — is `ACTION_BPF_FULL` only
+        // (full trust permits it too, before this function is reached).
         _ => false,
     }
 }

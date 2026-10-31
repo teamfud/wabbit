@@ -8,7 +8,7 @@ use tokio::signal;
 use wabbit::{
     filesystem, guard, handoff, ipc,
     policy::{self, Policy},
-    runtime,
+    runs, runtime, startup,
 };
 use wabbit_common::brand;
 
@@ -129,7 +129,6 @@ fn main() -> anyhow::Result<()> {
     // so both run here, on the main thread, before the runtime's threads
     // exist.
     handoff.ready()?;
-    handoff::join_root(&fds)?;
 
     // From here on the guard serves more than one caller: each IPC run
     // command writes the authorization maps while preparing its
@@ -138,6 +137,17 @@ fn main() -> anyhow::Result<()> {
     // a mutex instead. Nothing about enforcement changes — the links
     // still live exactly as long as the guard object does.
     let guard = Arc::new(std::sync::Mutex::new(guard));
+    let authorizer: Arc<dyn runs::RunAuthorizer> = Arc::clone(&guard) as _;
+
+    // The initrd-point `[[startup]]` entries: launched here — the guard
+    // enforcing, the process still in the initramfs, before the crossing
+    // (the tokio runtime does not exist yet, so the launches are
+    // blocking; a long-running entry delays the crossing, which is the
+    // honest cost of an entry that does not exit before
+    // `switch_root`). Per-entry fail-open.
+    startup::launch_initrd(&policy, &authorizer);
+
+    handoff::join_root(&fds)?;
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -155,7 +165,8 @@ async fn run(
     // held for this process's lifetime and inherited by everything it
     // spawns (opened without CLOEXEC). The systemd poll and the chroot
     // into the real root have already read through them (the handoff
-    // above); they stay open — and inheritable — for whatever comes next.
+    // above); the shutdown watch below reads through them too, and they
+    // stay open — and inheritable — for whatever comes next.
     info!(
         "holding runtime fds: /proc fd {}, /sys fd {}, /dev fd {}, /run fd {}",
         fds.procfs.as_raw_fd(),
@@ -163,7 +174,7 @@ async fn run(
         fds.dev.as_raw_fd(),
         fds.run.as_raw_fd(),
     );
-    let _held = fds;
+    let held = fds;
 
     // The eBPF logger's drain: a ring buffer in the kernel this task
     // empties. The logger was initialized on the main thread; only the
@@ -187,12 +198,14 @@ async fn run(
     // server's state anchors both (this boot's id, the burned command
     // ids, the compiled-in verification keys) and carries the guard's
     // run authorizer — the half that gives each run its own ephemeral
-    // cgroup — so a socket path without that state is no server at all.
+    // cgroup — and the stop signal below, which a signed `stop` command
+    // raises — so a socket path without that state is no server at all.
+    let stop = Arc::new(tokio::sync::Notify::new());
     let socket_path = env::var_os(ipc_socket_var()).map(std::path::PathBuf::from);
     let ipc_task = match socket_path {
         Some(path) => {
             let authorizer: Arc<dyn wabbit::runs::RunAuthorizer> = Arc::clone(&guard) as _;
-            match ipc::server_state(policy.clone(), authorizer) {
+            match ipc::server_state(policy.clone(), authorizer, Arc::clone(&stop)) {
                 Ok(state) => Some(tokio::spawn(ipc::run_server(path, state))),
                 Err(error) => {
                     warn!("IPC unavailable: {error:#}");
@@ -203,9 +216,69 @@ async fn run(
         None => None,
     };
 
-    let ctrl_c = signal::ctrl_c();
+    // The post-crossing `[[startup]]` entries — the `systemd` point at
+    // once, the `unit` point as its unit reaches active — in their own
+    // task: an entry may launch a program that outlives this function
+    // (a daemon is a legitimate `[[startup]]` argv), so the task, like
+    // the IPC server's, is never awaited; it dies with the process. The
+    // entries resolve their classes against this boot's policy — a
+    // later reconfigure rotates classes for *runs*, never for entries
+    // already launched.
+    {
+        let authorizer: Arc<dyn runs::RunAuthorizer> = Arc::clone(&guard) as _;
+        let policy = policy.clone();
+        tokio::spawn(async move {
+            startup::launch_post_crossing(&policy, &authorizer).await;
+        });
+    }
+
+    // The park. Under enforcement the operator's stop channel is the
+    // signed `stop` IPC command — the signal gate's self-guard denies
+    // every signal aimed at this process, `SIGINT` included, outside
+    // shutdown, so a graceful exit is *asked for*, by the deployment's
+    // key, not sent by whatever process feels like it. `Ctrl-C` still
+    // ends a pre-enforcement (dev) run and anything the shutdown watch
+    // below has relaxed. That watch is everything else the loop does:
+    // the one condition under which the self-guard lets outside
+    // processes signal wabbit again. PID 1's own sweep is exempt by
+    // sender already; the relaxation covers the rest of a shutdown (a
+    // SysV-style `killall5` sweep runs from a non-PID-1 sender) and is
+    // observed, never assumed: PID 1 gone, PID 1 *being* the shutdown
+    // process, or a delivered SIGTERM — which, once the guard enforces,
+    // only an exempt sender can land.
     println!("Waiting for Ctrl-C...");
-    ctrl_c.await?;
+    if ipc_task.is_some() {
+        // The honest stop instruction for an enforcing run: the marker
+        // above names the pre-enforcement/dev channel, this one names
+        // the one that works under enforcement.
+        info!(
+            "under enforcement the stop channel is the signed stop command \
+             ({} stop) — this process accepts no signals",
+            brand::CLIENT_NAME
+        );
+    }
+    let ctrl_c = signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .context("installing the SIGTERM watch")?;
+    let mut shutdown_seen = false;
+    let mut shutdown_watch = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        let shutting_down = tokio::select! {
+            _ = &mut ctrl_c => break,
+            // A signed `stop`: the server answered its client already;
+            // this process takes the same graceful exit `Ctrl-C` does.
+            _ = stop.notified() => break,
+            _ = sigterm.recv() => true,
+            _ = shutdown_watch.tick() => system_shutting_down(&held.procfs),
+        };
+        if shutting_down && !shutdown_seen {
+            shutdown_seen = true;
+            if let Ok(mut guard) = guard.lock() {
+                guard.note_shutdown();
+            }
+        }
+    }
     println!("Exiting...");
     // Dropping this handle (and the server's clone with it, as the
     // abort above winds the server down) detaches the guard's links:
@@ -253,4 +326,43 @@ fn configured_policy() -> anyhow::Result<Policy> {
         return policy::from_bytes(bytes).context("the policy baked into this binary");
     }
     Ok(Policy::default())
+}
+
+/// Is the system shutting down? Read through the held procfs descriptor
+/// — wabbit may be chrooted into PID 1's view of the root by now, and
+/// the descriptor refers to the live procfs whatever the root looks
+/// like — so the watch survives the crossing. Two observations count,
+/// both of them the *end* of the boot's own lifecycle:
+///
+/// * **PID 1 is gone** (`1/comm` no longer opens): an init exiting is
+///   the machine's last act, not an ordinary event;
+/// * **PID 1 *is* the shutdown process**: systemd re-executes into
+///   `systemd-shutdown` for its final sweep, and `comm` carries only
+///   the first 15 bytes of the name — so the prefixes below are what a
+///   16-byte name leaves. A bare `shutdown` covers the non-systemd
+///   inits that exec their own shutdown helper as PID 1.
+///
+/// An unreadable `comm` for any other reason decides nothing: the watch
+/// keeps polling, and the protection stays up — the `self_guard`'s
+/// relaxation is the *exception* to prove, never the default.
+fn system_shutting_down(procfs: &std::os::fd::OwnedFd) -> bool {
+    let fd = match rustix::fs::openat(
+        procfs,
+        "1/comm",
+        rustix::fs::OFlags::RDONLY,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return true,
+        Err(_) => return false,
+    };
+    let mut buffer = [0u8; 32];
+    let read = rustix::io::read(&fd, &mut buffer).unwrap_or(0);
+    let comm = &buffer[..read];
+    let end = comm
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .unwrap_or(comm.len());
+    let name = &comm[..end];
+    name.starts_with(b"shutdown") || name.starts_with(b"systemd-shutdow")
 }

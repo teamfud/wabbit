@@ -30,13 +30,16 @@
 
 use std::{
     fs,
-    os::unix::fs::MetadataExt,
+    os::unix::{fs::MetadataExt, process::CommandExt},
     path::{Path, PathBuf},
+    process::{Command as StdCommand, Stdio},
 };
 
 use anyhow::{Context, Result, bail};
 use wabbit_common::cgroup_types::{CLASS_SEGMENT, RUN_PREFIX, class_cgroup_fits};
 use wabbit_policy::authorization::AuthorizationEntry;
+
+use crate::policy::Policy;
 
 /// One prepared run cgroup: everything needed to undo it.
 #[derive(Debug, Clone)]
@@ -93,6 +96,35 @@ pub fn class_cgroup_path(own: &str, name: &str) -> Result<String> {
     Ok(format!("{own}/{CLASS_SEGMENT}/{name}"))
 }
 
+/// Resolve a class name to its compiled entry in `policy`: the convention
+/// path ([`class_cgroup_path`]) against wabbit's own cgroup, looked up in
+/// the policy's authorization section. Shared by the IPC server's
+/// classed runs and the boot's `[[startup]]` entries — one lookup, no
+/// class concept anywhere else in the runtime.
+///
+/// `own` is the authorizer's own cgroup (the subtree the class entries
+/// compile under); the caller supplies the policy to resolve against.
+pub fn class_entry(policy: &Policy, own: &str, name: &str) -> Result<AuthorizationEntry> {
+    let path = class_cgroup_path(own, name)?;
+    policy
+        .authorization
+        .as_ref()
+        .and_then(|config| {
+            config
+                .entries
+                .iter()
+                .find(|entry| entry.cgroup == Path::new(&path))
+        })
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the active policy defines no class {name:?}: classes compile to \
+                 <wabbit-cgroup>/{}/<name> entries, and no entry sits at {path:?}",
+                CLASS_SEGMENT
+            )
+        })
+}
+
 /// The ephemeral run cgroup under `parent`: `run-<command id>`.
 pub fn run_cgroup_path(parent: &Path, command_id: u64) -> PathBuf {
     parent.join(format!("{RUN_PREFIX}{command_id}"))
@@ -104,7 +136,7 @@ pub fn run_cgroup_path(parent: &Path, command_id: u64) -> PathBuf {
 /// parent is created too (wabbit owns its subtree; kernfs has no
 /// symlinks, so the directories cannot escape it).
 ///
-/// The spawned process puts *itself* in (see `wabbit/src/ipc.rs`'s
+/// The spawned process puts *itself* in (see `migrate_command`'s
 /// self-migration): the child writes its own pid to the cgroup's
 /// `cgroup.procs` between fork and exec, so the program's first syscall
 /// after exec already runs inside the run cgroup — no window in which
@@ -119,6 +151,92 @@ pub fn create_run_cgroup(parent: &Path, command_id: u64) -> Result<(PathBuf, u64
         .with_context(|| format!("stat(2) on the run cgroup {}", cgroup.display()))?
         .ino();
     Ok((cgroup, id))
+}
+
+/// A `Command` that migrates the child *itself* into `run`'s cgroup: the
+/// `pre_exec` closure runs between fork and exec, so the program's
+/// first instruction after exec already runs inside the run cgroup —
+/// no window in which run code executes with wabbit's own trust. The
+/// closure runs after fork in a multithreaded process: only
+/// async-signal-safe calls (open, write, close, getpid) and no
+/// allocation — the `cgroup.procs` path is a ready `CString` built
+/// before the fork, the pid formats into a stack buffer.
+///
+/// Stdin/stdout/stderr are piped; the caller drops the child's stdin
+/// when the rendezvous is over (an `EOF` releases a program reading
+/// stdin) and reads the rest.
+pub fn migrate_command(program: &str, args: &[String], run: &PreparedRun) -> Result<StdCommand> {
+    let procs = std::ffi::CString::new(
+        run.cgroup
+            .join("cgroup.procs")
+            .to_str()
+            .context("the run cgroup path is UTF-8")?,
+    )
+    .map_err(|_| anyhow::anyhow!("the cgroup.procs path is not C-stringable"))?;
+    let mut command = StdCommand::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    unsafe {
+        command.pre_exec(move || {
+            let fd = libc::open(procs.as_ptr(), libc::O_WRONLY);
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut digits = [0u8; 20];
+            let pid = libc::getpid() as u64;
+            let mut length = digits.len();
+            let mut rest = pid;
+            loop {
+                length -= 1;
+                digits[length] = b'0' + (rest % 10) as u8;
+                rest /= 10;
+                if rest == 0 {
+                    break;
+                }
+            }
+            let written = libc::write(
+                fd,
+                digits[length..].as_ptr().cast::<libc::c_void>(),
+                digits.len() - length,
+            );
+            let written = if written < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            };
+            libc::close(fd);
+            written
+        });
+    }
+    Ok(command)
+}
+
+/// [`migrate_command`], spawned on the plain std runtime — for callers
+/// outside a tokio runtime (the initrd-point startup entries, which run
+/// before the runtime exists).
+pub fn spawn_migrated_blocking(
+    program: &str,
+    args: &[String],
+    run: &PreparedRun,
+) -> Result<std::process::Child> {
+    migrate_command(program, args, run)?
+        .spawn()
+        .with_context(|| format!("running {program}"))
+}
+
+/// [`migrate_command`], spawned on the tokio runtime — for callers
+/// already inside it (the IPC runs, the post-crossing startup points).
+pub fn spawn_migrated(
+    program: &str,
+    args: &[String],
+    run: &PreparedRun,
+) -> Result<tokio::process::Child> {
+    tokio::process::Command::from(migrate_command(program, args, run)?)
+        .spawn()
+        .with_context(|| format!("running {program}"))
 }
 
 #[cfg(test)]

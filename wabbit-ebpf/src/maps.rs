@@ -96,6 +96,21 @@ pub static ENFORCING: Array<u32, 1> = Array::new();
 #[btf_map]
 pub static NET_POSTURE: Array<u32, 2> = Array::new();
 
+/// The self-guard's knobs — the protection that keeps wabbit itself
+/// signalable only by the trusted, PID 1, and the shutdown (see
+/// [`crate::lsm::signals`]). Three slots, indexed by the
+/// [`wabbit_common::authorization::SELF_GUARD_*`] constants: wabbit's
+/// own tgid (the protected subject), the byte offset of `tgid` in
+/// `struct task_struct` (parsed out of the running kernel's own BTF at
+/// load — ground truth, never a compile-time guess), and the shutdown
+/// relaxation flag the userspace sets when it observes the system going
+/// down. An all-zero map reads as *unarmed*, and an unarmed guard
+/// fail-opens: the machine's `kill(2)` must never depend on a protection
+/// that could not arm, and the self-test's enforcing step makes the
+/// missing protection fail loudly instead.
+#[btf_map]
+pub static SELF_GUARD: Array<u32, 3> = Array::new();
+
 /// Which decision points the gates reached, so the self-test suite can
 /// assert what it observed. A `BPF_ANY` insert marks a code as hit, not
 /// counted — a read-modify-write counter here trips the 6.8 verifier's

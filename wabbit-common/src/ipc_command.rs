@@ -29,7 +29,8 @@
 //!                                            replay as a command or vice
 //!                                            versa)
 //!             || version: u8              (currently 1)
-//!             || kind: u8                  (1 = run, 2 = reconfigure)
+//!             || kind: u8                  (1 = run, 2 = reconfigure,
+//!                                            3 = stop)
 //!             || boot id: 36 ASCII bytes   (dashes included, no newline)
 //!             || command id: u64, LE
 //!             || payload                   (the command itself)
@@ -54,6 +55,13 @@
 //!   policy keys before applying — a reconfigure is double-signed by
 //!   construction, once by the command envelope and once by the policy
 //!   format itself.
+//! * **stop**: no payload at all. The authenticated operator's stop
+//!   channel — the replacement for the `SIGINT` the self-guard no
+//!   longer lets outside processes deliver — asking wabbit for its
+//!   graceful park-exit (enforcement ends with the process that owns
+//!   the links). Signed by the deployment's key, bound to this boot,
+//!   burned on acceptance like every command: a captured `stop` replay
+//!   is worth nothing, and no process on the box can mint one.
 //!
 //! # Client-side counter discipline
 //!
@@ -77,6 +85,10 @@ pub const KIND_RUN: u8 = 1;
 /// Payload kind: apply a complete signed policy.
 pub const KIND_RECONFIGURE: u8 = 2;
 
+/// Payload kind: the graceful stop — the authenticated operator's stop
+/// channel (see the module docs). The payload is empty.
+pub const KIND_STOP: u8 = 3;
+
 /// The request kind byte on the IPC wire: a signed command.
 pub const SIGNED_REQUEST: u8 = 0b100;
 
@@ -94,7 +106,8 @@ pub const SIGNATURE_LEN: usize = 64;
 /// The decoded, fixed-size part of a command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandHeader {
-    /// Which payload follows: [`KIND_RUN`] or [`KIND_RECONFIGURE`].
+    /// Which payload follows: [`KIND_RUN`], [`KIND_RECONFIGURE`], or
+    /// [`KIND_STOP`].
     pub kind: u8,
     /// The boot the command was minted for, as
     /// `/proc/sys/kernel/random/boot_id` spells it.

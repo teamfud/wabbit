@@ -45,7 +45,7 @@
 //! | sketch field | implemented as |
 //! | --- | --- |
 //! | `GlobalPerm::allow_mount` | the `mount` action (`ACTION_MOUNT`) |
-//! | `GlobalPerm::allow_bpf` | the `bpf-attach` action (`ACTION_BPF_ATTACH`, the restricted system class; full `bpf(2)` stays wabbit-only) |
+//! | `GlobalPerm::allow_bpf` | the `bpf-attach` action (`ACTION_BPF_ATTACH`, the restricted system class), with the `bpf-full` action (`ACTION_BPF_FULL`) as the grantable unrestricted form — full `bpf(2)` is wabbit's own steady state |
 //! | `GlobalPerm::allow_kmods` | the `kmods` action (`ACTION_KMODS`) |
 //! | `GlobalPerm::allow_writing_cgroupfs` | the `cgroupfs-write` action (`ACTION_CGROUPFS_WRITE`) |
 //! | `GlobalPerm::allow_modifying_firewall` | the `firewall` action (`ACTION_FIREWALL`) |
